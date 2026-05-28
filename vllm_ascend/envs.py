@@ -1,4 +1,4 @@
-#
+﻿#
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
 #
@@ -108,6 +108,16 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MLP_DOWN_PREFETCH_SIZE":
     lambda: int(
         os.getenv("VLLM_ASCEND_MLP_DOWN_PREFETCH_SIZE", 18 * 1024 * 1024)),
+    # NPU L2 weight prefetch configuration.
+    "VLLM_PREFETCH": lambda: bool(int(os.getenv("VLLM_PREFETCH", "1"))),
+    "VLLM_PREFETCH_WEIGHT_SIZE_LIMIT": lambda: int(
+        os.getenv("VLLM_PREFETCH_WEIGHT_SIZE_LIMIT", "18874368")
+    ),
+    "VLLM_PREFETCH_LOG": lambda: bool(int(os.getenv("VLLM_PREFETCH_LOG", "0"))),
+    "VLLM_PREFETCH_WEIGHTS": lambda: os.getenv(
+        "VLLM_PREFETCH_WEIGHTS", "gate,next_qkv"
+    ),
+    "VLLM_PREFETCH_MODE": lambda: os.getenv("VLLM_PREFETCH_MODE", "all"),
     # Whether to enable msMonitor tool to monitor the performance of vllm-ascend.
     "MSMONITOR_USE_DAEMON":
     lambda: bool(int(os.getenv("MSMONITOR_USE_DAEMON", '0'))),
