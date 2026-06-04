@@ -43,6 +43,27 @@ inline void npu_prefetch_async(
 
     void* data_ptr = weight.data_ptr();
     size_t actual_size = static_cast<size_t>(prefetch_size);
+    aclrtStream compute_stream = c10_npu::getCurrentNPUStream();
+
+    bool capturing = false;
+    try {
+        capturing = c10_npu::GetCurrentNPUStream().isCapturing();
+    } catch (...) {
+        capturing = false;
+    }
+
+    if (capturing) {
+        aclError ret = aclrtCmoAsync(
+            data_ptr, actual_size,
+            ACL_RT_CMO_TYPE_PREFETCH,
+            compute_stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync capture failed, ret=", ret);
+        if (log_enabled) {
+            std::printf("[prefetch-c++] capture mode same stream size=%zu\n", actual_size);
+            std::fflush(stdout);
+        }
+        return;
+    }
 
     ensure_pf_stream();
 
@@ -61,7 +82,6 @@ inline void npu_prefetch_async(
             std::printf("[prefetch-c++] same stream size=%zu\n", actual_size);
             std::fflush(stdout);
         }
-        aclrtStream compute_stream = c10_npu::getCurrentNPUStream();
         aclError ret = aclrtCmoAsync(
             data_ptr, actual_size,
             ACL_RT_CMO_TYPE_PREFETCH,
