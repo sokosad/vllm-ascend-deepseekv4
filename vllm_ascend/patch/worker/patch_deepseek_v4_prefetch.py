@@ -20,17 +20,9 @@ def _patched_decoder_forward(
     try:
         from vllm_ascend.envs import (
             VLLM_PREFETCH,
-            VLLM_PREFETCH_LOG,
             VLLM_PREFETCH_WEIGHT_SIZE_LIMIT,
             VLLM_PREFETCH_WEIGHTS,
         )
-
-        if VLLM_PREFETCH_LOG:
-            print(
-                "[prefetch] ENTER forward layer={}".format(
-                    getattr(self, 'layer_idx', '?')
-                )
-            )
 
         if VLLM_PREFETCH and hasattr(self, '_prefetch_enabled'):
             pw = set(
@@ -97,32 +89,12 @@ def _patched_decoder_forward(
                 hidden_states, residual, post_ffn, comb_ffn
             )
 
-            if VLLM_PREFETCH_LOG:
-                has_gate = "gate" in pw
-                has_next_qkv = (
-                    "next_qkv" in pw
-                    and hasattr(self, "_prefetch_next_qkv_weight")
-                )
-                print(
-                    "[prefetch] layer={} gate={} next_qkv={}".format(
-                        self.layer_idx, has_gate, has_next_qkv
-                    )
-                )
-
             return hidden_states, residual
 
         return _original_decoder_forward(
             self, positions, hidden_states, residual, llama_4_scaling
         )
-    except Exception as e:
-        from vllm_ascend.envs import VLLM_PREFETCH_LOG
-        if VLLM_PREFETCH_LOG:
-            print(
-                "[prefetch] ERROR in patched forward "
-                "layer={}: {}".format(
-                    getattr(self, 'layer_idx', '?'), e
-                )
-            )
+    except Exception:
         return _original_decoder_forward(
             self, positions, hidden_states, residual, llama_4_scaling
         )
