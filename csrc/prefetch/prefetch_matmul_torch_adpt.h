@@ -35,6 +35,10 @@ inline void npu_prefetch_async(
         return;
     }
 
+    if (!weight.is_npu()) {
+        return;
+    }
+
     static bool log_enabled = std::getenv("VLLM_PREFETCH_LOG") != nullptr;
 
     void* data_ptr = weight.data_ptr();
