@@ -6,7 +6,7 @@ from vllm_ascend.models.deepseek_v4 import (
 )
 
 import vllm_ascend.prefetch
-from vllm_ascend.prefetch.manager import prefetch_weight, prefetch_weight_sync
+from vllm_ascend.prefetch.manager import prefetch_weight_sync
 
 _original_decoder_forward = DeepseekV2DecoderLayer.forward
 
@@ -69,20 +69,20 @@ def _patched_decoder_forward(
                 or (mode == "prefill" and nt > threshold)
             )
 
-            if do_pf and "gate" in pw:
-                gate_w = self.mlp.gate.weight
-                gate_name = "layer.{}.moe.gate".format(self.layer_idx)
-                prefetch_weight(
-                    gate_w, max_size,
-                    weight_name=gate_name,
-                )
-
             residual = hidden_states.clone()
             hidden_states, post_ffn, comb_ffn = self.hc_pre(
                 hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
                 self.hc_ffn_base
             )
             hidden_states = self.post_attention_layernorm(hidden_states)
+
+            if do_pf and "gate" in pw:
+                gate_w = self.mlp.gate.weight
+                gate_name = "layer.{}.moe.gate".format(self.layer_idx)
+                prefetch_weight_sync(
+                    gate_w, max_size,
+                    weight_name=gate_name,
+                )
 
             hidden_states = self.mlp(hidden_states)
 
@@ -93,7 +93,7 @@ def _patched_decoder_forward(
                         wname_str = "layer.{}.next_{}".format(
                             self.layer_idx, wname,
                         )
-                        prefetch_weight(
+                        prefetch_weight_sync(
                             wt, max_size,
                             weight_name=wname_str,
                         )
