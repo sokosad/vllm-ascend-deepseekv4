@@ -29,7 +29,8 @@ namespace vllm_ascend {
 
 inline void npu_prefetch_async(
     const at::Tensor& weight,
-    int64_t prefetch_size) {
+    int64_t prefetch_size,
+    bool use_async_stream) {
 
     if (!weight.defined() || weight.numel() == 0 || prefetch_size <= 0) {
         return;
@@ -43,51 +44,33 @@ inline void npu_prefetch_async(
 
     void* data_ptr = weight.data_ptr();
     size_t actual_size = static_cast<size_t>(prefetch_size);
+
+    if (use_async_stream) {
+        ensure_pf_stream();
+        if (g_pf_ctx.initialized) {
+            if (log_enabled) {
+                std::printf("[prefetch-c++] async stream size=%zu\n", actual_size);
+                std::fflush(stdout);
+            }
+            aclError ret = aclrtCmoAsync(
+                data_ptr, actual_size,
+                ACL_RT_CMO_TYPE_PREFETCH,
+                g_pf_ctx.stream);
+            TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync async failed, ret=", ret);
+            return;
+        }
+    }
+
+    if (log_enabled) {
+        std::printf("[prefetch-c++] same stream size=%zu\n", actual_size);
+        std::fflush(stdout);
+    }
     aclrtStream compute_stream = c10_npu::getCurrentNPUStream();
-
-    bool capturing = false;
-    try {
-        capturing = c10_npu::getCurrentNPUStream().isCapturing();
-    } catch (...) {
-        capturing = false;
-    }
-
-    if (capturing) {
-        aclError ret = aclrtCmoAsync(
-            data_ptr, actual_size,
-            ACL_RT_CMO_TYPE_PREFETCH,
-            compute_stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync capture failed, ret=", ret);
-        if (log_enabled) {
-            std::printf("[prefetch-c++] capture mode same stream size=%zu\n", actual_size);
-            std::fflush(stdout);
-        }
-        return;
-    }
-
-    ensure_pf_stream();
-
-    if (g_pf_ctx.initialized) {
-        if (log_enabled) {
-            std::printf("[prefetch-c++] async stream size=%zu\n", actual_size);
-            std::fflush(stdout);
-        }
-        aclError ret = aclrtCmoAsync(
-            data_ptr, actual_size,
-            ACL_RT_CMO_TYPE_PREFETCH,
-            g_pf_ctx.stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync async failed, ret=", ret);
-    } else {
-        if (log_enabled) {
-            std::printf("[prefetch-c++] same stream size=%zu\n", actual_size);
-            std::fflush(stdout);
-        }
-        aclError ret = aclrtCmoAsync(
-            data_ptr, actual_size,
-            ACL_RT_CMO_TYPE_PREFETCH,
-            compute_stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync same failed, ret=", ret);
-    }
+    aclError ret = aclrtCmoAsync(
+        data_ptr, actual_size,
+        ACL_RT_CMO_TYPE_PREFETCH,
+        compute_stream);
+    TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync same failed, ret=", ret);
 }
 
 }

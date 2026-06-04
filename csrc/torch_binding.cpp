@@ -2090,7 +2090,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_prefetch_async("
             "Tensor weight, "
-            "int prefetch_size"
+            "int prefetch_size, "
+            "bool use_async_stream=False"
         ") -> ()"
     );
     ops.impl("npu_prefetch_async", torch::kPrivateUse1, &vllm_ascend::npu_prefetch_async);

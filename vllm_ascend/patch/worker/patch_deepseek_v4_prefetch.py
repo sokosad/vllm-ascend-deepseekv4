@@ -59,12 +59,13 @@ def _patched_decoder_forward(
                 or (mode == "decode" and nt <= threshold)
                 or (mode == "prefill" and nt > threshold)
             )
+            use_async = nt > threshold
 
             if do_pf and "gate" in pw:
                 gate_w = self.mlp.gate.weight
                 gate_size = gate_w.element_size() * gate_w.numel()
                 if max_size <= 0 or gate_size <= max_size:
-                    torch.ops._C_ascend.npu_prefetch_async(gate_w, gate_size)
+                    torch.ops._C_ascend.npu_prefetch_async(gate_w, gate_size, use_async)
 
             residual = hidden_states.clone()
 
@@ -82,7 +83,7 @@ def _patched_decoder_forward(
                     for wname, wt in next_weights:
                         ws = wt.element_size() * wt.numel()
                         if max_size <= 0 or ws <= max_size:
-                            torch.ops._C_ascend.npu_prefetch_async(wt, ws)
+                            torch.ops._C_ascend.npu_prefetch_async(wt, ws, use_async)
 
             hidden_states = self.hc_post(
                 hidden_states, residual, post_ffn, comb_ffn

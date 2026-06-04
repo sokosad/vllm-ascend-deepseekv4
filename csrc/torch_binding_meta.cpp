@@ -1142,7 +1142,8 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant_meta(
 
 void npu_prefetch_async_meta(
     const at::Tensor& weight,
-    int64_t prefetch_size) {
+    int64_t prefetch_size,
+    bool use_async_stream) {
 }
 
 } // namespace meta
