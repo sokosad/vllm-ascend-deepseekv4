@@ -35,7 +35,7 @@ inline void npu_prefetch_async(
         return;
     }
 
-    if (!weight.is_cpu() && weight.device().type() != at::kPrivateUse1) {
+    if (weight.device().type() != at::kPrivateUse1) {
         return;
     }
 
