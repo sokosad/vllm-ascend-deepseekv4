@@ -47,6 +47,7 @@
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "moe/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "prefetch/prefetch_matmul_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2085,5 +2086,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             ") -> ()"
     );
     ops.impl("npu_scatter_nd_update_v2", torch::kPrivateUse1, &vllm_ascend::npu_scatter_nd_update_v2);
+
+    ops.def(
+        "npu_prefetch_async("
+            "Tensor weight, "
+            "int prefetch_size, "
+            "bool use_async_stream=False"
+        ") -> ()"
+    );
+    ops.impl("npu_prefetch_async", torch::kPrivateUse1, &vllm_ascend::npu_prefetch_async);
 }
 #endif

@@ -1140,6 +1140,12 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant_meta(
     return {y, scale};
 }
 
+void npu_prefetch_async_meta(
+    const at::Tensor& weight,
+    int64_t prefetch_size,
+    bool use_async_stream) {
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1206,5 +1212,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // npu_scatter_nd_update_v2
     ops.impl("npu_scatter_nd_update_v2", &vllm_ascend::meta::npu_scatter_nd_update_v2_meta);
     ops.impl("npu_dequant_swiglu_quant", &vllm_ascend::meta::npu_dequant_swiglu_quant_meta);
+
+    ops.impl("npu_prefetch_async", &vllm_ascend::meta::npu_prefetch_async_meta);
 }
 }
