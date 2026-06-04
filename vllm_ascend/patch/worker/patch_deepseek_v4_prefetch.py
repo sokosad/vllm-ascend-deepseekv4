@@ -60,19 +60,18 @@ def _patched_decoder_forward(
                 or (mode == "prefill" and nt > threshold)
             )
 
-            residual = hidden_states.clone()
-
-            hidden_states, post_ffn, comb_ffn = self.hc_pre(
-                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
-                self.hc_ffn_base
-            )
-
             if do_pf and "gate" in pw:
                 gate_w = self.mlp.gate.weight
                 gate_size = gate_w.element_size() * gate_w.numel()
                 if max_size <= 0 or gate_size <= max_size:
                     torch.ops._C_ascend.npu_prefetch_async(gate_w, gate_size)
 
+            residual = hidden_states.clone()
+
+            hidden_states, post_ffn, comb_ffn = self.hc_pre(
+                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
+                self.hc_ffn_base
+            )
             hidden_states = self.post_attention_layernorm(hidden_states)
 
             hidden_states = self.mlp(hidden_states)
