@@ -70,11 +70,6 @@ def _patched_decoder_forward(
             )
 
             residual = hidden_states.clone()
-            hidden_states, post_ffn, comb_ffn = self.hc_pre(
-                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
-                self.hc_ffn_base
-            )
-            hidden_states = self.post_attention_layernorm(hidden_states)
 
             if do_pf and "gate" in pw:
                 gate_w = self.mlp.gate.weight
@@ -83,6 +78,12 @@ def _patched_decoder_forward(
                     gate_w, max_size,
                     weight_name=gate_name,
                 )
+
+            hidden_states, post_ffn, comb_ffn = self.hc_pre(
+                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
+                self.hc_ffn_base
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
             hidden_states = self.mlp(hidden_states)
 
