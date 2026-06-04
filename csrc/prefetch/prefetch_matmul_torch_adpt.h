@@ -35,7 +35,7 @@ inline void npu_prefetch_async(
         return;
     }
 
-    if (!weight.is_npu()) {
+    if (!weight.is_cpu() && weight.device().type() != at::kPrivateUse1) {
         return;
     }
 
@@ -47,7 +47,7 @@ inline void npu_prefetch_async(
 
     bool capturing = false;
     try {
-        capturing = c10_npu::GetCurrentNPUStream().isCapturing();
+        capturing = c10_npu::getCurrentNPUStream().isCapturing();
     } catch (...) {
         capturing = false;
     }
