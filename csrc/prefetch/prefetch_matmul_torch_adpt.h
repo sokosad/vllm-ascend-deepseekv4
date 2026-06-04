@@ -3,29 +3,9 @@
 #include <torch/extension.h>
 #include <acl/acl.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
-#include <mutex>
+#include <torch_npu/csrc/core/npu/interface/AclInterface.h>
 
 namespace vllm_ascend {
-
-struct PrefetchContext {
-    bool initialized = false;
-    aclrtStream prefetch_stream = nullptr;
-    aclrtEvent prefetch_event = nullptr;
-    std::mutex mtx;
-};
-
-static PrefetchContext g_prefetch_ctx;
-
-static void ensure_prefetch_ctx() {
-    std::lock_guard<std::mutex> lock(g_prefetch_ctx.mtx);
-    if (!g_prefetch_ctx.initialized) {
-        aclError ret = aclrtCreateStream(&g_prefetch_ctx.prefetch_stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Failed to create prefetch stream, ret=", ret);
-        ret = aclrtCreateEvent(&g_prefetch_ctx.prefetch_event);
-        TORCH_CHECK(ret == ACL_ERROR_NONE, "Failed to create prefetch event, ret=", ret);
-        g_prefetch_ctx.initialized = true;
-    }
-}
 
 inline void npu_prefetch_async(
     const at::Tensor& weight,
@@ -35,20 +15,17 @@ inline void npu_prefetch_async(
         return;
     }
 
-    ensure_prefetch_ctx();
-
     aclrtStream compute_stream = c10_npu::getCurrentNPUStream();
 
     void* data_ptr = weight.data_ptr();
     size_t actual_size = static_cast<size_t>(prefetch_size);
 
-    aclrtEventRecord(g_prefetch_ctx.prefetch_event, compute_stream);
-    aclrtStreamWaitEvent(g_prefetch_ctx.prefetch_stream, g_prefetch_ctx.prefetch_event);
+    aclError ret = c10_npu::acl::AclrtCmoAsync(
+        data_ptr, actual_size,
+        ACL_RT_CMO_TYPE_PREFETCH,
+        compute_stream);
 
-    aclError ret = aclrtCmoAsync(data_ptr, actual_size,
-                                 ACL_RT_CMO_TYPE_PREFETCH,
-                                 g_prefetch_ctx.prefetch_stream);
-    TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtCmoAsync prefetch failed, ret=", ret);
+    TORCH_CHECK(ret == ACL_ERROR_NONE, "AclrtCmoAsync prefetch failed, ret=", ret);
 }
 
 }
