@@ -10,10 +10,15 @@ def _prefetch_after_attn_impl(
     layer_idx: int,
     weight_name: str,
 ) -> None:
-    from vllm_ascend.prefetch.manager import prefetch_weight_sync
+    from vllm_ascend.prefetch.manager import (
+        prefetch_weight_sync, prefetch_weight, _is_graph_capturing,
+    )
     from vllm_ascend.envs import VLLM_PREFETCH
     if VLLM_PREFETCH and weight is not None and weight.numel() > 0:
-        prefetch_weight_sync(weight, max_weight_size, weight_name=weight_name)
+        if _is_graph_capturing():
+            prefetch_weight_sync(weight, max_weight_size, weight_name=weight_name)
+        else:
+            prefetch_weight(weight, max_weight_size, weight_name=weight_name)
 
 
 def _prefetch_after_attn_fake(
@@ -33,10 +38,15 @@ def _prefetch_after_mlp_impl(
     layer_idx: int,
     weight_name: str,
 ) -> None:
-    from vllm_ascend.prefetch.manager import prefetch_weight_sync
+    from vllm_ascend.prefetch.manager import (
+        prefetch_weight_sync, prefetch_weight, _is_graph_capturing,
+    )
     from vllm_ascend.envs import VLLM_PREFETCH
     if VLLM_PREFETCH and weight is not None and weight.numel() > 0:
-        prefetch_weight_sync(weight, max_weight_size, weight_name=weight_name)
+        if _is_graph_capturing():
+            prefetch_weight_sync(weight, max_weight_size, weight_name=weight_name)
+        else:
+            prefetch_weight(weight, max_weight_size, weight_name=weight_name)
 
 
 def _prefetch_after_mlp_fake(

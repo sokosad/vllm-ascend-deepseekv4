@@ -6,7 +6,7 @@ from vllm_ascend.models.deepseek_v4 import (
 )
 
 import vllm_ascend.prefetch
-from vllm_ascend.prefetch.manager import prefetch_weight_sync
+from vllm_ascend.prefetch.manager import prefetch_weight, prefetch_weight_sync
 
 _original_decoder_forward = DeepseekV2DecoderLayer.forward
 
@@ -28,7 +28,9 @@ def _patched_decoder_forward(
 
         if VLLM_PREFETCH_LOG:
             print(
-                f"[prefetch] ENTER forward layer={getattr(self, 'layer_idx', '?')}"
+                "[prefetch] ENTER forward layer={}".format(
+                    getattr(self, 'layer_idx', '?')
+                )
             )
 
         if VLLM_PREFETCH and hasattr(self, '_prefetch_enabled'):
@@ -43,6 +45,16 @@ def _patched_decoder_forward(
                 self.hc_attn_base
             )
             hidden_states = self.input_layernorm(hidden_states)
+
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                llama_4_scaling=llama_4_scaling,
+            )
+
+            hidden_states = self.hc_post(
+                hidden_states, residual, post_attn, comb_attn
+            )
 
             from vllm_ascend.envs import (
                 VLLM_PREFETCH_MODE,
@@ -60,20 +72,11 @@ def _patched_decoder_forward(
             if do_pf and "gate" in pw:
                 gate_w = self.mlp.gate.weight
                 gate_name = "layer.{}.moe.gate".format(self.layer_idx)
-                prefetch_weight_sync(
+                prefetch_weight(
                     gate_w, max_size,
                     weight_name=gate_name,
                 )
 
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                llama_4_scaling=llama_4_scaling,
-            )
-
-            hidden_states = self.hc_post(
-                hidden_states, residual, post_attn, comb_attn
-            )
             residual = hidden_states.clone()
             hidden_states, post_ffn, comb_ffn = self.hc_pre(
                 hidden_states, self.hc_ffn_fn, self.hc_ffn_scale,
@@ -90,7 +93,7 @@ def _patched_decoder_forward(
                         wname_str = "layer.{}.next_{}".format(
                             self.layer_idx, wname,
                         )
-                        prefetch_weight_sync(
+                        prefetch_weight(
                             wt, max_size,
                             weight_name=wname_str,
                         )
@@ -106,8 +109,9 @@ def _patched_decoder_forward(
                     and hasattr(self, "_prefetch_next_qkv_weight")
                 )
                 print(
-                    f"[prefetch] layer={self.layer_idx} "
-                    f"gate={has_gate} next_qkv={has_next_qkv}"
+                    "[prefetch] layer={} gate={} next_qkv={}".format(
+                        self.layer_idx, has_gate, has_next_qkv
+                    )
                 )
 
             return hidden_states, residual
@@ -119,8 +123,10 @@ def _patched_decoder_forward(
         from vllm_ascend.envs import VLLM_PREFETCH_LOG
         if VLLM_PREFETCH_LOG:
             print(
-                f"[prefetch] ERROR in patched forward "
-                f"layer={getattr(self, 'layer_idx', '?')}: {e}"
+                "[prefetch] ERROR in patched forward "
+                "layer={}: {}".format(
+                    getattr(self, 'layer_idx', '?'), e
+                )
             )
         return _original_decoder_forward(
             self, positions, hidden_states, residual, llama_4_scaling

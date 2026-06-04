@@ -50,21 +50,20 @@ def prefetch_weight(
     prefetch_event = get_prefetch_event()
 
     weight_size = weight.element_size() * weight.numel()
-    if 0 < max_weight_size < weight_size:
-        return
+    actual_size = max_weight_size if 0 < max_weight_size < weight_size else weight_size
 
     from vllm_ascend.envs import VLLM_PREFETCH_LOG
     if VLLM_PREFETCH_LOG:
         print(
             f"[prefetch] {weight_name or hex(id(weight))} "
-            f"| size={weight_size} bytes"
+            f"| size={actual_size}/{weight_size} bytes"
         )
 
     compute_stream.record_event(prefetch_event)
     prefetch_stream.wait_event(prefetch_event)
 
     with torch_npu.npu.stream(prefetch_stream):
-        torch_npu.npu_prefetch(weight, weight, weight_size, 0)
+        torch_npu.npu_prefetch(weight, weight, actual_size, 0)
 
 
 def prefetch_weight_sync(
@@ -81,14 +80,13 @@ def prefetch_weight_sync(
         return
 
     weight_size = weight.element_size() * weight.numel()
-    if 0 < max_weight_size < weight_size:
-        return
+    actual_size = max_weight_size if 0 < max_weight_size < weight_size else weight_size
 
     from vllm_ascend.envs import VLLM_PREFETCH_LOG
     if VLLM_PREFETCH_LOG:
         print(
             f"[prefetch-sync] {weight_name or hex(id(weight))} "
-            f"| size={weight_size} bytes"
+            f"| size={actual_size}/{weight_size} bytes"
         )
 
-    torch_npu.npu_prefetch(weight, weight, weight_size, 0)
+    torch_npu.npu_prefetch(weight, weight, actual_size, 0)
