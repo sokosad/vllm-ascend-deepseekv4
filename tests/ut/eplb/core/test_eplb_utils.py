@@ -71,3 +71,53 @@ class TestAscendConfig(unittest.TestCase):
         self.assertIsNone(log2phy)
         self.assertTrue(torch.equal(expert_map, gt_expert_map))
         self.assertEqual(redundant_experts, 0)
+
+
+class TestLog2PhyProximity(unittest.TestCase):
+    """Node-aware (same-node-preferred) replica selection in generate_log2phy_map."""
+
+    @staticmethod
+    def _two_node_map():
+        # 4 ranks, num_die_per_host=2 -> 2 nodes (ranks 0,1 | 2,3); 2 experts;
+        # each rank holds 1 physical expert (valid_count=1).
+        # expert0 replicated on rank0(node0) & rank2(node1);
+        # expert1 replicated on rank1(node0) & rank3(node1).
+        return [
+            torch.tensor([0, -1], dtype=torch.int32),
+            torch.tensor([-1, 0], dtype=torch.int32),
+            torch.tensor([0, -1], dtype=torch.int32),
+            torch.tensor([-1, 0], dtype=torch.int32),
+        ]
+
+    def test_prefers_same_node_replica(self):
+        from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+        num_die, valid_count = 2, 1
+        gmap = self._two_node_map()
+        for ep in range(4):
+            res = generate_log2phy_map(gmap, ep, num_die_per_host=num_die)
+            for logical in range(2):
+                phys = int(res[logical])
+                self.assertEqual(
+                    (phys // valid_count) // num_die, ep // num_die,
+                    f"ep{ep} expert{logical} selected cross-node phys {phys}")
+
+    def test_fallback_when_no_same_node_replica(self):
+        from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+        # expert0 lives only on rank0 (node0); a node1 rank must fall back, not crash.
+        gmap = [
+            torch.tensor([0, -1], dtype=torch.int32),
+            torch.tensor([-1, 0], dtype=torch.int32),
+            torch.tensor([-1, 0], dtype=torch.int32),
+            torch.tensor([-1, 0], dtype=torch.int32),
+        ]
+        res = generate_log2phy_map(gmap, 3, num_die_per_host=2)
+        self.assertEqual(int(res[0]), 0)
+
+    def test_disabled_matches_round_robin(self):
+        from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+        gmap = self._two_node_map()
+        # num_die_per_host=0 disables node-awareness -> original round-robin.
+        for ep in range(4):
+            res = generate_log2phy_map(gmap, ep, num_die_per_host=0)
+            # expert0 replicas [phys0(rank0), phys2(rank2)] -> ep%2 selection
+            self.assertEqual(int(res[0]), [0, 2][ep % 2])

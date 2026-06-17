@@ -97,9 +97,32 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
 
 
-def generate_log2phy_map(global_expert_map, ep_rank):
+def _select_replica(replicas, ep_rank, valid_count, num_die_per_host):
+    """Pick one physical replica id for `ep_rank` among a logical expert's
+    replicas, preferring one that lives on the same node (host).
+
+    A physical id encodes its owning rank as `phys // valid_count`, so the
+    replica's node is `(phys // valid_count) // num_die_per_host`. When a
+    same-node replica exists the token dispatch stays on the fast intra-node
+    link (HCCS/SIO) instead of crossing nodes (RoCE). Falls back to the plain
+    round-robin over all replicas when no same-node replica exists or when
+    node-awareness is disabled (num_die_per_host <= 0), which keeps the
+    original behaviour bit-for-bit on a single node.
+    """
+    pool = replicas
+    if num_die_per_host > 0 and valid_count > 0:
+        my_node = ep_rank // num_die_per_host
+        same_node = [p for p in replicas if (p // valid_count) // num_die_per_host == my_node]
+        if same_node:
+            pool = same_node
+    return pool[ep_rank % len(pool)]
+
+
+def generate_log2phy_map(global_expert_map, ep_rank, num_die_per_host=None):
+    if num_die_per_host is None:
+        num_die_per_host = int(os.getenv("VLLM_ASCEND_NUM_DIE_PER_HOST", "8"))
     log2phy_map = defaultdict(list)
-    valid_count = torch.sum(global_expert_map[0] != -1)
+    valid_count = int(torch.sum(global_expert_map[0] != -1))
     for rankid, map_per_rank in enumerate(global_expert_map):
         for idx, val in enumerate(map_per_rank):
             val = val.item()
@@ -107,8 +130,7 @@ def generate_log2phy_map(global_expert_map, ep_rank):
                 log2phy_map[idx].append(val + rankid * valid_count)
 
     for key in log2phy_map:
-        num_of_duplications = len(log2phy_map[key])
-        log2phy_map[key] = log2phy_map[key][ep_rank % num_of_duplications]
+        log2phy_map[key] = _select_replica(log2phy_map[key], ep_rank, valid_count, num_die_per_host)
 
     log2phy_map = torch.scatter(
         torch.zeros(len(log2phy_map), dtype=torch.int32),
