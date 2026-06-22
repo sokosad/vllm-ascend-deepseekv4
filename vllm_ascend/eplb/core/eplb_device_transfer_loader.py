@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import time
 from enum import Enum
 
 import torch.distributed as dist
@@ -52,6 +53,7 @@ class D2DExpertWeightLoader:
 
         self.layer_id = layer_id
         self.comm_op_list = []
+        send_bytes = 0
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
@@ -59,15 +61,26 @@ class D2DExpertWeightLoader:
                 self.comm_op_list.append(
                     dist.P2POp(dist.isend, src_tensor, dst_rank, group=self.comm_group.device_group)
                 )
+                send_bytes += src_tensor.numel() * src_tensor.element_size()
 
+        recv_bytes = 0
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info
             for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:
                 self.comm_op_list.append(
                     dist.P2POp(dist.irecv, buffer_tensor, recv_rank, group=self.comm_group.device_group)
                 )
+                recv_bytes += buffer_tensor.numel() * buffer_tensor.element_size()
             local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
+
+        # EPLB migration accounting: experts moved + bytes for this layer on this rank.
+        self._last_xfer_bytes = send_bytes + recv_bytes
+        logger.info(
+            "[EPLB-MIG] layer=%d send_experts=%d recv_experts=%d send_MB=%.2f recv_MB=%.2f",
+            layer_id, len(expert_send_info), len(expert_recv_info),
+            send_bytes / 1e6, recv_bytes / 1e6,
+        )
 
         self.state = ExpertWeightUpdateState.READY
 
@@ -92,8 +105,15 @@ class D2DExpertWeightLoader:
             return
 
         # Waiting for send/recv tasks finish
+        t0 = time.perf_counter()
         for req in reqs:
             req.wait()
+        ms = (time.perf_counter() - t0) * 1e3
+        mb = getattr(self, "_last_xfer_bytes", 0) / 1e6
+        logger.info(
+            "[EPLB-MIG] layer=%d transfer %.2f MB in %.2f ms = %.1f GB/s",
+            self.layer_id, mb, ms, (mb / 1e3) / (ms / 1e3) if ms > 0 else 0.0,
+        )
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
