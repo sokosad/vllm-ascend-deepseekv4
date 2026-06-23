@@ -75,11 +75,10 @@ class D2DExpertWeightLoader:
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
 
         # EPLB migration accounting: experts moved + bytes for this layer on this rank.
-        self._last_xfer_bytes = send_bytes + recv_bytes
         logger.info(
-            "[EPLB-MIG] layer=%d send_experts=%d recv_experts=%d send_MB=%.2f recv_MB=%.2f",
+            "[EPLB-MIG] layer=%d send_experts=%d recv_experts=%d MB=%.2f",
             layer_id, len(expert_send_info), len(expert_recv_info),
-            send_bytes / 1e6, recv_bytes / 1e6,
+            (send_bytes + recv_bytes) / 1e6,
         )
 
         self.state = ExpertWeightUpdateState.READY
@@ -108,12 +107,8 @@ class D2DExpertWeightLoader:
         t0 = time.perf_counter()
         for req in reqs:
             req.wait()
-        ms = (time.perf_counter() - t0) * 1e3
-        mb = getattr(self, "_last_xfer_bytes", 0) / 1e6
-        logger.info(
-            "[EPLB-MIG] layer=%d transfer %.2f MB in %.2f ms = %.1f GB/s",
-            self.layer_id, mb, ms, (mb / 1e3) / (ms / 1e3) if ms > 0 else 0.0,
-        )
+        logger.info("[EPLB-MIG] layer=%d transfer wait %.1f ms",
+                    self.layer_id, (time.perf_counter() - t0) * 1e3)
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
