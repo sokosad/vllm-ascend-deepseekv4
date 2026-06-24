@@ -122,6 +122,7 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
@@ -1617,6 +1618,21 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
                 self.eplb_updator.forward_end()
+
+        # EPLB-free per-layer hotness dump. Runs in the eager driver (NOT the
+        # compiled graph), so .tolist()/logging is safe here. Periodically logs
+        # each card's cumulative per-expert load (moe_load accumulated in the MoE
+        # forward under VLLM_ASCEND_LOG_CARD_TOKENS); parse with hotness_summary.py.
+        if envs_ascend.VLLM_ASCEND_LOG_CARD_TOKENS:
+            self._hot_step = getattr(self, "_hot_step", 0) + 1
+            if self._hot_step % envs_ascend.VLLM_ASCEND_CARD_TOK_LOG_INTERVAL == 0:
+                hf = self.model_config.hf_config
+                nd = getattr(hf, "first_k_dense_replace", 0)
+                inner = getattr(self.model, "model", self.model)
+                for _l in range(nd, hf.num_hidden_layers):
+                    _ml = getattr(inner.layers[_l].mlp.experts, "moe_load", None)
+                    if _ml is not None:
+                        logger.info("[HOTNESS] inst=%d load=%s", _l - nd, _ml.tolist())
 
         if self.debugger is not None:
             self.debugger.stop()

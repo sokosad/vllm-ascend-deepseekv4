@@ -603,12 +603,6 @@ class AscendFusedMoE(FusedMoE):
                     self.load_counter.add_(1)
                 else:
                     self.moe_load.add_(local_load)
-                    # EPLB-free per-layer hotness dump: log this card's cumulative
-                    # per-expert load periodically; parser stitches the global array.
-                    if envs_ascend.VLLM_ASCEND_LOG_CARD_TOKENS:
-                        self._hot_calls = getattr(self, "_hot_calls", 0) + 1
-                        if self._hot_calls % envs_ascend.VLLM_ASCEND_CARD_TOK_LOG_INTERVAL == 0:
-                            logger.info("[HOTNESS] inst=%d load=%s", self.moe_instance_id, self.moe_load.tolist())
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
