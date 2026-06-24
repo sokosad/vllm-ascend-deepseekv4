@@ -78,6 +78,13 @@ from vllm_ascend.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 logger = init_logger(__name__)
 
+import vllm_ascend.envs as envs_ascend  # noqa: E402
+
+# Per-card (per-rank) MoE token counter, EPLB-independent. One process == one card,
+# so this process-global cumulative count + the worker log prefix (Worker_DP*_EP*)
+# gives per-card token totals without enabling EPLB. Gated by VLLM_ASCEND_LOG_CARD_TOKENS.
+_CARD_TOK = {"tokens": 0, "calls": 0}
+
 
 def hadamard_transform_ref(x: torch.Tensor, scale=1.0):
     from scipy.linalg import hadamard
@@ -340,6 +347,15 @@ class DeepseekV4MoE(nn.Module):
                 input_ids=None) -> torch.Tensor:
 
         num_tokens, hidden_dim = hidden_states.shape
+
+        # [CARD-TOK] per-card MoE token counter (no EPLB needed). Logs cumulative
+        # tokens for this rank every N MoE-forward calls; parse by rank prefix.
+        if envs_ascend.VLLM_ASCEND_LOG_CARD_TOKENS:
+            _CARD_TOK["tokens"] += int(num_tokens)
+            _CARD_TOK["calls"] += 1
+            if _CARD_TOK["calls"] % envs_ascend.VLLM_ASCEND_CARD_TOK_LOG_INTERVAL == 0:
+                logger.info("[CARD-TOK] tokens=%d calls=%d", _CARD_TOK["tokens"], _CARD_TOK["calls"])
+
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.

@@ -101,6 +101,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # Log per-card (per-rank) MoE token counts WITHOUT enabling EPLB. Lightweight
+    # counter in the MoE layer forward; logs cumulative tokens every N calls.
+    "VLLM_ASCEND_LOG_CARD_TOKENS": lambda: bool(int(os.getenv("VLLM_ASCEND_LOG_CARD_TOKENS", "0"))),
+    "VLLM_ASCEND_CARD_TOK_LOG_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_CARD_TOK_LOG_INTERVAL", "2000")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True
