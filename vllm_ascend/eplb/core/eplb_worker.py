@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import os
 from multiprocessing import Process, Queue
 from typing import Any
 
@@ -35,6 +36,9 @@ class EplbWorker:
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
+        # Load-aware replica selection (disabled by default, opt-in via env var)
+        self.load_aware = int(os.environ.get("CRAFT_LOAD_AWARE", "0"))
+        self._cur_load_info = None
 
     def do_update(self):
         # put data in to queue
@@ -57,6 +61,8 @@ class EplbWorker:
         load_info = self.fetch_and_sum_load_info()
         if load_info is None:
             return
+        # Cache for load-aware replica selection (used in pack_update_info)
+        self._cur_load_info = load_info
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
@@ -260,7 +266,15 @@ class EplbWorker:
 
             maps.append(new_expert_map[self.rank_id].numpy().tolist())
 
-            log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
+            # Pass per-rank load to enable load-aware replica selection
+            per_rank_load = None
+            if self.load_aware and self._cur_load_info is not None:
+                try:
+                    per_rank_load = self._cur_load_info[layer_id].cpu().numpy().tolist()
+                except Exception:
+                    per_rank_load = None
+            log2phy_map = generate_log2phy_map(
+                new_expert_map, self.rank_id, per_rank_load=per_rank_load)
             log2phy_all.append(log2phy_map.numpy().tolist())
 
             layer_ids.append(layer_id)
