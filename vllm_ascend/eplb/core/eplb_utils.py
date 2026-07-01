@@ -97,7 +97,24 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
 
 
-def generate_log2phy_map(global_expert_map, ep_rank):
+def generate_log2phy_map(global_expert_map, ep_rank, per_rank_load=None):
+    """Build the logical-to-physical expert mapping for a given EP rank.
+
+    When per_rank_load is provided, uses LPT (Longest Processing Time)
+    partitioning to assign ranks to replicas based on per-rank load, instead
+    of the default ep_rank % num_replicas polling. This balances the actual
+    load across replicas, mitigating the polling imbalance where all tokens
+    from a rank go to the same replica.
+
+    Args:
+        global_expert_map: List of per-rank expert maps [ep_size][n_experts].
+        ep_rank: The EP rank to generate the mapping for.
+        per_rank_load: Optional per-rank per-expert load [ep_size][n_experts].
+            When None, uses the original ep_rank % d polling (default).
+
+    Returns:
+        Tensor mapping each logical expert to a physical expert ID.
+    """
     log2phy_map = defaultdict(list)
     valid_count = torch.sum(global_expert_map[0] != -1)
     for rankid, map_per_rank in enumerate(global_expert_map):
@@ -107,8 +124,29 @@ def generate_log2phy_map(global_expert_map, ep_rank):
                 log2phy_map[idx].append(val + rankid * valid_count)
 
     for key in log2phy_map:
-        num_of_duplications = len(log2phy_map[key])
-        log2phy_map[key] = log2phy_map[key][ep_rank % num_of_duplications]
+        num_replicas = len(log2phy_map[key])
+        if per_rank_load is not None and num_replicas > 1:
+            # LPT partition: assign ranks to replicas by load balance
+            ep_size = len(per_rank_load)
+            rank_loads = [
+                float(per_rank_load[r][key]) if key < len(per_rank_load[r]) else 0.0
+                for r in range(ep_size)
+            ]
+            # Sort ranks by load (desc), break ties by rank id (deterministic)
+            order = sorted(range(ep_size), key=lambda r: (-rank_loads[r], r))
+            group_load = [0.0] * num_replicas
+            group_count = [0] * num_replicas
+            rank_to_group = [0] * ep_size
+            for r in order:
+                target_group = min(
+                    range(num_replicas),
+                    key=lambda g: (group_load[g], group_count[g], g))
+                rank_to_group[r] = target_group
+                group_load[target_group] += rank_loads[r]
+                group_count[target_group] += 1
+            log2phy_map[key] = log2phy_map[key][rank_to_group[ep_rank]]
+        else:
+            log2phy_map[key] = log2phy_map[key][ep_rank % num_replicas]
 
     log2phy_map = torch.scatter(
         torch.zeros(len(log2phy_map), dtype=torch.int32),
