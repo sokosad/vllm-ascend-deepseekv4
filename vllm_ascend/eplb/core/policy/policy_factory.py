@@ -1,6 +1,7 @@
 # Copyright Huawei Technologies Co., Ltd. 2023-2024. All rights reserved.
 # Todo: Once https://github.com/vllm-project/vllm/pull/24069 is merged in vllm. Remove this factory.
 from .policy_abstract import DynamicConfig, EplbPolicy
+from .policy_craft import CraftPolicy
 from .policy_default_eplb import DefaultEplb
 from .policy_flashlb import FlashLB, warm_up
 from .policy_random import RandomLoadBalance
@@ -22,6 +23,8 @@ class PolicyFactory:
             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
             # Multi-Shot Enhancement and Incremental Adjustment
             3: FlashLB,
+            # CRAFT: cost-aware expert replica allocation with layerwise NR
+            4: CraftPolicy,
         }
         policy_class = policy.get(policy_type, RandomLoadBalance)
         policy_instance = policy_class(config)
