@@ -431,8 +431,8 @@ class EplbConfig:
                 raise TypeError(f"{key} must be an integer")
             if self.config[key] < 0:  # type: ignore
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
-        if self.eplb_policy_type not in [0, 1, 2, 3]:
-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
+            raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
