@@ -25,6 +25,7 @@ _SHARD_WEIGHT: GroupCoordinator | None = None
 _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
+_EPLB_MIGRATE: GroupCoordinator | None = None
 
 
 def init_ascend_model_parallel(
@@ -99,6 +100,16 @@ def init_ascend_model_parallel(
         global _DYNAMIC_EPLB
         _DYNAMIC_EPLB = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="dynamic_eplb"
+        )
+        # Dedicated communicator for EPLB expert weight migration (P2P d2d).
+        # Separate from inference all-to-all to avoid HCCL communicator contention,
+        # which was the root cause of 16-card throughput collapse (-65%).
+        # See CRAFT analysis: migration batch_isend_irecv and inference all-to-all
+        # sharing one communicator serialize each other.
+        global _EPLB_MIGRATE
+        _EPLB_MIGRATE = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend,
+            group_name="eplb_migrate"
         )
 
     if get_ascend_config().multistream_overlap_gate:
@@ -284,6 +295,17 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
     return _DYNAMIC_EPLB
 
 
+def get_eplb_migrate_group() -> GroupCoordinator:
+    """Get the dedicated communicator for EPLB expert weight migration.
+
+    This group is separate from the inference communicator to avoid HCCL
+    contention between migration P2P (batch_isend_irecv) and inference
+    collective (all-to-all/all-gather) operations.
+    """
+    assert _EPLB_MIGRATE is not None, "EPLB migrate group is not initialized"
+    return _EPLB_MIGRATE
+
+
 def destroy_ascend_model_parallel():
     global _MC2
     if _MC2:
@@ -339,3 +361,8 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+    global _EPLB_MIGRATE
+    if _EPLB_MIGRATE:
+        _EPLB_MIGRATE.destroy()
+    _EPLB_MIGRATE = None
