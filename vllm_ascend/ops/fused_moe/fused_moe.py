@@ -366,6 +366,9 @@ class AscendFusedMoE(FusedMoE):
             from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
             self._replica_options, self._replica_counts = build_replica_options(
                 self.global_expert_map, self.ep_size, valid_count)
+            # Move to NPU for runtime efficiency (topk_ids is on NPU)
+            self._replica_options = self._replica_options.npu()
+            self._replica_counts = self._replica_counts.npu()
             logger.info_once(
                 "[Metro] Replica selection enabled (strategy=%d), "
                 "max_replicas=%d", get_metro_strategy(),
@@ -468,6 +471,14 @@ class AscendFusedMoE(FusedMoE):
     def update_log2phy_map(self, new_log2phy):
         """Update log2phy map (called after EPLB rebalance)."""
         self.log2phy = new_log2phy
+        # Rebuild Metro replica options to match new placement
+        if self._replica_options is not None and self.global_expert_map is not None:
+            from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
+            valid_count = self.global_expert_map[0].ne(-1).sum().item()
+            opts, cnts = build_replica_options(
+                self.global_expert_map, self.ep_size, valid_count)
+            self._replica_options = opts.npu()
+            self._replica_counts = cnts.npu()
 
     def clear_moe_load(self):
         if self.moe_load is not None:
