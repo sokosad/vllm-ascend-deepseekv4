@@ -357,6 +357,19 @@ class AscendFusedMoE(FusedMoE):
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.local_num_experts = self.global_num_experts // self.ep_size
+        # Build 2D replica options for Metro replica selection (if enabled)
+        self._replica_options = None
+        self._replica_counts = None
+        from vllm_ascend.ops.fused_moe.metro_replica import get_metro_strategy
+        if get_metro_strategy() > 0 and self.global_expert_map is not None:
+            valid_count = self.global_expert_map[0].ne(-1).sum().item()
+            from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
+            self._replica_options, self._replica_counts = build_replica_options(
+                self.global_expert_map, self.ep_size, valid_count)
+            logger.info_once(
+                "[Metro] Replica selection enabled (strategy=%d), "
+                "max_replicas=%d", get_metro_strategy(),
+                self._replica_options.shape[1] if self._replica_options is not None else 0)
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -451,6 +464,10 @@ class AscendFusedMoE(FusedMoE):
 
     def get_log2phy_map(self):
         return self.log2phy
+
+    def update_log2phy_map(self, new_log2phy):
+        """Update log2phy map (called after EPLB rebalance)."""
+        self.log2phy = new_log2phy
 
     def clear_moe_load(self):
         if self.moe_load is not None:
@@ -580,6 +597,8 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+            replica_options=self._replica_options,
+            replica_counts=self._replica_counts,
         )
 
         if self.dynamic_eplb:

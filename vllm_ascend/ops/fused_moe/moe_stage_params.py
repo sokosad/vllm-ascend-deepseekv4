@@ -39,6 +39,9 @@ class MoERoutingParams:
     mc2_mask: torch.Tensor | None
     apply_router_weight_on_input: bool
     log2phy: torch.Tensor | None = None
+    # Metro replica selection: 2D options and counts (built from global_expert_map)
+    replica_options: torch.Tensor | None = None
+    replica_counts: torch.Tensor | None = None
     # Precomputed activation scales from prepare stage for quantized dispatch.
     pertoken_scale: torch.Tensor | None = None
 
