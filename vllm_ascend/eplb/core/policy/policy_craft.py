@@ -222,8 +222,10 @@ class CraftPolicy(EplbPolicy):
         self.topk = int(os.environ.get("CRAFT_TOPK", "6"))
         # Accept new placement if predicted max < thresh * current max
         self.improve_thresh = float(os.environ.get("CRAFT_IMPROVE_THRESH", "0.97"))
-        # Layerwise variable NR (CRAFT paper core)
-        self.layerwise = int(os.environ.get("CRAFT_LAYERWISE", "1"))
+        # Layerwise variable NR (CRAFT paper core). Disabled by default because
+        # the framework's _compute_imbalance and check_expert_placement need -1
+        # padding adaptation (see TODO). Enable after fixing those functions.
+        self.layerwise = int(os.environ.get("CRAFT_LAYERWISE", "0"))
         # Polling-aware real max for gating (0=ideal load/copies, 1=simulated)
         self.real_eval = int(os.environ.get("CRAFT_REAL_EVAL", "0"))
 
