@@ -169,7 +169,66 @@ def select_replica_l2(topk_ids, options, counts, ep_size):
     return result
 
 
-def select_replica(topk_ids, options, counts, ep_size, strategy):
+def select_replica_l3(topk_ids, options, counts, ep_size, comm_group=None):
+    """L3: Global greedy with all-gather (full Metro).
+
+    All-gathers per-expert token counts across EP ranks, then uses global
+    information for optimal replica selection. This is the full Metro approach.
+
+    Requires one all-gather of [n_logical] integers per forward step.
+    """
+    num_tokens = topk_ids.shape[0]
+    n_logical = counts.shape[0]
+    device = topk_ids.device
+
+    # Step 1: Count per-expert tokens locally
+    local_counts = torch.bincount(topk_ids, minlength=n_logical).to(torch.int32)
+
+    # Step 2: All-gather across EP ranks
+    if comm_group is not None and torch.distributed.is_initialized():
+        global_counts = local_counts.clone()
+        torch.distributed.all_reduce(global_counts, op=torch.distributed.ReduceOp.SUM,
+                                     group=comm_group)
+    else:
+        global_counts = local_counts
+
+    # Step 3: Weighted greedy selection using global expert hotness
+    # Hot experts (high global count) should spread across more replicas
+    # Cold experts (low count) can share replicas
+    card_load = torch.zeros(ep_size, dtype=torch.int64, device=device)
+    result = torch.empty_like(topk_ids)
+
+    token_options = options[topk_ids]
+    token_counts = counts[topk_ids]
+    token_global = global_counts[topk_ids]
+
+    # Sort by global hotness (hottest first) for greedy
+    sorted_idx = torch.argsort(token_global, descending=True)
+
+    for idx in sorted_idx:
+        expert = topk_ids[idx].item()
+        d = token_counts[idx].item()
+        if d <= 1:
+            result[idx] = token_options[idx][0]
+            continue
+
+        # Choose replica on least-loaded card (using global counts as weight)
+        best_replica = 0
+        best_score = float('inf')
+        for r in range(d):
+            # Score = card_load + global_count (hot expert → higher priority for balancing)
+            score = card_load[r % ep_size].item()
+            if score < best_score:
+                best_score = score
+                best_replica = r
+
+        result[idx] = token_options[idx][best_replica]
+        card_load[best_replica % ep_size] += token_global[idx].item()
+
+    return result
+
+
+def select_replica(topk_ids, options, counts, ep_size, strategy, comm_group=None):
     """Dispatch to the appropriate replica selection strategy.
 
     Args:
@@ -178,19 +237,21 @@ def select_replica(topk_ids, options, counts, ep_size, strategy):
         counts: [n_logical] replica count per logical expert.
         ep_size: Number of EP ranks.
         strategy: METRO_L1_POSITION, METRO_L2_GREEDY, or METRO_L3_GLOBAL.
+        comm_group: Optional torch.distributed group for L3 all-gather.
 
     Returns:
         Physical expert IDs, same shape as topk_ids.
     """
     original_shape = topk_ids.shape
-    flat_ids = topk_ids.reshape(-1)
+    flat_ids = topk_ids.reshape(-1).long()
 
     if strategy == METRO_L1_POSITION:
         result = select_replica_l1(flat_ids, options, counts)
     elif strategy == METRO_L2_GREEDY:
         result = select_replica_l2(flat_ids, options, counts, ep_size)
+    elif strategy == METRO_L3_GLOBAL:
+        result = select_replica_l3(flat_ids, options, counts, ep_size, comm_group)
     else:
-        # Fallback to L1 for unsupported strategies
         result = select_replica_l1(flat_ids, options, counts)
 
-    return result.reshape(original_shape)
+    return result.reshape(original_shape).to(topk_ids.dtype)
