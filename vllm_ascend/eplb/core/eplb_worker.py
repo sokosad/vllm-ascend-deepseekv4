@@ -100,8 +100,10 @@ class EplbWorker:
         num_ranks = old_placement.shape[1]
 
         for layer_id in range(num_layers):
-            # check if any logical expert is not placed on any rank
-            if torch.unique(new_placement[layer_id]).numel() < torch.unique(old_placement[layer_id]).numel():
+            # check if any logical expert is not placed on any rank (excluding -1 padding)
+            new_valid = new_placement[layer_id][new_placement[layer_id] >= 0]
+            old_valid = old_placement[layer_id][old_placement[layer_id] >= 0]
+            if torch.unique(new_valid).numel() < torch.unique(old_valid).numel():
                 logger.error(f"There exists expert not placed on any rank in layer {layer_id}")
                 new_placement[layer_id] = old_placement[layer_id]
                 continue
@@ -110,8 +112,11 @@ class EplbWorker:
                 new_placement_check = new_placement[layer_id][rank_id]
                 old_placement_check = old_placement[layer_id][rank_id]
 
+                # Filter out -1 padding for duplicate check
+                new_no_pad = new_placement_check[new_placement_check >= 0]
+
                 # check if same logical experts are placed on the same NPU
-                if new_placement_check.numel() != torch.unique(new_placement_check).numel():
+                if new_no_pad.numel() != torch.unique(new_no_pad).numel():
                     logger.error(
                         "Replicated experts are placed on the same NPU; expert placement on "
                         f"layer {layer_id}, rank {rank_id} is invalid"
@@ -286,12 +291,17 @@ class EplbWorker:
         imbalance_list = []
         deployment_all_layer = np.array(deployment_all_layer)
         for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):
-            counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])
+            # Filter out -1 padding entries (from layerwise variable NR)
+            valid_mask = deployment >= 0
+            valid_deployment = deployment[valid_mask]
+            counts = np.bincount(valid_deployment.reshape(-1), minlength=hotness.shape[0])
 
             unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
 
             stage_load = unit_hotness[deployment].sum(-1)
-            stage_par = stage_load.max() / stage_load.mean()
+            # Only consider valid (non -1) entries for stage_par
+            valid_stage_load = stage_load[valid_mask]
+            stage_par = valid_stage_load.max() / valid_stage_load.mean() if valid_stage_load.mean() > 0 else 1.0
             imbalance_list.append(stage_par)
 
         max_val = max(imbalance_list)
@@ -306,7 +316,9 @@ class EplbWorker:
             hotness = np.zeros(num_of_expert, dtype=rank_load.dtype)
             deployment_flat = deployment.ravel()
             rank_load_flat = rank_load.ravel()
-            np.add.at(hotness, deployment_flat, rank_load_flat)
+            # Filter out -1 padding entries (from layerwise variable NR)
+            valid_mask = deployment_flat >= 0
+            np.add.at(hotness, deployment_flat[valid_mask], rank_load_flat[valid_mask])
             hotnesses.append(hotness)
 
         return np.array(hotnesses)

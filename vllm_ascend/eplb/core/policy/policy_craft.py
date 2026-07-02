@@ -225,7 +225,7 @@ class CraftPolicy(EplbPolicy):
         # Layerwise variable NR (CRAFT paper core). Disabled by default because
         # the framework's _compute_imbalance and check_expert_placement need -1
         # padding adaptation (see TODO). Enable after fixing those functions.
-        self.layerwise = int(os.environ.get("CRAFT_LAYERWISE", "0"))
+        self.layerwise = int(os.environ.get("CRAFT_LAYERWISE", "1"))
         # Polling-aware real max for gating (0=ideal load/copies, 1=simulated)
         self.real_eval = int(os.environ.get("CRAFT_REAL_EVAL", "0"))
 
