@@ -249,9 +249,25 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale = [layer.fused_w1_scale] if fused_scale_flag else [layer.w13_weight_scale_fp32]
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
+        if getattr(layer, "local_num_experts_pool", 0) > 0:
+            w1_pool = [layer.w13_weight_pool]
+            w1_scale_pool = [layer.fused_w1_scale_pool] if fused_scale_flag else [layer.w13_weight_scale_fp32_pool]
+            w2_pool = [layer.w2_weight_pool]
+            w2_scale_pool = [layer.fused_w2_scale_pool] if fused_scale_flag else [layer.w2_weight_scale_pool]
+        else:
+            w1_pool = None
+            w1_scale_pool = None
+            w2_pool = None
+            w2_scale_pool = None
 
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+        w1_scale_bias_pool = (
+            [torch.tensor([], dtype=torch.float32)] if fused_scale_flag and w1_pool is not None else None
+        )
+        w2_scale_bias_pool = (
+            [torch.tensor([], dtype=torch.float32)] if fused_scale_flag and w2_pool is not None else None
+        )
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -273,6 +289,12 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale=w2_scale,
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
+                w1_pool=w1_pool,
+                w2_pool=w2_pool,
+                w1_scale_pool=w1_scale_pool,
+                w2_scale_pool=w2_scale_pool,
+                w1_scale_bias_pool=w1_scale_bias_pool,
+                w2_scale_bias_pool=w2_scale_bias_pool,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -292,10 +314,30 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
+        pool_size = getattr(layer, "local_num_experts_pool", 0)
+        if pool_size > 0:
+            main_size = getattr(layer, "local_num_experts_main", layer.w13_weight.shape[0] - pool_size)
+            layer.w13_weight_pool = layer.w13_weight.data[main_size:].clone()
+            layer.w2_weight_pool = layer.w2_weight.data[main_size:].clone()
+            layer.w13_weight_scale_pool = layer.w13_weight_scale.data[main_size:].clone()
+            layer.w13_weight_scale_fp32_pool = layer.w13_weight_scale_fp32.data[main_size:].clone()
+            layer.w13_weight_offset_pool = layer.w13_weight_offset.data[main_size:].clone()
+            layer.w2_weight_scale_pool = layer.w2_weight_scale.data[main_size:].clone()
+            layer.w2_weight_offset_pool = layer.w2_weight_offset.data[main_size:].clone()
+            layer.w13_weight.data = layer.w13_weight.data[:main_size].clone()
+            layer.w2_weight.data = layer.w2_weight.data[:main_size].clone()
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data[:main_size].clone()
+            layer.w13_weight_scale_fp32 = layer.w13_weight_scale_fp32.data[:main_size].clone()
+            layer.w13_weight_offset.data = layer.w13_weight_offset.data[:main_size].clone()
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data[:main_size].clone()
+            layer.w2_weight_offset.data = layer.w2_weight_offset.data[:main_size].clone()
 
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
             layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
             layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
+            if pool_size > 0:
+                layer.fused_w1_scale_pool = scale_from_float_to_int64(layer.w13_weight_scale_pool.data)
+                layer.fused_w2_scale_pool = scale_from_float_to_int64(layer.w2_weight_scale_pool.data)
 
         if self.dynamic_eplb:
             layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]

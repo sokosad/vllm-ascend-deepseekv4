@@ -89,9 +89,13 @@ class VllmEplbAdaptor:
 
         for layer_idx in range(self.num_dense_layers, self.model.config.num_hidden_layers):
             self.expert_param_per_layer[layer_idx] = list()
+            experts = self.model.model.layers[layer_idx].mlp.experts
+            if getattr(experts, "craft_pool_enabled", False):
+                self._init_pool_expert_param_for_layer(layer_idx, experts)
+                continue
             for name in self.expert_weight_names:
                 param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"
-                param_value = getattr(self.model.model.layers[layer_idx].mlp.experts, name)
+                param_value = getattr(experts, name)
                 self.param_dict[param_key] = param_value
             for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()
@@ -100,6 +104,34 @@ class VllmEplbAdaptor:
                         self.param_dict["model.layers." + str(layer_idx) + ".mlp.experts." + name][local_expert_id]
                     )
                 self.expert_param_per_layer[layer_idx].append(per_expert_param)
+
+    def _init_pool_expert_param_for_layer(self, layer_idx, experts):
+        main_size = experts.local_num_experts_main
+        pool_names = {
+            "w13_weight_list": "w13_weight_pool",
+            "w2_weight_list": "w2_weight_pool",
+            "w13_weight_scale_fp32_list": "w13_weight_scale_fp32_pool",
+            "w2_weight_scale_list": "w2_weight_scale_pool",
+            "fused_w1_scale_list": "fused_w1_scale_pool",
+            "fused_w2_scale_list": "fused_w2_scale_pool",
+        }
+        for name in self.expert_weight_names:
+            param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"
+            self.param_dict[param_key] = getattr(experts, name)
+            pool_name = pool_names.get(name)
+            if pool_name is not None and hasattr(experts, pool_name):
+                self.param_dict[f"{param_key}_pool"] = getattr(experts, pool_name)
+
+        for local_expert_id in range(self.num_local_experts):
+            per_expert_param = list()
+            for name in self.expert_weight_names:
+                param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"
+                if local_expert_id < main_size:
+                    per_expert_param.append(self.param_dict[param_key][local_expert_id])
+                else:
+                    pool_key = f"{param_key}_pool"
+                    per_expert_param.append(self.param_dict[pool_key][local_expert_id - main_size])
+            self.expert_param_per_layer[layer_idx].append(per_expert_param)
 
     def get_rank_expert_workload(self) -> torch.Tensor:
         self.moe_load = self.model.get_all_moe_loads()

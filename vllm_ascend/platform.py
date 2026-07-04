@@ -257,6 +257,28 @@ class NPUPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
+        craft_pool_size = ascend_config.eplb_config.craft_pool_size
+        if craft_pool_size > 0:
+            if vllm_config.additional_config is None:
+                vllm_config.additional_config = {}
+            ep_size = max(1, getattr(parallel_config, "tensor_parallel_size", 1))
+            pool_redundant_experts = craft_pool_size * ep_size
+            configured_redundant_experts = ascend_config.eplb_config.num_redundant_experts
+            if configured_redundant_experts not in (0, pool_redundant_experts):
+                raise ValueError(
+                    "craft_pool_size conflicts with num_redundant_experts: "
+                    f"craft_pool_size={craft_pool_size}, ep_size={ep_size}, "
+                    f"num_redundant_experts={configured_redundant_experts}."
+                )
+            ascend_config.eplb_config.config["num_redundant_experts"] = pool_redundant_experts
+            parallel_eplb_config = getattr(parallel_config, "eplb_config", None)
+            if parallel_eplb_config is not None:
+                setattr(parallel_eplb_config, "num_redundant_experts", pool_redundant_experts)
+                setattr(parallel_eplb_config, "craft_pool_size", craft_pool_size)
+            vllm_config.additional_config.setdefault("eplb_config", {})[
+                "num_redundant_experts"
+            ] = pool_redundant_experts
+
         ascend_compilation_config = ascend_config.ascend_compilation_config
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(

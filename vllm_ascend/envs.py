@@ -105,6 +105,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # counter in the MoE layer forward; logs cumulative tokens every N calls.
     "VLLM_ASCEND_LOG_CARD_TOKENS": lambda: bool(int(os.getenv("VLLM_ASCEND_LOG_CARD_TOKENS", "0"))),
     "VLLM_ASCEND_CARD_TOK_LOG_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_CARD_TOK_LOG_INTERVAL", "2000")),
+    # Static CRAFT pooling: extra local redundant expert slots per rank.
+    # 0 keeps the existing single-tensor MoE path.
+    "VLLM_ASCEND_CRAFT_POOL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True

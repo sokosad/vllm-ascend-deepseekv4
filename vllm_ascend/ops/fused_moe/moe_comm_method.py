@@ -59,6 +59,24 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
 
 
+def _apply_log2phy(log2phy: torch.Tensor | None, topk_ids: torch.Tensor) -> torch.Tensor:
+    if log2phy is None:
+        return topk_ids
+    if log2phy.dim() == 1:
+        return log2phy[topk_ids]
+
+    candidates = log2phy[topk_ids]
+    replica_counts = torch.sum(candidates >= 0, dim=-1)
+    if torch.any(replica_counts == 0):
+        raise ValueError("Pool log2phy contains a logical expert without a physical replica.")
+
+    token_selector = torch.arange(topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64)
+    while token_selector.dim() < topk_ids.dim():
+        token_selector = token_selector.unsqueeze(-1)
+    replica_selector = (token_selector + topk_ids.to(torch.int64)) % replica_counts
+    return candidates.gather(-1, replica_selector.unsqueeze(-1)).squeeze(-1)
+
+
 def set_gmmswigluquant_method():
     from vllm_ascend.ascend_config import get_ascend_config
 
@@ -127,9 +145,10 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
-        routed_topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+        routed_topk_ids = _apply_log2phy(
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.topk_ids,
+        )
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -278,7 +297,10 @@ class FusedMC2CommImpl(MoECommMethod):
             "w1_scale and w2_scale cannot be None for FusedMC2CommImpl."
         )
 
-        assert not (fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None), (
+        assert not (
+            fused_experts_input.weights.w1_scale_bias is None
+            or fused_experts_input.weights.w2_scale_bias is None
+        ), (
             "w1_scale_bias and w2_scale_bias cannot be None for FusedMC2CommImpl."
         )
 
@@ -287,9 +309,10 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         # Apply log2phy if needed
-        topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+        topk_ids = _apply_log2phy(
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.topk_ids,
+        )
 
         expert_tokens = None
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
@@ -330,4 +353,8 @@ class FusedMC2CommImpl(MoECommMethod):
             )
         else:
             raise ValueError(f"Wrong value of {envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2=}")
-        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens, swiglu_limit=fused_experts_input.swiglu_limit)
+        return FusedExpertsResult(
+            routed_out=out,
+            expert_tokens=expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+        )

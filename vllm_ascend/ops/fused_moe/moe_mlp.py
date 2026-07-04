@@ -403,13 +403,72 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     w2_scale_bias = mlp_compute_input.weights.w2_scale_bias
     w1_offset = mlp_compute_input.weights.w1_offset
     w2_offset = mlp_compute_input.weights.w2_offset
+    w1_pool = mlp_compute_input.weights.w1_pool
+    w2_pool = mlp_compute_input.weights.w2_pool
+    w1_scale_pool = mlp_compute_input.weights.w1_scale_pool
+    w2_scale_pool = mlp_compute_input.weights.w2_scale_pool
+    w1_scale_bias_pool = mlp_compute_input.weights.w1_scale_bias_pool
+    w2_scale_bias_pool = mlp_compute_input.weights.w2_scale_bias_pool
+    w1_offset_pool = mlp_compute_input.weights.w1_offset_pool
+    w2_offset_pool = mlp_compute_input.weights.w2_offset_pool
     activation = mlp_compute_input.activation
     need_trans = mlp_compute_input.need_trans
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
+    has_pool = w1_pool is not None and w2_pool is not None
+
+    if has_pool:
+        if group_list_type != 1:
+            raise ValueError("CRAFT pool MLP split requires count-mode group_list.")
+        w1_main_tensor = w1[0] if isinstance(w1, list) else w1
+        main_experts = w1_main_tensor.shape[0]
+        main_tokens = int(group_list[:main_experts].sum().item())
+        group_list_main = group_list[:main_experts]
+        group_list_pool = group_list[main_experts:]
+        hidden_main = hidden_states[:main_tokens]
+        hidden_pool = hidden_states[main_tokens:]
+        dynamic_scale_main = dynamic_scale[:main_tokens] if dynamic_scale is not None else None
+        dynamic_scale_pool = dynamic_scale[main_tokens:] if dynamic_scale is not None else None
+        topk_scales_main = topk_scales[:main_tokens] if topk_scales is not None else None
+        topk_scales_pool = topk_scales[main_tokens:] if topk_scales is not None else None
 
     if not mlp_compute_input.quant.is_quant:
+        if has_pool:
+            outputs = []
+            before_gmm2_evt = None
+            if hidden_main.shape[0] > 0:
+                out_main, before_gmm2_evt = unquant_apply_mlp(
+                    hidden_states=hidden_main,
+                    w1=w1,
+                    w2=w2,
+                    w1_bias=w1_bias,
+                    w2_bias=w2_bias,
+                    activation=activation,
+                    group_list=group_list_main,
+                    group_list_type=group_list_type,
+                    topk_scales=topk_scales_main,
+                    need_trans=need_trans,
+                )
+                outputs.append(out_main)
+            if hidden_pool.shape[0] > 0:
+                out_pool, pool_evt = unquant_apply_mlp(
+                    hidden_states=hidden_pool,
+                    w1=w1_pool,
+                    w2=w2_pool,
+                    w1_bias=None,
+                    w2_bias=None,
+                    activation=activation,
+                    group_list=group_list_pool,
+                    group_list_type=group_list_type,
+                    topk_scales=topk_scales_pool,
+                    need_trans=need_trans,
+                )
+                before_gmm2_evt = before_gmm2_evt or pool_evt
+                outputs.append(out_pool)
+            if not outputs:
+                return hidden_states, before_gmm2_evt
+            return torch.cat(outputs, dim=0), before_gmm2_evt
         return unquant_apply_mlp(
             hidden_states=hidden_states,
             w1=w1,
@@ -439,6 +498,67 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         scale_type = mxfp.scale_dtype
         per_token_scale_type = mxfp.per_token_scale_dtype
         use_bf16 = mxfp.use_bf16
+
+    if has_pool:
+        assert w1_scale_pool is not None and w2_scale_pool is not None
+        outputs = []
+        before_gmm2_evt = None
+        if hidden_main.shape[0] > 0:
+            out_main, before_gmm2_evt = quant_apply_mlp(
+                hidden_states=hidden_main,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                group_list=group_list_main,
+                dynamic_scale=dynamic_scale_main,
+                group_list_type=group_list_type,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+                w1_offset=w1_offset,
+                w2_offset=w2_offset,
+                fusion=fusion,
+                dynamic_eplb=dynamic_eplb,
+                use_mxfp_quant=use_mxfp_quant,
+                act_quant_type=act_quant_type,
+                weight_quant_type=weight_quant_type,
+                scale_type=scale_type,
+                per_token_scale_type=per_token_scale_type,
+                use_bf16=use_bf16,
+                swiglu_limit=swiglu_limit,
+                quant_type=mlp_compute_input.quant.quant_type,
+            )
+            outputs.append(out_main)
+        if hidden_pool.shape[0] > 0:
+            out_pool, pool_evt = quant_apply_mlp(
+                hidden_states=hidden_pool,
+                w1=w1_pool,
+                w1_scale=w1_scale_pool,
+                w2=w2_pool,
+                w2_scale=w2_scale_pool,
+                group_list=group_list_pool,
+                dynamic_scale=dynamic_scale_pool,
+                group_list_type=group_list_type,
+                w1_scale_bias=w1_scale_bias_pool,
+                w2_scale_bias=w2_scale_bias_pool,
+                w1_offset=w1_offset_pool,
+                w2_offset=w2_offset_pool,
+                fusion=fusion,
+                dynamic_eplb=dynamic_eplb,
+                use_mxfp_quant=use_mxfp_quant,
+                act_quant_type=act_quant_type,
+                weight_quant_type=weight_quant_type,
+                scale_type=scale_type,
+                per_token_scale_type=per_token_scale_type,
+                use_bf16=use_bf16,
+                swiglu_limit=swiglu_limit,
+                quant_type=mlp_compute_input.quant.quant_type,
+            )
+            before_gmm2_evt = before_gmm2_evt or pool_evt
+            outputs.append(out_pool)
+        if not outputs:
+            return hidden_states, before_gmm2_evt
+        return torch.cat(outputs, dim=0), before_gmm2_evt
 
     return quant_apply_mlp(
         hidden_states=hidden_states,

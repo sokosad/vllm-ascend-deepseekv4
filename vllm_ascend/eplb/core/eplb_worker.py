@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, generate_pool_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
 
@@ -141,6 +141,7 @@ class EplbWorker:
                     updated_expert_maps_this_layer,
                     layer_id,
                 )
+                continue
 
             # Parse expert_ids each rank needs to receive from other ranks
             dst_rank_indices, experts_to_recv = torch.where(
@@ -259,7 +260,10 @@ class EplbWorker:
 
             maps.append(new_expert_map[self.rank_id].numpy().tolist())
 
-            log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
+            if self.policy_type == 4:
+                log2phy_map = generate_pool_log2phy_map(new_expert_map)
+            else:
+                log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
             log2phy_all.append(log2phy_map.numpy().tolist())
 
             layer_ids.append(layer_id)

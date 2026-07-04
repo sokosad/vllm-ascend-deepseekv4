@@ -3,6 +3,7 @@
 from .policy_abstract import DynamicConfig, EplbPolicy
 from .policy_default_eplb import DefaultEplb
 from .policy_flashlb import FlashLB, warm_up
+from .policy_pool_eplb import PoolBalanceEplb
 from .policy_random import RandomLoadBalance
 from .policy_swift_balancer import SwiftBalanceEplb
 
@@ -22,6 +23,8 @@ class PolicyFactory:
             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
             # Multi-Shot Enhancement and Incremental Adjustment
             3: FlashLB,
+            # CRAFT pool EPLB: fixed home segment, dynamically replaced pool slots
+            4: PoolBalanceEplb,
         }
         policy_class = policy.get(policy_type, RandomLoadBalance)
         policy_instance = policy_class(config)

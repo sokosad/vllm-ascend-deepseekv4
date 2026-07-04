@@ -393,12 +393,15 @@ class EplbConfig:
         "expert_map_record_path": None,
         "num_redundant_experts": 0,
         "eplb_policy_type": 1,
+        "craft_pool_size": 0,
     }
 
     def __init__(self, user_config: dict | None = None):
         if user_config is None:
             user_config = {}
         self.config = self._defaults.copy()
+        if "craft_pool_size" not in user_config:
+            self.config["craft_pool_size"] = int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0"))
         if user_config and isinstance(user_config, dict):
             for key, value in user_config.items():
                 if key in self.config:
@@ -426,13 +429,18 @@ class EplbConfig:
                 raise TypeError("The expert_map_record_path is not json.")
             dirname = os.path.dirname(self.expert_map_record_path)
             os.makedirs(dirname, exist_ok=True)
-        for key in ["expert_heat_collection_interval", "algorithm_execution_interval", "num_redundant_experts"]:
+        for key in [
+            "expert_heat_collection_interval",
+            "algorithm_execution_interval",
+            "num_redundant_experts",
+            "craft_pool_size",
+        ]:
             if not isinstance(self.config[key], int):
                 raise TypeError(f"{key} must be an integer")
             if self.config[key] < 0:  # type: ignore
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
-        if self.eplb_policy_type not in [0, 1, 2, 3]:
-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
+            raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
@@ -441,6 +449,7 @@ class EplbConfig:
 
         logger.info(f"Dynamic EPLB is {self.config['dynamic_eplb']}")
         logger.info(f"The number of redundant experts is {self.config['num_redundant_experts']}")
+        logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

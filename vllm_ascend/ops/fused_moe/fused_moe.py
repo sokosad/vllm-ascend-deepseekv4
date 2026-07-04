@@ -37,7 +37,13 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.eplb.core.eplb_utils import (
+    expert_file_pool_metadata,
+    expert_file_pool_size_is_uniform,
+    generate_local_physical_expert_mask,
+    generate_pool_log2phy_map,
+    init_eplb_config,
+)
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
@@ -356,7 +362,67 @@ class AscendFusedMoE(FusedMoE):
         )
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
-        self.local_num_experts = self.global_num_experts // self.ep_size
+        pool_map_enabled, pool_start, pool_size_from_map = expert_file_pool_metadata(
+            eplb_config.expert_map_path, self.moe_instance_id)
+        self.local_num_experts_main = pool_start if pool_start is not None else num_experts // self.ep_size
+        configured_pool_size = max(
+            0,
+            int(
+                getattr(
+                    eplb_config,
+                    "craft_pool_size",
+                    envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE,
+                ) or 0
+            ),
+        )
+        self.local_num_experts_pool = configured_pool_size if configured_pool_size > 0 else (pool_size_from_map or 0)
+        self.craft_pool_enabled = pool_map_enabled or configured_pool_size > 0
+        self.dispatch_expert_map = self._expert_map
+        if eplb_config.dynamic_eplb and eplb_config.eplb_policy_type == 4 and not self.craft_pool_enabled:
+            raise ValueError(
+                "Dynamic CRAFT pool requires eplb_config.craft_pool_size > 0 "
+                "or a pool_mode expert_map_path."
+            )
+        if self.craft_pool_enabled:
+            if eplb_config.dynamic_eplb and eplb_config.eplb_policy_type != 4:
+                raise ValueError("Dynamic CRAFT pool requires eplb_policy_type=4.")
+            if (
+                configured_pool_size > 0
+                and pool_size_from_map is not None
+                and pool_size_from_map != configured_pool_size
+            ):
+                raise ValueError(
+                    "CRAFT pool expert_map conflicts with craft_pool_size: "
+                    f"map_pool_size={pool_size_from_map}, craft_pool_size={configured_pool_size}."
+                )
+            if pool_map_enabled and eplb_config.dynamic_eplb and not expert_file_pool_size_is_uniform(
+                eplb_config.expert_map_path
+            ):
+                raise ValueError("Dynamic CRAFT pool requires a fixed pool_size across all layers.")
+            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+                raise ValueError("CRAFT pool requires VLLM_ASCEND_ENABLE_FUSED_MC2=0 (AllGather path).")
+            if self.global_expert_map is None:
+                raise ValueError("CRAFT pool requires eplb_config.craft_pool_size or a pool_mode expert_map_path.")
+            local_slots = int(torch.max(self._expert_map).item()) + 1 if self._expert_map is not None else 0
+            inferred_pool_size = max(0, local_slots - self.local_num_experts_main)
+            if self.local_num_experts_pool <= 0:
+                self.local_num_experts_pool = inferred_pool_size
+            if local_slots != self.local_num_experts_main + self.local_num_experts_pool:
+                raise ValueError(
+                    "CRAFT pool expert_map slot count mismatch: "
+                    f"local_slots={local_slots}, main={self.local_num_experts_main}, "
+                    f"pool={self.local_num_experts_pool}.")
+            self.global_num_experts = num_experts
+            self.global_redundant_expert_num = 0
+            self.log2phy = generate_pool_log2phy_map(self.global_expert_map).npu()
+            self.local_num_experts = self.local_num_experts_main + self.local_num_experts_pool
+            self.dispatch_expert_map = generate_local_physical_expert_mask(
+                self.local_num_experts,
+                self.ep_size,
+                self.ep_rank,
+            ).npu()
+        else:
+            self.local_num_experts = self.global_num_experts // self.ep_size
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -385,6 +451,8 @@ class AscendFusedMoE(FusedMoE):
         self.swiglu_limit= getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 1000000)
         moe_quant_params = {
             "num_experts": self.local_num_experts,
+            "num_experts_main": self.local_num_experts_main,
+            "num_experts_pool": self.local_num_experts_pool,
             "hidden_size": self.hidden_size,
             "intermediate_size_per_partition": self.intermediate_size_per_partition,
             "params_dtype": self.params_dtype,
@@ -567,7 +635,7 @@ class AscendFusedMoE(FusedMoE):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             global_num_experts=self.global_num_experts,
-            expert_map=self._expert_map,
+            expert_map=self.dispatch_expert_map,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,

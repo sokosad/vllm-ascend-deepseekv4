@@ -10,6 +10,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.eplb.core.eplb_utils import expert_file_has_pool_mode
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -229,6 +230,25 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     """
     if not is_moe_model(vllm_config):
         return None
+    eplb_config = getattr(vllm_config.parallel_config, "eplb_config", None)
+    additional_config = vllm_config.additional_config or {}
+    ascend_eplb_config = additional_config.get("eplb_config", {})
+    expert_map_path = getattr(eplb_config, "expert_map_path", None)
+    eplb_policy_type = ascend_eplb_config.get(
+        "eplb_policy_type",
+        getattr(eplb_config, "eplb_policy_type", None),
+    )
+    craft_pool_size = ascend_eplb_config.get(
+        "craft_pool_size",
+        getattr(eplb_config, "craft_pool_size", envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE),
+    )
+    craft_pool_size = int(craft_pool_size or 0)
+    if (
+        eplb_policy_type == 4
+        or craft_pool_size > 0
+        or expert_file_has_pool_mode(expert_map_path)
+    ):
+        return MoECommType.ALLGATHER
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
     quant_type = getattr(
