@@ -210,6 +210,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        num_experts_pool: int = 0,
         **extra_weight_attrs,
     ) -> None:
         weight_param = self.quant_method.get_weight(
@@ -236,6 +237,29 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             if any(fields in param_key for fields in per_group_param):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
 
+        # Pool (redundant) weights — independent expert count per layer
+        # pool defaults to 0 (disabled); craft_alloc MCKP sets k_i > 0 per layer
+        if num_experts_pool > 0:
+            weight_param_pool = self.quant_method.get_weight(
+                num_experts_pool, intermediate_size_per_partition, hidden_size, params_dtype
+            )
+            for param_key, param_value in weight_param_pool.items():
+                pool_key = param_key + "_pool"
+                param = torch.nn.Parameter(param_value, requires_grad=False)
+                layer.register_parameter(pool_key, param)
+                set_weight_attrs(param, extra_weight_attrs)
+
+            dynamic_quant_param_pool = self.quant_method.get_dynamic_quant_param(
+                num_experts_pool, intermediate_size_per_partition, hidden_size, params_dtype
+            )
+            for param_key, param_value in dynamic_quant_param_pool.items():
+                pool_key = param_key + "_pool"
+                param = torch.nn.Parameter(param_value, requires_grad=False)
+                layer.register_parameter(pool_key, param)
+                set_weight_attrs(param, extra_weight_attrs)
+                if any(fields in param_key for fields in per_group_param):
+                    param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -260,6 +284,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
+        replica_options: torch.Tensor | None = None,
+        replica_counts: torch.Tensor | None = None,
+        replica_card_of: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.quant_method.apply(
             layer=layer,
@@ -284,6 +311,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             mc2_mask=mc2_mask,
+            replica_options=replica_options,
+            replica_counts=replica_counts,
+            replica_card_of=replica_card_of,
             tid2eid=self.tid2eid,
         )
 

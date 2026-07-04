@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -122,6 +123,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        replica_options: torch.Tensor | None = None,
+        replica_counts: torch.Tensor | None = None,
+        replica_card_of: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -215,6 +219,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                replica_options=replica_options,
+                replica_counts=replica_counts,
+                replica_card_of=replica_card_of,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -357,18 +364,47 @@ class AscendFusedMoE(FusedMoE):
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.local_num_experts = self.global_num_experts // self.ep_size
+        # Pool (redundant) expert count — independent per layer, decoupled from EP.
+        # 0 = disabled (default). Set via VLLM_ASCEND_CRAFT_POOL_SIZE env for dev,
+        # or populated from craft_alloc per-layer JSON (step 5).
+        #
+        # Key design: global_num_experts and global_redundant_expert_num from
+        # init_eplb_config are NOT overridden — they encode the total physical
+        # slots including pool (e.g. 256 + 8k_i) so MC2 dispatch computes the
+        # correct moe_expert_num = 256 + 8k_i. The routing assertion
+        #   router_logits[1] == global_num_experts - global_redundant_expert_num
+        #   = (256 + 8k_i) - 8k_i = 256
+        # passes correctly.
+        #
+        # Only local_num_experts is split: 32 for create_weights main tensor,
+        # k_i for pool tensor. Dispatch uses total_local = 32 + k_i.
+        self.local_num_experts_pool = int(os.environ.get("VLLM_ASCEND_CRAFT_POOL_SIZE", 0))
+        if self.local_num_experts_pool > 0:
+            # Split local count: main for create_weights, total for dispatch
+            self.local_num_experts = num_experts // self.ep_size  # 32 (main only)
+            self.local_num_experts_total = self.local_num_experts + self.local_num_experts_pool
+            logger.info_once(
+                "[Pool] Pool mode enabled: main=%d pool=%d total=%d per card "
+                "(global_redundant_expert_num=%d global_num_experts=%d)",
+                self.local_num_experts, self.local_num_experts_pool,
+                self.local_num_experts_total,
+                self.global_redundant_expert_num, self.global_num_experts)
+        else:
+            self.local_num_experts_total = self.local_num_experts
         # Build 2D replica options for Metro replica selection (if enabled)
         self._replica_options = None
         self._replica_counts = None
+        self._replica_card_of = None
         from vllm_ascend.ops.fused_moe.metro_replica import get_metro_strategy
         if get_metro_strategy() > 0 and self.global_expert_map is not None:
             valid_count = self.global_expert_map[0].ne(-1).sum().item()
             from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
-            self._replica_options, self._replica_counts = build_replica_options(
-                self.global_expert_map, self.ep_size, valid_count)
+            self._replica_options, self._replica_counts, self._replica_card_of = \
+                build_replica_options(self.global_expert_map, self.ep_size, valid_count)
             # Move to NPU for runtime efficiency (topk_ids is on NPU)
             self._replica_options = self._replica_options.npu()
             self._replica_counts = self._replica_counts.npu()
+            self._replica_card_of = self._replica_card_of.npu()
             logger.info_once(
                 "[Metro] Replica selection enabled (strategy=%d), "
                 "max_replicas=%d", get_metro_strategy(),
@@ -394,7 +430,7 @@ class AscendFusedMoE(FusedMoE):
                 self.moe_load = torch.zeros((self.num_iter, self.local_num_experts), dtype=torch.int32, device="npu")
 
         self.moe_config.num_experts = self.global_num_experts
-        self.moe_config.num_local_experts = self.local_num_experts
+        self.moe_config.num_local_experts = self.local_num_experts_total
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
         self._init_force_load_balance_ids()
         # TODO(qcs): check the default value of ops.
@@ -405,6 +441,7 @@ class AscendFusedMoE(FusedMoE):
             "intermediate_size_per_partition": self.intermediate_size_per_partition,
             "params_dtype": self.params_dtype,
             "weight_loader": self.weight_loader,
+            "num_experts_pool": self.local_num_experts_pool,
         }
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod"):
@@ -475,10 +512,11 @@ class AscendFusedMoE(FusedMoE):
         if self._replica_options is not None and self.global_expert_map is not None:
             from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
             valid_count = self.global_expert_map[0].ne(-1).sum().item()
-            opts, cnts = build_replica_options(
+            opts, cnts, cards = build_replica_options(
                 self.global_expert_map, self.ep_size, valid_count)
             self._replica_options = opts.npu()
             self._replica_counts = cnts.npu()
+            self._replica_card_of = cards.npu()
 
     def clear_moe_load(self):
         if self.moe_load is not None:
@@ -610,6 +648,7 @@ class AscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
             replica_options=self._replica_options,
             replica_counts=self._replica_counts,
+            replica_card_of=self._replica_card_of,
         )
 
         if self.dynamic_eplb:

@@ -409,7 +409,53 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
 
+    # Pool (redundant) weights — when enabled, split hidden/group into main
+    # and pool sections, each goes through its own GMM call, then cat back.
+    # Pool is disabled by default (None); craft_alloc MCKP sets k_i > 0 per layer.
+    w1_pool = mlp_compute_input.weights.w1_pool
+    w2_pool = mlp_compute_input.weights.w2_pool
+    has_pool = w1_pool is not None and w2_pool is not None
+
+    # --- helpers for pool split ---
+    def _split_for_pool():
+        """Split hidden_states, group_list, dynamic_scale at the main/pool boundary."""
+        assert not dynamic_eplb, (
+            "Pool mode requires dynamic_eplb=False — with dynamic_eplb=True, "
+            "w1[0].shape[0] gives intermediate_size not num_experts.")
+        n_main = w1[0].shape[0] if isinstance(w1, list) else w1.shape[0]
+        n_main_tokens = int(group_list[:n_main].sum().item())
+        group_m = group_list[:n_main]
+        group_p = group_list[n_main:]
+        hidden_m = hidden_states[:n_main_tokens]
+        hidden_p = hidden_states[n_main_tokens:]
+        ds_m = dynamic_scale[:n_main_tokens] if dynamic_scale is not None else None
+        ds_p = dynamic_scale[n_main_tokens:] if dynamic_scale is not None else None
+        return hidden_m, hidden_p, group_m, group_p, ds_m, ds_p, n_main
+
+    if has_pool:
+        w1_scale_pool = mlp_compute_input.weights.w1_scale_pool
+        w2_scale_pool = mlp_compute_input.weights.w2_scale_pool
+        w1_scale_bias_pool = mlp_compute_input.weights.w1_scale_bias_pool
+        w2_scale_bias_pool = mlp_compute_input.weights.w2_scale_bias_pool
+        w1_offset_pool = mlp_compute_input.weights.w1_offset_pool
+        w2_offset_pool = mlp_compute_input.weights.w2_offset_pool
+
     if not mlp_compute_input.quant.is_quant:
+        if has_pool:
+            h_m, h_p, g_m, g_p, _, _, _ = _split_for_pool()
+            out_main, _ = unquant_apply_mlp(
+                hidden_states=h_m, w1=w1, w2=w2,
+                w1_bias=w1_bias, w2_bias=w2_bias, activation=activation,
+                group_list=g_m, group_list_type=group_list_type,
+                topk_scales=topk_scales, need_trans=need_trans,
+            )
+            out_pool, _ = unquant_apply_mlp(
+                hidden_states=h_p, w1=w1_pool, w2=w2_pool,
+                w1_bias=None, w2_bias=None, activation=activation,
+                group_list=g_p, group_list_type=group_list_type,
+                topk_scales=None, need_trans=need_trans,
+            )
+            return torch.cat([out_main, out_pool], dim=0), None
         return unquant_apply_mlp(
             hidden_states=hidden_states,
             w1=w1,
@@ -439,6 +485,36 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         scale_type = mxfp.scale_dtype
         per_token_scale_type = mxfp.per_token_scale_dtype
         use_bf16 = mxfp.use_bf16
+
+    if has_pool:
+        h_m, h_p, g_m, g_p, ds_m, ds_p, _ = _split_for_pool()
+        out_main, evt = quant_apply_mlp(
+            hidden_states=h_m, w1=w1, w1_scale=w1_scale,
+            w2=w2, w2_scale=w2_scale, group_list=g_m,
+            dynamic_scale=ds_m, group_list_type=group_list_type,
+            w1_scale_bias=w1_scale_bias, w2_scale_bias=w2_scale_bias,
+            w1_offset=w1_offset, w2_offset=w2_offset,
+            fusion=fusion, dynamic_eplb=dynamic_eplb,
+            use_mxfp_quant=use_mxfp_quant, act_quant_type=act_quant_type,
+            weight_quant_type=weight_quant_type, scale_type=scale_type,
+            per_token_scale_type=per_token_scale_type, use_bf16=use_bf16,
+            swiglu_limit=swiglu_limit,
+            quant_type=mlp_compute_input.quant.quant_type,
+        )
+        out_pool, _ = quant_apply_mlp(
+            hidden_states=h_p, w1=w1_pool, w1_scale=w1_scale_pool,
+            w2=w2_pool, w2_scale=w2_scale_pool, group_list=g_p,
+            dynamic_scale=ds_p, group_list_type=group_list_type,
+            w1_scale_bias=w1_scale_bias_pool, w2_scale_bias=w2_scale_bias_pool,
+            w1_offset=w1_offset_pool, w2_offset=w2_offset_pool,
+            fusion=fusion, dynamic_eplb=False,
+            use_mxfp_quant=use_mxfp_quant, act_quant_type=act_quant_type,
+            weight_quant_type=weight_quant_type, scale_type=scale_type,
+            per_token_scale_type=per_token_scale_type, use_bf16=use_bf16,
+            swiglu_limit=swiglu_limit,
+            quant_type=mlp_compute_input.quant.quant_type,
+        )
+        return torch.cat([out_main, out_pool], dim=0), evt
 
     return quant_apply_mlp(
         hidden_states=hidden_states,

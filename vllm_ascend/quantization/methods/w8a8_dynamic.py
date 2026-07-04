@@ -187,6 +187,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
+        replica_options: torch.Tensor | None = None,
+        replica_counts: torch.Tensor | None = None,
+        replica_card_of: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -253,6 +256,26 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
+        # Pool (redundant) weights — read from layer if pool is enabled
+        has_pool = hasattr(layer, 'w13_weight_pool')
+        if has_pool:
+            w1_pool = [layer.w13_weight_pool]
+            w2_pool = [layer.w2_weight_pool]
+            w1_scale_pool = [layer.w13_weight_scale_fp32_pool] \
+                if hasattr(layer, 'w13_weight_scale_fp32_pool') else [layer.w13_weight_scale_pool]
+            w2_scale_pool = [layer.w2_weight_scale_pool]  # w2 scale stays int8 (same as main)
+            w1_scale_bias_pool = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+            w2_scale_bias_pool = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+            # Match main path: W8A8_DYNAMIC uses dynamic per-token quant, not
+            # pre-quantized hidden states, so offset must be None (same as main
+            # which does not pass w1_offset/w2_offset to build_fused_experts_input).
+            w1_offset_pool: torch.Tensor | None = None
+            w2_offset_pool: torch.Tensor | None = None
+        else:
+            w1_pool = w2_pool = w1_scale_pool = w2_scale_pool = None
+            w1_scale_bias_pool = w2_scale_bias_pool = None
+            w1_offset_pool = w2_offset_pool = None
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -274,6 +297,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                replica_options=replica_options,
+                replica_counts=replica_counts,
+                replica_card_of=replica_card_of,
+                w1_pool=w1_pool,
+                w2_pool=w2_pool,
+                w1_scale_pool=w1_scale_pool,
+                w2_scale_pool=w2_scale_pool,
+                w1_scale_bias_pool=w1_scale_bias_pool,
+                w2_scale_bias_pool=w2_scale_bias_pool,
+                w1_offset_pool=w1_offset_pool,
+                w2_offset_pool=w2_offset_pool,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -322,3 +356,25 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 del layer.fused_w1_scale
                 del layer.fused_w2_scale
             torch.npu.empty_cache()
+
+        # Pool (redundant) weights — same transpose+NZ processing as main.
+        # Pool tensors are registered by create_weights when num_experts_pool>0.
+        if hasattr(layer, 'w13_weight_pool'):
+            pool_size = layer.w13_weight_pool.data.shape[0]
+            # Transpose + NZ format
+            layer.w13_weight_pool.data = layer.w13_weight_pool.data.transpose(1, 2).contiguous()
+            layer.w2_weight_pool.data = layer.w2_weight_pool.data.transpose(1, 2).contiguous()
+            layer.w13_weight_pool.data = torch_npu.npu_format_cast(
+                layer.w13_weight_pool.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w2_weight_pool.data = torch_npu.npu_format_cast(
+                layer.w2_weight_pool.data, ACL_FORMAT_FRACTAL_NZ)
+            # Scales and offsets
+            layer.w13_weight_scale_pool.data = layer.w13_weight_scale_pool.data.view(pool_size, -1)
+            layer.w13_weight_scale_fp32_pool = layer.w13_weight_scale_pool.data.to(torch.float32)
+            layer.w13_weight_offset_pool.data = layer.w13_weight_offset_pool.data.view(pool_size, -1)
+            layer.w2_weight_scale_pool.data = layer.w2_weight_scale_pool.data.view(pool_size, -1)
+            layer.w2_weight_offset_pool.data = layer.w2_weight_offset_pool.data.view(pool_size, -1)
+            # TODO: copy expert weights from main → pool slots based on craft_alloc
+            # pool_layout. For now, pool weights are populated via LOAD_FORMAT=dummy
+            # (random init) or checkpoint pre-population. Real replication logic
+            # requires pool_layout from craft_alloc JSON (step 5).
