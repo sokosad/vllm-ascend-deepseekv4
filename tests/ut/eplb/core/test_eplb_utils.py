@@ -7,8 +7,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 
-from vllm_ascend.ascend_config import init_ascend_config
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.ascend_config import EplbConfig, init_ascend_config
+from vllm_ascend.eplb.core.eplb_utils import get_configured_craft_pool_size, init_eplb_config
+from vllm_ascend.eplb.utils import _stack_moe_loads
 # isort: on
 
 
@@ -63,6 +64,25 @@ class TestAscendConfig(unittest.TestCase):
         self.assertTrue(torch.equal(log2phy, gt_log2phy))
         self.assertEqual(redundant_experts, 2)
 
+    def test_init_eplb_config_with_static_metro_routing(self):
+        self.vllm_config.additional_config = {
+            "refresh": True,
+            "eplb_config": {
+                "metro_routing": True,
+                "num_redundant_experts": 2,
+            },
+        }
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        _, expert_map, log2phy, redundant_experts = init_eplb_config(eplb_config, 0, self.moe_config)
+
+        gt_expert_map = torch.tensor([4, -1, -1, -1, 0, 1, 2, 3])
+        self.assertTrue(torch.equal(expert_map, gt_expert_map))
+        self.assertEqual(redundant_experts, 2)
+        self.assertEqual(log2phy.dim(), 2)
+        self.assertTrue(torch.equal(log2phy[0], torch.tensor([0, 9], dtype=torch.int32)))
+        self.assertTrue(torch.equal(log2phy[4], torch.tensor([4, 5], dtype=torch.int32)))
+
     def test_init_eplb_config_without_eplb(self):
         self.vllm_config.additional_config = {"refresh": True}
         eplb_config = init_ascend_config(self.vllm_config).eplb_config
@@ -71,3 +91,55 @@ class TestAscendConfig(unittest.TestCase):
         self.assertIsNone(log2phy)
         self.assertTrue(torch.equal(expert_map, gt_expert_map))
         self.assertEqual(redundant_experts, 0)
+
+    def test_stack_moe_loads_pads_variable_pool_slots(self):
+        loads = [
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4, 5]),
+        ]
+        stacked = _stack_moe_loads(loads)
+        self.assertTrue(torch.equal(stacked, torch.tensor([[1, 2, 0], [3, 4, 5]])))
+
+    def test_get_configured_craft_pool_size_per_layer(self):
+        self.vllm_config.additional_config["eplb_config"] = {
+            "craft_pool_layer_sizes": [0, 2, 1],
+        }
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        self.assertEqual(get_configured_craft_pool_size(eplb_config), 2)
+        self.assertEqual(get_configured_craft_pool_size(eplb_config, 0), 0)
+        self.assertEqual(get_configured_craft_pool_size(eplb_config, 1), 2)
+        self.assertEqual(get_configured_craft_pool_size(eplb_config, 4), 0)
+
+    def test_init_eplb_config_with_per_layer_craft_pool_size(self):
+        self.vllm_config.additional_config = {
+            "refresh": True,
+            "eplb_config": {"craft_pool_layer_sizes": [0, 1]},
+        }
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        _, expert_map0, log2phy0, redundant_experts0 = init_eplb_config(eplb_config, 0, self.moe_config)
+        _, expert_map1, log2phy1, redundant_experts1 = init_eplb_config(eplb_config, 1, self.moe_config)
+
+        self.assertEqual(redundant_experts0, 0)
+        self.assertEqual(redundant_experts1, 2)
+        self.assertEqual(int((expert_map0 >= 0).sum().item()), 4)
+        self.assertEqual(int((expert_map1 >= 0).sum().item()), 5)
+        self.assertIsNotNone(log2phy0)
+        self.assertIsNotNone(log2phy1)
+
+    def test_init_eplb_config_uses_logical_experts_for_craft_pool(self):
+        eplb_config = EplbConfig({"craft_pool_size": 1, "num_redundant_experts": 2})
+        self.moe_config.num_experts = 10
+        self.moe_config.num_logical_experts = 8
+
+        global_map, expert_map, log2phy, redundant_experts = init_eplb_config(
+            eplb_config,
+            0,
+            self.moe_config,
+        )
+
+        self.assertEqual(redundant_experts, 2)
+        self.assertEqual(global_map.shape, torch.Size([2, 8]))
+        self.assertEqual(int((expert_map >= 0).sum().item()), 5)
+        self.assertEqual(log2phy.shape, torch.Size([8, 2]))

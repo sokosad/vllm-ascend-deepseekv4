@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Optional
 from collections.abc import Callable
+import os
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,75 @@ from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import get_weight_prefetch_method
+
+
+def _metro_debug_enabled() -> bool:
+    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        if dynamo is not None and dynamo.is_compiling():
+            return False
+    except Exception:
+        pass
+    try:
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+_TID2EID_CACHE: dict[tuple[int, tuple[int, ...], str, int | None, int], torch.Tensor] = {}
+
+
+def _dynamo_is_compiling() -> bool:
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        return bool(dynamo is not None and dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+def _prepare_hash_input_ids(input_ids: torch.Tensor, expected_tokens: int) -> torch.Tensor:
+    input_ids = input_ids.reshape(-1).to(torch.int64)
+    if input_ids.shape[0] < expected_tokens:
+        pad = input_ids.new_zeros(expected_tokens - input_ids.shape[0])
+        input_ids = torch.cat((input_ids, pad), dim=0)
+    elif input_ids.shape[0] > expected_tokens:
+        input_ids = input_ids[:expected_tokens]
+    input_ids = torch.where(input_ids == -1, input_ids.new_zeros(()), input_ids)
+    return input_ids.contiguous()
+
+
+def _prepare_hash_tid2eid(
+    tid2eid: torch.Tensor,
+    expert_count: int,
+) -> torch.Tensor:
+    key = (
+        tid2eid.data_ptr(),
+        tuple(tid2eid.shape),
+        tid2eid.device.type,
+        tid2eid.device.index,
+        expert_count,
+    )
+    cached = _TID2EID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    tid2eid_i32 = tid2eid.to(torch.int32)
+    if expert_count <= 0 or _dynamo_is_compiling():
+        return tid2eid_i32
+
+    min_id = int(tid2eid_i32.min().item()) if tid2eid_i32.numel() else 0
+    max_id = int(tid2eid_i32.max().item()) if tid2eid_i32.numel() else -1
+    if min_id < 0 or max_id >= expert_count:
+        tid2eid_i32 = torch.clamp(tid2eid_i32, min=0, max=expert_count - 1)
+    tid2eid_i32 = tid2eid_i32.contiguous()
+    _TID2EID_CACHE[key] = tid2eid_i32
+    return tid2eid_i32
 
 
 def select_experts(
@@ -67,6 +137,18 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    metro_debug = _metro_debug_enabled()
+    if metro_debug:
+        torch.npu.synchronize()
+        print(
+            "[METRO_DEBUG][select_entry] "
+            f"hidden_shape={tuple(hidden_states.shape)} router_shape={tuple(router_logits.shape)} "
+            f"top_k={top_k} scoring={scoring_func} renorm={renormalize} "
+            f"use_grouped_topk={use_grouped_topk} topk_group={topk_group} "
+            f"num_expert_group={num_expert_group} has_bias={e_score_correction_bias is not None} "
+            f"has_tid2eid={tid2eid is not None} global_num_experts={global_num_experts}",
+            flush=True,
+        )
     # prefetch w1_w3_proj.weight preprocess
     weight_prefetch_method = get_weight_prefetch_method()
     weight_prefetch_method.maybe_prefetch_moe_weight_preprocess(hidden_states, "gate_up")
@@ -81,6 +163,9 @@ def select_experts(
     )
 
     if is_support_npu_moe_gating_top_k:
+        if metro_debug:
+            torch.npu.synchronize()
+            print("[METRO_DEBUG][select_fusion_before]", flush=True)
         topk_weights, topk_ids = _select_experts_with_fusion_ops(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -96,7 +181,20 @@ def select_experts(
             tid2eid=tid2eid,
             input_ids=input_ids,
         )
+        if metro_debug:
+            torch.npu.synchronize()
+            topk_min = int(topk_ids.min().item()) if topk_ids.numel() else -1
+            topk_max = int(topk_ids.max().item()) if topk_ids.numel() else -1
+            print(
+                "[METRO_DEBUG][select_fusion_after] "
+                f"topk_shape={tuple(topk_ids.shape)} topk_min={topk_min} topk_max={topk_max} "
+                f"weights_shape={tuple(topk_weights.shape)}",
+                flush=True,
+            )
     else:
+        if metro_debug:
+            torch.npu.synchronize()
+            print("[METRO_DEBUG][select_native_before]", flush=True)
         topk_weights, topk_ids = _native_select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -112,6 +210,57 @@ def select_experts(
             global_num_experts=global_num_experts,
             tid2eid=None,
             input_ids=None,
+        )
+        if metro_debug:
+            torch.npu.synchronize()
+            topk_min = int(topk_ids.min().item()) if topk_ids.numel() else -1
+            topk_max = int(topk_ids.max().item()) if topk_ids.numel() else -1
+            print(
+                "[METRO_DEBUG][select_native_after] "
+                f"topk_shape={tuple(topk_ids.shape)} topk_min={topk_min} topk_max={topk_max} "
+                f"weights_shape={tuple(topk_weights.shape)}",
+                flush=True,
+            )
+    return topk_weights, topk_ids
+
+
+def build_force_load_balance_routing(
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    log2phy: torch.Tensor | None = None,
+    weight_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if log2phy is not None:
+        force_topk_ids = layer.force_load_balance_routed_topk_ids
+        id_space = "routed"
+    else:
+        force_topk_ids = layer.force_load_balance_topk_ids
+        id_space = "physical"
+
+    num_tokens = hidden_states.shape[0]
+    topk_ids = force_topk_ids[:num_tokens]
+    if topk_ids.shape[-1] != top_k:
+        topk_ids = topk_ids[:, :top_k]
+
+    dtype = weight_dtype if weight_dtype is not None else hidden_states.dtype
+    if not torch.empty((), dtype=dtype).is_floating_point():
+        dtype = torch.float32
+    topk_weights = torch.full(
+        topk_ids.shape,
+        1.0 / top_k,
+        device=hidden_states.device,
+        dtype=dtype,
+    )
+    if _metro_debug_enabled():
+        torch.npu.synchronize()
+        topk_min = int(topk_ids.min().item()) if topk_ids.numel() else -1
+        topk_max = int(topk_ids.max().item()) if topk_ids.numel() else -1
+        print(
+            "[METRO_DEBUG][force_lb_routing] "
+            f"id_space={id_space} topk_shape={tuple(topk_ids.shape)} "
+            f"topk_min={topk_min} topk_max={topk_max} weights_dtype={topk_weights.dtype}",
+            flush=True,
         )
     return topk_weights, topk_ids
 
@@ -234,8 +383,8 @@ def _select_experts_with_fusion_ops(
         if tid2eid is not None:
             forward_context = get_forward_context()
             input_ids = forward_context.input_ids.to(torch.int64)
-            # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
-            tid2eid_ones = tid2eid.to(torch.int32)
+            expert_count = int(global_num_experts if global_num_experts > 0 else router_logits.shape[-1])
+            tid2eid_ones = _prepare_hash_tid2eid(tid2eid, expert_count)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
@@ -251,10 +400,25 @@ def _select_experts_with_fusion_ops(
                 splitted_input = split_tensor_along_first_dim(
                     input_ids, num_partitions=tp_size)
                 input_ids = splitted_input[tp_rank].contiguous()
-            input_ids = torch.where(input_ids == -1, 0, input_ids)
+            input_ids = _prepare_hash_input_ids(input_ids, int(router_logits.shape[0]))
         else:
             input_ids = None
             tid2eid_ones = None
+        if _metro_debug_enabled():
+            torch.npu.synchronize()
+            input_shape = None if input_ids is None else tuple(input_ids.shape)
+            input_min = int(input_ids.min().item()) if input_ids is not None and input_ids.numel() else None
+            input_max = int(input_ids.max().item()) if input_ids is not None and input_ids.numel() else None
+            tid_shape = None if tid2eid_ones is None else tuple(tid2eid_ones.shape)
+            tid_min = int(tid2eid_ones.min().item()) if tid2eid_ones is not None and tid2eid_ones.numel() else None
+            tid_max = int(tid2eid_ones.max().item()) if tid2eid_ones is not None and tid2eid_ones.numel() else None
+            print(
+                "[METRO_DEBUG][select_hash_op_before] "
+                f"router_shape={tuple(router_logits.shape)} top_k={top_k} "
+                f"input_shape={input_shape} input_min={input_min} input_max={input_max} "
+                f"tid2eid_shape={tid_shape} tid2eid_min={tid_min} tid2eid_max={tid_max}",
+                flush=True,
+            )
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
             x=router_logits,  # 输入张量
             k=top_k,  # 选取的专家数量
@@ -270,10 +434,24 @@ def _select_experts_with_fusion_ops(
             norm_type=2,  # 归一化类型（可选）
             out_flag=False  # 是否输出归一化结果（可选）
         )
+        if _metro_debug_enabled():
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][select_hash_op_after] "
+                f"topk_shape={tuple(topk_ids.shape)}",
+                flush=True,
+            )
         return topk_weights, topk_ids
     norm_type = 0 if scoring_func == "softmax" else 1
     if e_score_correction_bias is not None and e_score_correction_bias.dtype != router_logits.dtype:
         e_score_correction_bias = e_score_correction_bias.to(router_logits.dtype)
+    if _metro_debug_enabled():
+        torch.npu.synchronize()
+        print(
+            "[METRO_DEBUG][select_gating_op_before] "
+            f"router_shape={tuple(router_logits.shape)} top_k={top_k}",
+            flush=True,
+        )
     topk_weights, topk_ids, _ = DeviceOperator.moe_gating_top_k(
         router_logits,
         k=top_k,
@@ -287,6 +465,13 @@ def _select_experts_with_fusion_ops(
         eps=1e-20,
         bias_opt=e_score_correction_bias,
     )
+    if _metro_debug_enabled():
+        torch.npu.synchronize()
+        print(
+            "[METRO_DEBUG][select_gating_op_after] "
+            f"topk_shape={tuple(topk_ids.shape)}",
+            flush=True,
+        )
 
     return topk_weights, topk_ids
 

@@ -394,14 +394,19 @@ class EplbConfig:
         "num_redundant_experts": 0,
         "eplb_policy_type": 1,
         "craft_pool_size": 0,
+        "craft_pool_layer_sizes": None,
+        "craft_pool_top_m": 0,
+        "craft_pool_top_m_factor": 4,
+        "craft_pool_min_hotness_delta": 0.05,
+        "craft_pool_min_improvement": 0.01,
+        "metro_routing": False,
     }
 
     def __init__(self, user_config: dict | None = None):
         if user_config is None:
             user_config = {}
         self.config = self._defaults.copy()
-        if "craft_pool_size" not in user_config:
-            self.config["craft_pool_size"] = int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0"))
+        self._apply_env_defaults(user_config)
         if user_config and isinstance(user_config, dict):
             for key, value in user_config.items():
                 if key in self.config:
@@ -416,7 +421,39 @@ class EplbConfig:
             return self.config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
 
+    def _apply_env_defaults(self, user_config: dict):
+        env_defaults = {
+            "craft_pool_size": (("VLLM_ASCEND_CRAFT_POOL_SIZE",), int),
+            "craft_pool_top_m": (("CRAFT_POOL_TOP_M",), int),
+            "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
+            "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
+            "craft_pool_min_improvement": (("CRAFT_POOL_MIN_IMPROVEMENT",), float),
+            "metro_routing": (("VLLM_ASCEND_METRO_ROUTING", "METRO_ROUTING"), self._coerce_bool),
+        }
+        for key, (env_names, coerce) in env_defaults.items():
+            if key in user_config:
+                continue
+            for env_name in env_names:
+                value = os.getenv(env_name)
+                if value is not None:
+                    self.config[key] = coerce(value)
+                    break
+
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+            raise ValueError(f"Invalid boolean value: {value}")
+        return bool(value)
+
     def _validate_config(self):
+        self.config["metro_routing"] = self._coerce_bool(self.config["metro_routing"])
         if self.expert_map_path is not None:
             logger.info(f"The expert_map is {self.config['dynamic_eplb']}")
             if self.expert_map_path[-5:] != ".json":
@@ -441,6 +478,10 @@ class EplbConfig:
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
         if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
             raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
+        if not isinstance(self.config["metro_routing"], bool):
+            raise TypeError("metro_routing must be a boolean")
+        self._validate_craft_pool_layer_sizes()
+        self._validate_craft_pool_policy_knobs()
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
@@ -450,6 +491,45 @@ class EplbConfig:
         logger.info(f"Dynamic EPLB is {self.config['dynamic_eplb']}")
         logger.info(f"The number of redundant experts is {self.config['num_redundant_experts']}")
         logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
+        logger.info(f"The CRAFT pool layer sizes are {self.config['craft_pool_layer_sizes']}")
+        logger.info(f"The CRAFT pool top-M candidate limit is {self.config['craft_pool_top_m']}")
+        logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
+        logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")
+        logger.info(f"The CRAFT pool min improvement is {self.config['craft_pool_min_improvement']}")
+        logger.info(f"METRO routing is {self.config['metro_routing']}")
+
+    def _validate_craft_pool_layer_sizes(self):
+        layer_sizes = self.config["craft_pool_layer_sizes"]
+        if layer_sizes is None:
+            return
+        if self.config["craft_pool_size"] > 0:
+            raise ValueError("craft_pool_layer_sizes conflicts with craft_pool_size.")
+        if self.config["num_redundant_experts"] > 0:
+            raise ValueError("craft_pool_layer_sizes conflicts with num_redundant_experts.")
+        if not isinstance(layer_sizes, (list, tuple, dict)):
+            raise TypeError("craft_pool_layer_sizes must be a list, tuple, dict, or None")
+        values = layer_sizes.values() if isinstance(layer_sizes, dict) else layer_sizes
+        for pool_size in values:
+            if not isinstance(pool_size, int):
+                raise TypeError("craft_pool_layer_sizes values must be integers")
+            if pool_size < 0:
+                raise ValueError("craft_pool_layer_sizes values must be non-negative")
+
+    def _validate_craft_pool_policy_knobs(self):
+        for key in ["craft_pool_top_m", "craft_pool_top_m_factor"]:
+            if not isinstance(self.config[key], int):
+                raise TypeError(f"{key} must be an integer")
+        if self.config["craft_pool_top_m"] < 0:
+            raise ValueError("craft_pool_top_m must be non-negative")
+        if self.config["craft_pool_top_m_factor"] <= 0:
+            raise ValueError("craft_pool_top_m_factor must be greater than 0")
+
+        for key in ["craft_pool_min_hotness_delta", "craft_pool_min_improvement"]:
+            if not isinstance(self.config[key], (int, float)):
+                raise TypeError(f"{key} must be a number")
+            if self.config[key] < 0:
+                raise ValueError(f"{key} must be non-negative")
+            self.config[key] = float(self.config[key])
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

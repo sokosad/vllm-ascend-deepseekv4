@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 import vllm_ascend.envs as envs_ascend
@@ -59,7 +60,20 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
 
 
-def _apply_log2phy(log2phy: torch.Tensor | None, topk_ids: torch.Tensor) -> torch.Tensor:
+def _is_graph_capturing() -> bool:
+    if _EXTRA_CTX.capturing:
+        return True
+    try:
+        return bool(getattr(get_forward_context(), "capturing", False))
+    except Exception:
+        return False
+
+
+def _apply_log2phy(
+    log2phy: torch.Tensor | None,
+    topk_ids: torch.Tensor,
+    metro_routing: bool = False,
+) -> torch.Tensor:
     if log2phy is None:
         return topk_ids
     if log2phy.dim() == 1:
@@ -67,13 +81,15 @@ def _apply_log2phy(log2phy: torch.Tensor | None, topk_ids: torch.Tensor) -> torc
 
     candidates = log2phy[topk_ids]
     replica_counts = torch.sum(candidates >= 0, dim=-1)
-    if torch.any(replica_counts == 0):
-        raise ValueError("Pool log2phy contains a logical expert without a physical replica.")
+    replica_counts = torch.clamp(replica_counts, min=1)
 
-    token_selector = torch.arange(topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64)
-    while token_selector.dim() < topk_ids.dim():
-        token_selector = token_selector.unsqueeze(-1)
-    replica_selector = (token_selector + topk_ids.to(torch.int64)) % replica_counts
+    if metro_routing:
+        replica_selector = topk_ids.to(torch.int64) % replica_counts
+    else:
+        token_selector = torch.arange(topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64)
+        while token_selector.dim() < topk_ids.dim():
+            token_selector = token_selector.unsqueeze(-1)
+        replica_selector = (token_selector + topk_ids.to(torch.int64)) % replica_counts
     return candidates.gather(-1, replica_selector.unsqueeze(-1)).squeeze(-1)
 
 
@@ -148,6 +164,7 @@ class MoECommMethod(ABC):
         routed_topk_ids = _apply_log2phy(
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
+            getattr(self.moe_config, "metro_routing", False),
         )
 
         token_dispatch_input = build_token_dispatch_input(
@@ -156,10 +173,25 @@ class MoECommMethod(ABC):
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
+        use_fusion_ops = self.use_fusion_ops
+        disable_triton_activation = False
+        if fused_experts_input.compact_craft_pool:
+            use_fusion_ops = False
+            disable_triton_activation = True
+        elif (
+            _is_graph_capturing()
+            and getattr(self.moe_config, "metro_routing", False)
+            and fused_experts_input.routing.log2phy is not None
+            and fused_experts_input.routing.log2phy.dim() == 2
+        ):
+            use_fusion_ops = False
+            disable_triton_activation = True
+
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
-            use_fusion_ops=self.use_fusion_ops,
+            use_fusion_ops=use_fusion_ops,
+            disable_triton_activation=disable_triton_activation,
         )
 
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
@@ -312,6 +344,7 @@ class FusedMC2CommImpl(MoECommMethod):
         topk_ids = _apply_log2phy(
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
+            getattr(self.moe_config, "metro_routing", False),
         )
 
         expert_tokens = None

@@ -86,6 +86,8 @@ def set_ascend_forward_context(
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
+        forward_context.graph_capture_forward = False
+        forward_context.graph_buffer_warmup = False
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
@@ -204,6 +206,14 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -243,9 +253,25 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         getattr(eplb_config, "craft_pool_size", envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE),
     )
     craft_pool_size = int(craft_pool_size or 0)
+    craft_pool_layer_sizes = ascend_eplb_config.get(
+        "craft_pool_layer_sizes",
+        getattr(eplb_config, "craft_pool_layer_sizes", None),
+    )
+    if craft_pool_layer_sizes is not None:
+        values = (
+            craft_pool_layer_sizes.values()
+            if isinstance(craft_pool_layer_sizes, dict)
+            else craft_pool_layer_sizes
+        )
+        craft_pool_size = max((int(size or 0) for size in values), default=0)
+    metro_routing = ascend_eplb_config.get(
+        "metro_routing",
+        getattr(eplb_config, "metro_routing", envs_ascend.VLLM_ASCEND_METRO_ROUTING),
+    )
     if (
         eplb_policy_type == 4
         or craft_pool_size > 0
+        or _as_bool(metro_routing)
         or expert_file_has_pool_mode(expert_map_path)
     ):
         return MoECommType.ALLGATHER
@@ -310,6 +336,8 @@ class _ExtraForwardContextProxy:
 
     extra_attrs = (
         "capturing",
+        "graph_capture_forward",
+        "graph_buffer_warmup",
         "moe_comm_type",
         "moe_comm_method",
         "mmrs_fusion",

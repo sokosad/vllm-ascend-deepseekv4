@@ -53,10 +53,40 @@ def expert_file_pool_metadata(expert_map_path, layer_id):
     if layer_id >= data["moe_layer_count"]:
         return False, None, None
     layer = data["layer_list"][layer_id]
-    pool_mode = bool(data.get("pool_mode", False) or layer.get("pool_size", 0))
+    file_pool_mode = data.get("pool_mode", False) or any(
+        item.get("pool_size", 0) for item in data.get("layer_list", [])
+    )
+    pool_mode = bool(file_pool_mode or layer.get("pool_size", 0))
     pool_start = layer.get("pool_start", data.get("pool_start"))
     pool_size = layer.get("pool_size")
     return pool_mode, pool_start, pool_size
+
+
+def _coerce_pool_size(pool_size) -> int:
+    return max(0, int(pool_size or 0))
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def get_configured_craft_pool_size(eplb_config, layer_id: int | None = None) -> int:
+    layer_sizes = getattr(eplb_config, "craft_pool_layer_sizes", None)
+    if layer_sizes is None:
+        return _coerce_pool_size(getattr(eplb_config, "craft_pool_size", 0))
+    if isinstance(layer_sizes, dict):
+        if layer_id is None:
+            return max((_coerce_pool_size(size) for size in layer_sizes.values()), default=0)
+        return _coerce_pool_size(layer_sizes.get(layer_id, layer_sizes.get(str(layer_id), 0)))
+    if layer_id is None:
+        return max((_coerce_pool_size(size) for size in layer_sizes), default=0)
+    if layer_id >= len(layer_sizes):
+        return 0
+    return _coerce_pool_size(layer_sizes[layer_id])
 
 
 @lru_cache(maxsize=16)
@@ -68,22 +98,6 @@ def expert_file_has_pool_mode(expert_map_path):
     with open(expert_map_path) as f:
         data = json.load(f)
     return bool(data.get("pool_mode", False) or any(layer.get("pool_size", 0) for layer in data.get("layer_list", [])))
-
-
-@lru_cache(maxsize=16)
-def expert_file_pool_size_is_uniform(expert_map_path):
-    if not expert_map_path:
-        return True
-    if not (os.path.exists(expert_map_path) and os.access(expert_map_path, os.R_OK)):
-        return True
-    with open(expert_map_path) as f:
-        data = json.load(f)
-    sizes = {
-        layer.get("pool_size")
-        for layer in data.get("layer_list", [])
-        if layer.get("pool_size") is not None
-    }
-    return len(sizes) <= 1
 
 
 def generate_global_placement(n_expert, ep_size, n_redundant):
@@ -127,12 +141,17 @@ def generate_pool_placement(n_expert, ep_size, pool_size):
 
 def init_eplb_config(eplb_config, layer_id, moe_config):
     expert_map_path = eplb_config.expert_map_path
-    n_experts = moe_config.num_experts
+    n_experts = getattr(moe_config, "num_logical_experts", moe_config.num_experts)
     ep_size = moe_config.ep_size
     global_placement = None
-    craft_pool_size = max(0, int(getattr(eplb_config, "craft_pool_size", 0) or 0))
-    pool_mode = craft_pool_size > 0 or expert_file_has_pool_mode(expert_map_path)
-    eplb_enable = eplb_config.dynamic_eplb or pool_mode
+    craft_pool_size = get_configured_craft_pool_size(eplb_config, layer_id)
+    pool_mode = get_configured_craft_pool_size(eplb_config) > 0 or expert_file_has_pool_mode(expert_map_path)
+    metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
+    eplb_enable = (
+        eplb_config.dynamic_eplb
+        or pool_mode
+        or (metro_routing and eplb_config.num_redundant_experts > 0)
+    )
     n_redundant = eplb_config.num_redundant_experts if eplb_enable else 0
 
     if ep_size == 1:
@@ -175,7 +194,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
     if eplb_enable:
-        if pool_mode:
+        if pool_mode or metro_routing:
             log2phy = generate_pool_log2phy_map(global_expert_map).npu()
         else:
             log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
@@ -232,6 +251,8 @@ def generate_pool_log2phy_map(global_expert_map):
             idx = int(copy_index[expert_id].item())
             log2phy[expert_id, idx] = rankid * local_slots + local_slot
             copy_index[expert_id] += 1
+    if torch.any(copy_index == 0):
+        raise ValueError("Pool log2phy contains a logical expert without a physical replica.")
     return log2phy
 
 

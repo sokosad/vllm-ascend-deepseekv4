@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+import os
 from typing import Generic
 
 import torch
@@ -47,6 +48,25 @@ from vllm_ascend.utils import (
     is_hierarchical_communication_enabled,
     should_skip_allreduce_across_dp_group,
 )
+
+
+def _metro_debug_enabled() -> bool:
+    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        if dynamo is not None and dynamo.is_compiling():
+            return False
+    except Exception:
+        pass
+    try:
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
@@ -344,7 +364,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
-            global_num_experts = len(expert_map) + global_redundant_expert_num
+            global_num_experts = len(expert_map)
+            if global_num_experts < self.num_experts:
+                global_num_experts += global_redundant_expert_num
             mask = expert_map[topk_ids] != -1
             topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
@@ -353,17 +375,61 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
-        sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = DeviceOperator.npu_moe_init_routing(
-            hidden_states,
-            topk_ids,
-            scale=pertoken_scale,
-            active_num=num_tokens * self.top_k,
-            expert_num=global_num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_expert_range=[first_expert_idx, last_expert_idx],
-            quant_mode=1 if with_quant and pertoken_scale is None else -1,
-        )
+        metro_debug = _metro_debug_enabled()
+        if metro_debug:
+            torch.npu.synchronize()
+            topk_min = int(topk_ids.min().item()) if topk_ids.numel() else -1
+            topk_max = int(topk_ids.max().item()) if topk_ids.numel() else -1
+            local_hits = int(mask.sum().item()) if expert_map is not None else -1
+            expert_map_len = len(expert_map) if expert_map is not None else 0
+            print(
+                "[METRO_DEBUG][dispatch_before] "
+                f"ep_rank={get_ep_group().rank_in_group} "
+                f"hidden_shape={tuple(hidden_states.shape)} topk_shape={tuple(topk_ids.shape)} "
+                f"topk_min={topk_min} topk_max={topk_max} expert_map_len={expert_map_len} "
+                f"global_num_experts={global_num_experts} num_experts={self.num_experts} "
+                f"num_experts_local={self.num_experts_local} "
+                f"active_range=({first_expert_idx},{last_expert_idx}) local_hits={local_hits}",
+                flush=True,
+            )
+        init_routing_kwargs = {
+            "scale": pertoken_scale,
+            "active_num": num_tokens * self.top_k,
+            "expert_num": global_num_experts,
+            "expert_tokens_num_type": 1,
+            "expert_tokens_num_flag": True,
+            "active_expert_range": [first_expert_idx, last_expert_idx],
+            "quant_mode": 1 if with_quant and pertoken_scale is None else -1,
+        }
+        if (
+            token_dispatch_input.routing.log2phy is not None
+            and token_dispatch_input.routing.log2phy.dim() == 2
+            and hasattr(torch_npu, "npu_moe_init_routing_v2")
+        ):
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids,
+                **init_routing_kwargs,
+            )
+        else:
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = DeviceOperator.npu_moe_init_routing(
+                hidden_states,
+                topk_ids,
+                **init_routing_kwargs,
+            )
+        if metro_debug:
+            torch.npu.synchronize()
+            expert_tokens_sum = int(expert_tokens.sum().item()) if expert_tokens.numel() else 0
+            expert_tokens_max = int(expert_tokens.max().item()) if expert_tokens.numel() else 0
+            print(
+                "[METRO_DEBUG][dispatch_after] "
+                f"ep_rank={get_ep_group().rank_in_group} "
+                f"sorted_shape={tuple(sorted_hidden_states.shape)} "
+                f"expanded_shape={tuple(expanded_row_idx.shape)} "
+                f"expert_tokens_shape={tuple(expert_tokens.shape)} "
+                f"expert_tokens_sum={expert_tokens_sum} expert_tokens_max={expert_tokens_max}",
+                flush=True,
+            )
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1  # `count` mode
 

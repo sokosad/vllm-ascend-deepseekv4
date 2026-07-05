@@ -106,6 +106,30 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         self.quant_method.process_weights_after_loading(new_layer)
         mock_npu_format_cast.assert_called()
 
+    @patch('torch.npu.empty_cache')
+    @patch('torch_npu.npu_format_cast')
+    def test_process_weights_after_loading_splits_craft_pool_with_stale_main(
+        self,
+        mock_npu_format_cast,
+        _mock_empty_cache,
+    ):
+
+        def func_by_args(weight, num_format):
+            return weight
+
+        mock_npu_format_cast.side_effect = func_by_args
+        new_layer = self.build_layer()
+        new_layer.local_num_experts_main = self.num_experts
+        new_layer.local_num_experts_pool = 1
+        self.quant_method.dynamic_eplb = True
+
+        self.quant_method.process_weights_after_loading(new_layer)
+
+        self.assertEqual(new_layer.local_num_experts_main, self.num_experts - 1)
+        self.assertEqual(len(new_layer.w13_weight_list), self.num_experts - 1)
+        self.assertEqual(len(new_layer.w13_weight_pool_list), 1)
+        self.assertEqual(len(new_layer.w2_weight_pool_list), 1)
+
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.select_experts")
     def test_apply_uses_explicit_dispatch_and_mlp_args(self, mock_select_experts, mock_extra_ctx):

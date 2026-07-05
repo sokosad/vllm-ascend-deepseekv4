@@ -8,7 +8,11 @@ from vllm.platforms import PlatformEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
-from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.platform import (
+    CRAFT_POOL_ASCEND_SPLITTING_OPS,
+    CRAFT_POOL_MOE_SPLITTING_OPS,
+    NPUPlatform,
+)
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
@@ -38,7 +42,12 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.xlite_graph_config.enabled = False
         mock_ascend_config.xlite_graph_config.full_mode = False
         mock_ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+        mock_ascend_config.ascend_compilation_config.enable_static_kernel = False
         mock_ascend_config.ascend_fusion_config = None
+        mock_ascend_config.eplb_config.craft_pool_size = 0
+        mock_ascend_config.eplb_config.craft_pool_layer_sizes = None
+        mock_ascend_config.eplb_config.expert_map_path = ""
+        mock_ascend_config.eplb_config.metro_routing = False
         mock_ascend_config.recompute_scheduler_enable = False
         mock_ascend_config.SLO_limits_for_dynamic_batch = -1
         mock_ascend_config.enable_shared_expert_dp = False
@@ -165,6 +174,41 @@ class TestNPUPlatform(TestBase):
         self.platform.apply_config_platform_defaults(vllm_config)
 
         self.assertIsNone(vllm_config.compilation_config.max_cudagraph_capture_size)
+
+    def test_get_configured_ep_size_uses_data_and_tensor_parallel(self):
+        parallel_config = MagicMock()
+        parallel_config.enable_expert_parallel = True
+        parallel_config.tensor_parallel_size = 4
+        parallel_config.data_parallel_size = 2
+
+        self.assertEqual(self.platform._get_configured_ep_size(parallel_config), 8)
+
+    def test_get_configured_ep_size_without_expert_parallel(self):
+        parallel_config = MagicMock()
+        parallel_config.enable_expert_parallel = False
+        parallel_config.tensor_parallel_size = 4
+        parallel_config.data_parallel_size = 2
+
+        self.assertEqual(self.platform._get_configured_ep_size(parallel_config), 1)
+
+    def test_is_craft_pool_configured_with_layer_sizes(self):
+        eplb_config = MagicMock()
+        eplb_config.craft_pool_size = 0
+        eplb_config.craft_pool_layer_sizes = [0, 1, 0]
+        eplb_config.expert_map_path = ""
+
+        self.assertTrue(self.platform._is_craft_pool_configured(eplb_config))
+
+    def test_append_craft_pool_splitting_ops(self):
+        compilation_config = MagicMock()
+        compilation_config.splitting_ops = ["vllm::unified_attention", "vllm::moe_forward"]
+
+        self.platform._append_craft_pool_splitting_ops(compilation_config)
+        self.platform._append_craft_pool_splitting_ops(compilation_config)
+
+        self.assertEqual(compilation_config.splitting_ops.count("vllm::moe_forward"), 1)
+        for op_name in CRAFT_POOL_MOE_SPLITTING_OPS + CRAFT_POOL_ASCEND_SPLITTING_OPS:
+            self.assertIn(op_name, compilation_config.splitting_ops)
 
     @patch("vllm_ascend.platform.refresh_block_size")
     @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)

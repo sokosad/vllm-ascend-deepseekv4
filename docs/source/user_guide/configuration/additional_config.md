@@ -93,6 +93,13 @@ The details of each configuration option are as follows:
 | `algorithm_execution_interval`   | int | `30`   | The forward iterations when the EPLB worker will finish CPU tasks. |
 | `expert_map_record_path`         | str | `None` | Save the expert load calculation results to a new expert table in the specified directory.|
 | `num_redundant_experts`          | int | `0`    | Specify redundant experts during initialization. |
+| `craft_pool_size`                | int | `0`    | Specify a uniform CRAFT pool size per rank for every MoE layer. |
+| `craft_pool_layer_sizes`         | list/dict | `None` | Specify per-MoE-layer CRAFT pool sizes. Unspecified layers use pool size 0. |
+| `craft_pool_top_m`               | int | `0`    | Limit CRAFT pool planning to the top-M hot experts. When set to 0, the planner uses `craft_pool_top_m_factor`. |
+| `craft_pool_top_m_factor`        | int | `4`    | Multiplier for automatic CRAFT pool candidate count: `craft_pool_size * ep_size * factor`. |
+| `craft_pool_min_hotness_delta`   | float | `0.05` | Skip CRAFT pool replanning for a layer when hotness changes less than this relative threshold. |
+| `craft_pool_min_improvement`     | float | `0.01` | Skip CRAFT pool migration when estimated max-rank-load improvement is below this threshold. |
+| `metro_routing`                  | bool | `False` | Enable METRO-style replica routing for normal EPLB redundant experts. When enabled, each logical expert is routed to one preferred physical replica in the batch to reduce activated expert weights. |
 
 ### Example
 

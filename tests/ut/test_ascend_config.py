@@ -77,6 +77,113 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_with_craft_pool_layer_sizes(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "eplb_config": {"craft_pool_layer_sizes": {"2": 1, "9": 3}},
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(ascend_config.eplb_config.craft_pool_layer_sizes, {"2": 1, "9": 3})
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_with_craft_pool_policy_knobs(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "eplb_config": {
+                "craft_pool_top_m": 16,
+                "craft_pool_top_m_factor": 2,
+                "craft_pool_min_hotness_delta": 0.2,
+                "craft_pool_min_improvement": 0.15,
+            },
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(ascend_config.eplb_config.craft_pool_top_m, 16)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_top_m_factor, 2)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_min_hotness_delta, 0.2)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.15)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_with_metro_routing(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "eplb_config": {"metro_routing": True},
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.eplb_config.metro_routing)
+
+    @_clean_up_ascend_config
+    @patch.dict(
+        "os.environ",
+        {
+            "CRAFT_POOL_TOP_M": "12",
+            "CRAFT_POOL_TOP_M_FACTOR": "3",
+            "CRAFT_POOL_MIN_HOTNESS_DELTA": "0.25",
+            "CRAFT_POOL_MIN_IMPROVEMENT": "0.2",
+        },
+    )
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_reads_craft_pool_policy_knobs_from_env(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"refresh": True}
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(ascend_config.eplb_config.craft_pool_top_m, 12)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_top_m_factor, 3)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_min_hotness_delta, 0.25)
+        self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.2)
+
+    @_clean_up_ascend_config
+    @patch.dict("os.environ", {"VLLM_ASCEND_METRO_ROUTING": "true"})
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_reads_metro_routing_from_env(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"refresh": True}
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.eplb_config.metro_routing)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_eplb_config_rejects_conflicting_craft_pool_layer_sizes(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "eplb_config": {
+                "craft_pool_size": 1,
+                "craft_pool_layer_sizes": [0, 1],
+            },
+            "refresh": True,
+        }
+
+        with self.assertRaises(ValueError):
+            init_ascend_config(test_vllm_config)
+
+        clear_ascend_config()
+        test_vllm_config.additional_config = {
+            "eplb_config": {
+                "num_redundant_experts": 16,
+                "craft_pool_layer_sizes": [0, 1],
+            },
+            "refresh": True,
+        }
+
+        with self.assertRaises(ValueError):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {

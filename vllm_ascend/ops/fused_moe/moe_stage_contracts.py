@@ -76,6 +76,7 @@ class MoEFusedExpertsInput:
     activation: str = "silu"
     need_trans: bool = False
     dynamic_eplb: bool = False
+    compact_craft_pool: bool = False
     swiglu_limit: int = 0
 
 
@@ -148,7 +149,9 @@ class MoEMlpComputeInput:
     activation: str = "silu"
     need_trans: bool = False
     dynamic_eplb: bool = False
+    compact_craft_pool: bool = False
     swiglu_limit: int = 0
+    disable_triton_activation: bool = False
 
 
 __all__ = [

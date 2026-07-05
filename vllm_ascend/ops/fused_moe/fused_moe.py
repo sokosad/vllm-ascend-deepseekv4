@@ -17,6 +17,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
+import os
 
 import torch
 import torch.nn.functional as F
@@ -39,13 +40,17 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (
     expert_file_pool_metadata,
-    expert_file_pool_size_is_uniform,
     generate_local_physical_expert_mask,
     generate_pool_log2phy_map,
+    get_configured_craft_pool_size,
     init_eplb_config,
 )
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    build_force_load_balance_routing,
+    select_experts,
+    zero_experts_compute,
+)
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
@@ -75,6 +80,74 @@ class FusedMoEEvents:
     before_gmm2: torch.npu.Event | None = field(default=None)
     before_combine: torch.npu.Event | None = field(default=None)
     swiglu_limit: int = 0
+
+
+def _metro_debug_enabled() -> bool:
+    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        if dynamo is not None and dynamo.is_compiling():
+            return False
+    except Exception:
+        pass
+    try:
+        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
+    if not bool(getattr(layer, "craft_pool_enabled", False)):
+        return False
+    try:
+        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
+            return True
+    except Exception:
+        pass
+    try:
+        mode = get_forward_context().cudagraph_runtime_mode
+    except Exception:
+        return False
+    return getattr(mode, "name", "NONE") != "NONE"
+
+
+def _is_craft_pool_graph_capturing(layer: torch.nn.Module) -> bool:
+    if not _is_craft_pool_graph_mode(layer):
+        return False
+    try:
+        return bool(
+            _EXTRA_CTX.capturing
+            or _EXTRA_CTX.graph_capture_forward
+            or _EXTRA_CTX.graph_buffer_warmup
+        )
+    except Exception:
+        return False
+
+
+def _craft_graph_buffer(layer: torch.nn.Module, name: str, ref: torch.Tensor) -> torch.Tensor:
+    cache_name = f"_craft_graph_{name}_buffers"
+    buffers = getattr(layer, cache_name, None)
+    if buffers is None:
+        buffers = {}
+        setattr(layer, cache_name, buffers)
+    key = (tuple(ref.shape), ref.dtype, ref.device.type, ref.device.index)
+    buf = buffers.get(key)
+    if buf is None or buf.shape != ref.shape or buf.dtype != ref.dtype or buf.device != ref.device:
+        buf = torch.zeros_like(ref)
+        buffers[key] = buf
+    return buf
+
+
+def _copy_to_craft_graph_buffer(layer: torch.nn.Module, name: str, value: torch.Tensor) -> torch.Tensor:
+    if not _is_craft_pool_graph_mode(layer):
+        return value
+    buf = _craft_graph_buffer(layer, name, value)
+    if buf.data_ptr() != value.data_ptr():
+        buf.copy_(value)
+    return buf
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -132,21 +205,30 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = get_forward_context().input_ids
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts,
-            tid2eid=self.tid2eid,
-            input_ids=input_ids)
+        if enable_force_load_balance:
+            topk_weights, topk_ids = build_force_load_balance_routing(
+                layer=layer,
+                hidden_states=x,
+                top_k=top_k,
+                log2phy=log2phy,
+                weight_dtype=router_logits.dtype,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+                global_num_experts=global_num_experts,
+                tid2eid=self.tid2eid,
+                input_ids=input_ids)
         
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -166,12 +248,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
         topk_weights = topk_weights.to(x.dtype)
-        # this is a naive implementation for experts load balance so as
-        # to avoid accumulating too much tokens on a single rank.
-        # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
-            topk_ids = layer.force_load_balance_topk_ids[: topk_ids.shape[0]]
-
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
         # and provide dummy scales (w1_scale, w2_scale). This is required because:
@@ -357,6 +433,7 @@ class AscendFusedMoE(FusedMoE):
 
         # init moe
         eplb_config = ascend_config.eplb_config
+        self.metro_routing = bool(getattr(eplb_config, "metro_routing", False))
         self.global_expert_map, self._expert_map, self.log2phy, self.global_redundant_expert_num = init_eplb_config(
             eplb_config, self.moe_instance_id, self.moe_config
         )
@@ -365,18 +442,10 @@ class AscendFusedMoE(FusedMoE):
         pool_map_enabled, pool_start, pool_size_from_map = expert_file_pool_metadata(
             eplb_config.expert_map_path, self.moe_instance_id)
         self.local_num_experts_main = pool_start if pool_start is not None else num_experts // self.ep_size
-        configured_pool_size = max(
-            0,
-            int(
-                getattr(
-                    eplb_config,
-                    "craft_pool_size",
-                    envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE,
-                ) or 0
-            ),
-        )
+        configured_pool_mode = get_configured_craft_pool_size(eplb_config) > 0
+        configured_pool_size = get_configured_craft_pool_size(eplb_config, self.moe_instance_id)
         self.local_num_experts_pool = configured_pool_size if configured_pool_size > 0 else (pool_size_from_map or 0)
-        self.craft_pool_enabled = pool_map_enabled or configured_pool_size > 0
+        self.craft_pool_enabled = pool_map_enabled or configured_pool_mode
         self.dispatch_expert_map = self._expert_map
         if eplb_config.dynamic_eplb and eplb_config.eplb_policy_type == 4 and not self.craft_pool_enabled:
             raise ValueError(
@@ -395,10 +464,6 @@ class AscendFusedMoE(FusedMoE):
                     "CRAFT pool expert_map conflicts with craft_pool_size: "
                     f"map_pool_size={pool_size_from_map}, craft_pool_size={configured_pool_size}."
                 )
-            if pool_map_enabled and eplb_config.dynamic_eplb and not expert_file_pool_size_is_uniform(
-                eplb_config.expert_map_path
-            ):
-                raise ValueError("Dynamic CRAFT pool requires a fixed pool_size across all layers.")
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 raise ValueError("CRAFT pool requires VLLM_ASCEND_ENABLE_FUSED_MC2=0 (AllGather path).")
             if self.global_expert_map is None:
@@ -423,6 +488,12 @@ class AscendFusedMoE(FusedMoE):
             ).npu()
         else:
             self.local_num_experts = self.global_num_experts // self.ep_size
+            if self.metro_routing and self.log2phy is not None and self.log2phy.dim() == 2:
+                self.dispatch_expert_map = generate_local_physical_expert_mask(
+                    self.local_num_experts,
+                    self.ep_size,
+                    self.ep_rank,
+                ).npu()
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -446,6 +517,7 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
+        self.moe_config.metro_routing = self.metro_routing
         self._init_force_load_balance_ids()
         # TODO(qcs): check the default value of ops.
         self.swiglu_limit= getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 1000000)
@@ -550,6 +622,11 @@ class AscendFusedMoE(FusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
+        if _is_craft_pool_graph_capturing(self):
+            routed_out = _craft_graph_buffer(self, "routed", hidden_states)
+            if return_with_event:
+                return FusedMoEResult(routed_out=routed_out, swiglu_limit=self.swiglu_limit)
+            return routed_out
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
@@ -584,23 +661,32 @@ class AscendFusedMoE(FusedMoE):
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
                 set_flash_common3_context(shared_out=shared_out)
-                input_ids = get_forward_context().input_ids
-                topk_weights, topk_ids = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=self.use_grouped_topk,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    custom_routing_function=self.custom_routing_function,
-                    scoring_func=self.scoring_func,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    e_score_correction_bias=self.e_score_correction_bias,
-                    global_num_experts=self.global_num_experts,
-                    input_ids=input_ids,  # Note: get ids from forward context
-                    tid2eid=self.tid2eid,  # 
-                )
+                if enable_force_load_balance:
+                    topk_weights, topk_ids = build_force_load_balance_routing(
+                        layer=self,
+                        hidden_states=hidden_states,
+                        top_k=self.top_k,
+                        log2phy=self.log2phy,
+                        weight_dtype=router_logits.dtype,
+                    )
+                else:
+                    input_ids = get_forward_context().input_ids
+                    topk_weights, topk_ids = select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        top_k=self.top_k,
+                        use_grouped_topk=self.use_grouped_topk,
+                        renormalize=self.renormalize,
+                        topk_group=self.topk_group,
+                        num_expert_group=self.num_expert_group,
+                        custom_routing_function=self.custom_routing_function,
+                        scoring_func=self.scoring_func,
+                        routed_scaling_factor=self.routed_scaling_factor,
+                        e_score_correction_bias=self.e_score_correction_bias,
+                        global_num_experts=self.global_num_experts,
+                        input_ids=input_ids,  # Note: get ids from forward context
+                        tid2eid=self.tid2eid,
+                    )
 
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
                     topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
@@ -663,6 +749,16 @@ class AscendFusedMoE(FusedMoE):
                     if group_list_type == 1
                     else torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
                 )
+                metro_debug = _metro_debug_enabled()
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][moe_load_before] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"local_load_shape={tuple(local_load.shape)} moe_load_shape={tuple(self.moe_load.shape)} "
+                        f"group_list_type={group_list_type}",
+                        flush=True,
+                    )
                 if self.multi_stage:
                     cur_iter = torch.remainder(self.load_counter, self.num_iter)
                     self.moe_load.index_add_(
@@ -671,13 +767,37 @@ class AscendFusedMoE(FusedMoE):
                     self.load_counter.add_(1)
                 else:
                     self.moe_load.add_(local_load)
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        f"[METRO_DEBUG][moe_load_after] ep_rank={self.ep_rank} layer={self.moe_instance_id}",
+                        flush=True,
+                    )
+        metro_debug = _metro_debug_enabled()
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][finalize_before] "
+                f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                f"routed_shape={tuple(fused_experts_results.routed_out.shape)} "
+                f"reduce_results={self.reduce_results} padded_shape={padded_hidden_states_shape}",
+                flush=True,
+            )
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][finalize_after] "
+                f"ep_rank={self.ep_rank} layer={self.moe_instance_id} out_shape={tuple(routed_out.shape)}",
+                flush=True,
+            )
 
         if return_with_event:
+            routed_out = _copy_to_craft_graph_buffer(self, "routed", routed_out)
             return FusedMoEResult(
                 routed_out=routed_out,
                 before_dispatch_evt=fused_experts_results.before_dispatch_evt,
@@ -687,7 +807,7 @@ class AscendFusedMoE(FusedMoE):
             )
         else:
             # The vLLM FusedMoE forward_impl does not return events.
-            return routed_out
+            return _copy_to_craft_graph_buffer(self, "routed", routed_out)
 
 
 class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
@@ -814,6 +934,16 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
     def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents):
         if self._shared_experts is None:
             return None
+        metro_debug = _metro_debug_enabled()
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][shared_begin] "
+                f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                f"hidden_shape={tuple(hidden_states.shape)} hidden_contig={hidden_states.is_contiguous()} "
+                f"quant={self.quant_type} overlap={self.multistream_overlap_shared_expert}",
+                flush=True,
+            )
 
         def maybe_wait_event(evt: torch.npu.Event | None):
             if evt is not None:
@@ -826,6 +956,14 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 # Execute dynamic quant concurrently with MoE gate.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_quant_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"quantized_shape={tuple(quantized_x.shape)} scale_shape={tuple(pertoken_scale.shape)}",
+                        flush=True,
+                    )
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)
@@ -837,6 +975,14 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     bias=None,
                     output_dtype=torch.int32
                 )
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_gate_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"gate_shape={tuple(hidden_states.shape)}",
+                        flush=True,
+                    )
                 # Execute activation concurrently with gmm2.
 
                 maybe_wait_event(fused_moe_evts.before_gmm2)
@@ -853,6 +999,14 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     swiglu_mode=1,
                     clamp_limit=fused_moe_evts.swiglu_limit,
                 )
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_swiglu_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"quantized_shape={tuple(quantized_x.shape)} scale_shape={tuple(swiglu_out_scale.shape)}",
+                        flush=True,
+                    )
                 # Execute the down projection concurrently with the combine
                 # communication.
                 maybe_wait_event(fused_moe_evts.before_combine)
@@ -864,6 +1018,14 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     bias=None,
                     output_dtype=original_dtype
                 )
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_down_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"shared_shape={tuple(shared_out.shape)} shared_contig={shared_out.is_contiguous()}",
+                        flush=True,
+                    )
             else:
                 # Ensure the shared experts wait for hidden_states to be ready.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
@@ -871,10 +1033,26 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)
                 part1_out = self._shared_experts_part1(hidden_states)
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_part1_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"part1_shape={tuple(part1_out.shape)}",
+                        flush=True,
+                    )
                 # Execute the down projection concurrently with the combine
                 # communication.
                 maybe_wait_event(fused_moe_evts.before_combine)
                 shared_out = self._shared_experts_part2(hidden_states, part1_out)
+                if metro_debug:
+                    torch.npu.synchronize()
+                    print(
+                        "[METRO_DEBUG][shared_part2_after] "
+                        f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                        f"shared_shape={tuple(shared_out.shape)} shared_contig={shared_out.is_contiguous()}",
+                        flush=True,
+                    )
 
         # Make sure the default stream waits for the shared experts stream to
         # finish.
@@ -889,11 +1067,26 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             and not shared_expert_dp_enabled()
         ):
             shared_out = tensor_model_parallel_all_reduce(shared_out)
+            if metro_debug:
+                torch.npu.synchronize()
+                print(
+                    "[METRO_DEBUG][shared_allreduce_after] "
+                    f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                    f"shared_shape={tuple(shared_out.shape)}",
+                    flush=True,
+                )
         return shared_out
 
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        if _is_craft_pool_graph_capturing(self):
+            routed_out = _craft_graph_buffer(self, "routed", hidden_states)
+            if self._shared_experts is None:
+                return routed_out
+            shared_out = _craft_graph_buffer(self, "shared", hidden_states)
+            return shared_out, routed_out
+
         if self.multistream_overlap_gate:
             set_flash_common3_context(shared_experts=self._shared_experts)
 
@@ -934,5 +1127,17 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     swiglu_limit=fused_moe_results.swiglu_limit
                 ),
             )
+        if _metro_debug_enabled():
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][shared_return] "
+                f"ep_rank={self.ep_rank} layer={self.moe_instance_id} "
+                f"shared_shape={None if shared_out is None else tuple(shared_out.shape)} "
+                f"routed_shape={tuple(routed_out.shape)}",
+                flush=True,
+            )
 
+        routed_out = _copy_to_craft_graph_buffer(self, "routed", routed_out)
+        if shared_out is not None:
+            shared_out = _copy_to_craft_graph_buffer(self, "shared", shared_out)
         return shared_out, routed_out

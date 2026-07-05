@@ -36,6 +36,10 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
+        rank_in_group = getattr(self.comm_group, "rank_in_group", self.rank_id)
+        self.rank_in_group = rank_in_group if isinstance(rank_in_group, int) else self.rank_id
+        group_ranks = getattr(self.comm_group, "ranks", None)
+        self.plan_src_rank = group_ranks[0] if isinstance(group_ranks, (list, tuple)) and group_ranks else 0
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -63,6 +67,8 @@ class EplbUpdator:
 
         self.reqs = []
         self.update_info_all = []
+        self.update_info_index = 0
+        self.skip_current_step = False
 
         self.cur_iterations: torch.int64 = 0
 
@@ -95,17 +101,62 @@ class EplbUpdator:
         )
         return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
 
+    def current_weight_update_index(self):
+        return self.cur_iterations - (
+            self.expert_heat_collection_interval + self.algorithm_execution_interval
+        )
+
     def wakeup_eplb_worker(self):
         self.eplb_process.planner_q.put(1)
 
-    def forward_before(self):
+    def _broadcast_update_info(self, update_info_all):
+        object_list = [update_info_all if self.rank_id == self.plan_src_rank else None]
+        group = getattr(self.comm_group, "cpu_group", None)
+        if group is None:
+            group = getattr(self.comm_group, "device_group", None)
+        dist.broadcast_object_list(object_list, src=self.plan_src_rank, group=group)
+        return object_list[0]
+
+    def _select_rank_update_info(self, update_info_all):
+        selected_update_info = []
+        for record in update_info_all:
+            if not isinstance(record, dict) or "send_all" not in record:
+                selected_update_info.append(record)
+                continue
+
+            rank_idx = self.rank_in_group
+            selected_update_info.append(
+                (
+                    record["send_all"][rank_idx],
+                    record["recv_all"][rank_idx],
+                    record["maps_all"][rank_idx],
+                    record["log2phy_all"][rank_idx],
+                    record["layer_id"],
+                )
+            )
+        return selected_update_info
+
+    def forward_before(self, skip_update: bool = False):
+        self.skip_current_step = skip_update
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
-            self.update_info_all = self.eplb_process.block_update_q.get()
+            update_info_all = self.eplb_process.block_update_q.get()
+            update_info_all = self._broadcast_update_info(update_info_all)
+            self.update_info_all = self._select_rank_update_info(update_info_all)
+            self.update_info_index = 0
+        if self.skip_current_step:
+            return
         if self.update_expert_weight_flag():
-            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all.pop(
-                0
-            )
+            self.update_info_index = self.current_weight_update_index()
+            if self.update_info_index < 0 or self.update_info_index >= len(self.update_info_all):
+                logger.warning_once(
+                    "EPLB update info is not ready for index %s; skipping this step",
+                    self.update_info_index,
+                )
+                return
+            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all[
+                self.update_info_index
+            ]
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
             updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))
@@ -125,10 +176,19 @@ class EplbUpdator:
             self.compute_and_set_moe_load()
             self.wakeup_eplb_worker()
 
-        if self.update_expert_weight_flag() and self.expert_map_record_path is None:
+        if self.update_expert_weight_flag() and self.skip_current_step:
+            self.skip_current_step = False
+            return
+
+        if (
+            self.update_expert_weight_flag()
+            and not self.skip_current_step
+            and self.expert_map_record_path is None
+        ):
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
         self.update_iteration()
+        self.skip_current_step = False
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

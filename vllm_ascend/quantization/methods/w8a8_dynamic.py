@@ -28,7 +28,11 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.flash_common3_context import get_flash_common3_context
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    build_force_load_balance_routing,
+    select_experts,
+    zero_experts_compute,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
@@ -44,6 +48,40 @@ def scale_from_float_to_int64(scale):
         np.frombuffer(scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32).astype(np.int64)
     ).to(scale.device)
     return scale
+
+
+def _resolve_craft_pool_split(layer, pool_size: int) -> int:
+    pool_size = int(pool_size)
+    total_experts = int(layer.w13_weight.shape[0])
+    if pool_size <= 0:
+        layer.local_num_experts_main = total_experts
+        layer.local_num_experts_pool = 0
+        return total_experts
+    if pool_size >= total_experts:
+        raise ValueError(
+            "CRAFT pool weight split requires pool_size to be smaller than loaded expert slots, "
+            f"but got pool_size={pool_size}, total_experts={total_experts}."
+        )
+
+    inferred_main_size = total_experts - pool_size
+    configured_main_size = getattr(layer, "local_num_experts_main", None)
+    if configured_main_size is None:
+        main_size = inferred_main_size
+    else:
+        configured_main_size = int(configured_main_size)
+        if configured_main_size + pool_size == total_experts:
+            main_size = configured_main_size
+        elif configured_main_size >= total_experts:
+            main_size = inferred_main_size
+        else:
+            raise ValueError(
+                "CRAFT pool weight split mismatch: "
+                f"configured_main={configured_main_size}, pool={pool_size}, total={total_experts}."
+            )
+
+    layer.local_num_experts_main = main_size
+    layer.local_num_experts_pool = pool_size
+    return main_size
 
 
 @register_scheme("W8A8_DYNAMIC", "linear")
@@ -195,7 +233,15 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 "Number of global experts mismatch (excluding redundancy)"
             )
 
-        if self.multistream_overlap_gate:
+        if enable_force_load_balance:
+            topk_weights, topk_ids = build_force_load_balance_routing(
+                layer=layer,
+                hidden_states=x,
+                top_k=top_k,
+                log2phy=log2phy,
+                weight_dtype=router_logits.dtype,
+            )
+        elif self.multistream_overlap_gate:
             fc3_context = get_flash_common3_context()
             assert fc3_context is not None
             topk_weights = fc3_context.topk_weights
@@ -226,12 +272,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 zero_expert_type=zero_expert_type,
                 hidden_states=x,
             )
-        # this is a naive implementation for experts load balance so as
-        # to avoid accumulating too much tokens on a single rank.
-        # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
-            topk_ids = layer.force_load_balance_routed_topk_ids[: topk_ids.shape[0]]
-
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
 
@@ -239,7 +279,25 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         fused_scale_flag = (
             _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
         )
-        if self.dynamic_eplb:
+        pool_size = int(getattr(layer, "local_num_experts_pool", 0) or 0)
+        compact_craft_pool = (
+            self.dynamic_eplb
+            and pool_size > 0
+            and hasattr(layer, "w13_weight_with_pool")
+            and hasattr(layer, "w2_weight_with_pool")
+        )
+        effective_dynamic_eplb = self.dynamic_eplb and not compact_craft_pool
+
+        if compact_craft_pool:
+            w1 = [layer.w13_weight_with_pool]
+            w1_scale = (
+                [layer.fused_w1_scale_with_pool]
+                if fused_scale_flag
+                else [layer.w13_weight_scale_fp32_with_pool]
+            )
+            w2 = [layer.w2_weight_with_pool]
+            w2_scale = [layer.fused_w2_scale_with_pool] if fused_scale_flag else [layer.w2_weight_scale_with_pool]
+        elif self.dynamic_eplb:
             w1 = layer.w13_weight_list
             w1_scale = layer.fused_w1_scale_list if fused_scale_flag else layer.w13_weight_scale_fp32_list
             w2 = layer.w2_weight_list
@@ -249,7 +307,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale = [layer.fused_w1_scale] if fused_scale_flag else [layer.w13_weight_scale_fp32]
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
-        if getattr(layer, "local_num_experts_pool", 0) > 0:
+        if pool_size > 0 and not compact_craft_pool:
             w1_pool = [layer.w13_weight_pool]
             w1_scale_pool = [layer.fused_w1_scale_pool] if fused_scale_flag else [layer.w13_weight_scale_fp32_pool]
             w2_pool = [layer.w2_weight_pool]
@@ -277,7 +335,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w1=w1,
                 w2=w2,
                 quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
+                dynamic_eplb=effective_dynamic_eplb,
                 expert_map=expert_map,
                 global_redundant_expert_num=global_redundant_expert_num,
                 mc2_mask=mc2_mask,
@@ -295,6 +353,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale_pool=w2_scale_pool,
                 w1_scale_bias_pool=w1_scale_bias_pool,
                 w2_scale_bias_pool=w2_scale_bias_pool,
+                compact_craft_pool=compact_craft_pool,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -316,45 +375,83 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
         pool_size = getattr(layer, "local_num_experts_pool", 0)
         if pool_size > 0:
-            main_size = getattr(layer, "local_num_experts_main", layer.w13_weight.shape[0] - pool_size)
-            layer.w13_weight_pool = layer.w13_weight.data[main_size:].clone()
-            layer.w2_weight_pool = layer.w2_weight.data[main_size:].clone()
-            layer.w13_weight_scale_pool = layer.w13_weight_scale.data[main_size:].clone()
-            layer.w13_weight_scale_fp32_pool = layer.w13_weight_scale_fp32.data[main_size:].clone()
-            layer.w13_weight_offset_pool = layer.w13_weight_offset.data[main_size:].clone()
-            layer.w2_weight_scale_pool = layer.w2_weight_scale.data[main_size:].clone()
-            layer.w2_weight_offset_pool = layer.w2_weight_offset.data[main_size:].clone()
-            layer.w13_weight.data = layer.w13_weight.data[:main_size].clone()
-            layer.w2_weight.data = layer.w2_weight.data[:main_size].clone()
-            layer.w13_weight_scale.data = layer.w13_weight_scale.data[:main_size].clone()
-            layer.w13_weight_scale_fp32 = layer.w13_weight_scale_fp32.data[:main_size].clone()
-            layer.w13_weight_offset.data = layer.w13_weight_offset.data[:main_size].clone()
-            layer.w2_weight_scale.data = layer.w2_weight_scale.data[:main_size].clone()
-            layer.w2_weight_offset.data = layer.w2_weight_offset.data[:main_size].clone()
+            main_size = _resolve_craft_pool_split(layer, pool_size)
+            layer.w13_weight_with_pool = layer.w13_weight.data
+            layer.w2_weight_with_pool = layer.w2_weight.data
+            layer.w13_weight_scale_with_pool = layer.w13_weight_scale.data
+            layer.w13_weight_scale_fp32_with_pool = layer.w13_weight_scale_fp32.data
+            layer.w13_weight_offset_with_pool = layer.w13_weight_offset.data
+            layer.w2_weight_scale_with_pool = layer.w2_weight_scale.data
+            layer.w2_weight_offset_with_pool = layer.w2_weight_offset.data
+
+            layer.w13_weight_pool = layer.w13_weight_with_pool[main_size:]
+            layer.w2_weight_pool = layer.w2_weight_with_pool[main_size:]
+            layer.w13_weight_scale_pool = layer.w13_weight_scale_with_pool[main_size:]
+            layer.w13_weight_scale_fp32_pool = layer.w13_weight_scale_fp32_with_pool[main_size:]
+            layer.w13_weight_offset_pool = layer.w13_weight_offset_with_pool[main_size:]
+            layer.w2_weight_scale_pool = layer.w2_weight_scale_with_pool[main_size:]
+            layer.w2_weight_offset_pool = layer.w2_weight_offset_with_pool[main_size:]
+
+            layer.w13_weight.data = layer.w13_weight_with_pool[:main_size]
+            layer.w2_weight.data = layer.w2_weight_with_pool[:main_size]
+            layer.w13_weight_scale.data = layer.w13_weight_scale_with_pool[:main_size]
+            layer.w13_weight_scale_fp32 = layer.w13_weight_scale_fp32_with_pool[:main_size]
+            layer.w13_weight_offset.data = layer.w13_weight_offset_with_pool[:main_size]
+            layer.w2_weight_scale.data = layer.w2_weight_scale_with_pool[:main_size]
+            layer.w2_weight_offset.data = layer.w2_weight_offset_with_pool[:main_size]
 
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
             layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
             layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
             if pool_size > 0:
-                layer.fused_w1_scale_pool = scale_from_float_to_int64(layer.w13_weight_scale_pool.data)
-                layer.fused_w2_scale_pool = scale_from_float_to_int64(layer.w2_weight_scale_pool.data)
+                layer.fused_w1_scale_with_pool = scale_from_float_to_int64(layer.w13_weight_scale_with_pool)
+                layer.fused_w2_scale_with_pool = scale_from_float_to_int64(layer.w2_weight_scale_with_pool)
+                layer.fused_w1_scale_pool = layer.fused_w1_scale_with_pool[main_size:]
+                layer.fused_w2_scale_pool = layer.fused_w2_scale_with_pool[main_size:]
 
         if self.dynamic_eplb:
-            layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
-            layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
-            layer.w13_weight_scale_fp32_list = [
-                weight.clone() for weight in layer.w13_weight_scale_fp32.data.unbind(dim=0)
+            clone_expert_views = pool_size <= 0
+            layer.w13_weight_list = [
+                weight.clone() if clone_expert_views else weight for weight in layer.w13_weight.data.unbind(dim=0)
             ]
-            layer.w2_weight_scale_list = [weight.clone() for weight in layer.w2_weight_scale.data.unbind(dim=0)]
+            layer.w2_weight_list = [
+                weight.clone() if clone_expert_views else weight for weight in layer.w2_weight.data.unbind(dim=0)
+            ]
+            layer.w13_weight_scale_fp32_list = [
+                weight.clone() if clone_expert_views else weight
+                for weight in layer.w13_weight_scale_fp32.data.unbind(dim=0)
+            ]
+            layer.w2_weight_scale_list = [
+                weight.clone() if clone_expert_views else weight
+                for weight in layer.w2_weight_scale.data.unbind(dim=0)
+            ]
+            if pool_size > 0:
+                layer.w13_weight_pool_list = [weight for weight in layer.w13_weight_pool.data.unbind(dim=0)]
+                layer.w2_weight_pool_list = [weight for weight in layer.w2_weight_pool.data.unbind(dim=0)]
+                layer.w13_weight_scale_fp32_pool_list = [
+                    weight for weight in layer.w13_weight_scale_fp32_pool.data.unbind(dim=0)
+                ]
+                layer.w2_weight_scale_pool_list = [
+                    weight for weight in layer.w2_weight_scale_pool.data.unbind(dim=0)
+                ]
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
                 layer.fused_w1_scale_list = [
-                    weight.clone()
+                    weight.clone() if clone_expert_views else weight
                     for weight in layer.fused_w1_scale.view(len(layer.w13_weight_list), -1).data.unbind(dim=0)
                 ]
                 layer.fused_w2_scale_list = [
-                    weight.clone()
+                    weight.clone() if clone_expert_views else weight
                     for weight in layer.fused_w2_scale.view(len(layer.w2_weight_list), -1).data.unbind(dim=0)
                 ]
+                if pool_size > 0:
+                    layer.fused_w1_scale_pool_list = [
+                        weight
+                        for weight in layer.fused_w1_scale_pool.view(pool_size, -1).data.unbind(dim=0)
+                    ]
+                    layer.fused_w2_scale_pool_list = [
+                        weight
+                        for weight in layer.fused_w2_scale_pool.view(pool_size, -1).data.unbind(dim=0)
+                    ]
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale

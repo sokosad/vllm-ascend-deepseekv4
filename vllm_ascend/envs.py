@@ -108,6 +108,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Static CRAFT pooling: extra local redundant expert slots per rank.
     # 0 keeps the existing single-tensor MoE path.
     "VLLM_ASCEND_CRAFT_POOL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0")),
+    # METRO replica routing: route each logical expert to one preferred
+    # physical replica in a batch to reduce activated expert weights.
+    "VLLM_ASCEND_METRO_ROUTING": lambda: os.getenv(
+        "VLLM_ASCEND_METRO_ROUTING", os.getenv("METRO_ROUTING", "0")
+    ).lower()
+    in ("1", "true", "yes", "on"),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True

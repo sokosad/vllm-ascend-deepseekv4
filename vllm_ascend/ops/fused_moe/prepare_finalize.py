@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 
 from abc import ABC, abstractmethod
+import os
 
 import torch
 import torch.distributed as dist
@@ -35,6 +36,23 @@ from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch, prefill_context_parallel_enable
+
+
+def _metro_debug_enabled() -> bool:
+    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        if dynamo is not None and dynamo.is_compiling():
+            return False
+    except Exception:
+        pass
+    try:
+        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 class PrepareAndFinalize(ABC):
@@ -479,6 +497,15 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [local_num_tokens, hidden_size]
         """
+        metro_debug = _metro_debug_enabled()
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][pf_finalize_entry] "
+                f"hidden_shape={tuple(hidden_states.shape)} reduce_results={reduce_results} "
+                f"enable_sp={enable_sp()} enable_sp_by_pass={enable_sp_by_pass()}",
+                flush=True,
+            )
         if enable_sp() or enable_sp_by_pass():
             return self._finalize_with_ep_group(hidden_states)
 
@@ -494,7 +521,23 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         2 Reduce_results is True usually happens when model has no shared experts. We still do reduce scatter
         here, then skip allreudce in FusedMoe.
         """
+        metro_debug = _metro_debug_enabled()
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][pf_ep_reduce_before] "
+                f"hidden_shape={tuple(hidden_states.shape)} "
+                f"ep_rank={getattr(self.moe_config, 'ep_rank', None)} ep_size={getattr(self.moe_config, 'ep_size', None)}",
+                flush=True,
+            )
         hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
+        if metro_debug:
+            torch.npu.synchronize()
+            print(
+                "[METRO_DEBUG][pf_ep_reduce_after] "
+                f"hidden_shape={tuple(hidden_states.shape)}",
+                flush=True,
+            )
 
         return hidden_states
 
@@ -508,10 +551,39 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
+        metro_debug = _metro_debug_enabled()
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
+            if metro_debug:
+                torch.npu.synchronize()
+                print(
+                    "[METRO_DEBUG][pf_dp_reduce_before] "
+                    f"hidden_shape={tuple(hidden_states.shape)} num_tokens={getattr(self, 'num_tokens', None)}",
+                    flush=True,
+                )
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
+            if metro_debug:
+                torch.npu.synchronize()
+                print(
+                    "[METRO_DEBUG][pf_dp_reduce_after] "
+                    f"hidden_shape={tuple(hidden_states.shape)}",
+                    flush=True,
+                )
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
+            if metro_debug:
+                torch.npu.synchronize()
+                print(
+                    "[METRO_DEBUG][pf_pcp_reduce_before] "
+                    f"hidden_shape={tuple(hidden_states.shape)}",
+                    flush=True,
+                )
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+            if metro_debug:
+                torch.npu.synchronize()
+                print(
+                    "[METRO_DEBUG][pf_pcp_reduce_after] "
+                    f"hidden_shape={tuple(hidden_states.shape)}",
+                    flush=True,
+                )
         return hidden_states

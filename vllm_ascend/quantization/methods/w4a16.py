@@ -24,7 +24,7 @@ from vllm.config import get_current_vllm_config
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+from vllm_ascend.ops.fused_moe.experts_selector import build_force_load_balance_routing, select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
 from .base import AscendMoEScheme, QuantType
@@ -205,21 +205,30 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
             "Number of global experts mismatch (excluding redundancy)"
         )
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts,
-            tid2eid=tid2eid,
-        )
+        if enable_force_load_balance:
+            topk_weights, topk_ids = build_force_load_balance_routing(
+                layer=layer,
+                hidden_states=x,
+                top_k=top_k,
+                log2phy=log2phy,
+                weight_dtype=router_logits.dtype,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+                global_num_experts=global_num_experts,
+                tid2eid=tid2eid,
+            )
 
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
