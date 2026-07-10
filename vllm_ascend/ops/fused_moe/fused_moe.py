@@ -122,6 +122,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        replica_options: torch.Tensor | None = None,
+        replica_counts: torch.Tensor | None = None,
+        replica_card_of: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -215,6 +218,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                replica_options=replica_options,
+                replica_counts=replica_counts,
+                replica_card_of=replica_card_of,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -360,15 +366,17 @@ class AscendFusedMoE(FusedMoE):
         # Build 2D replica options for Metro replica selection (if enabled)
         self._replica_options = None
         self._replica_counts = None
+        self._replica_card_of = None
         from vllm_ascend.ops.fused_moe.metro_replica import get_metro_strategy
         if get_metro_strategy() > 0 and self.global_expert_map is not None:
             valid_count = self.global_expert_map[0].ne(-1).sum().item()
             from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
-            self._replica_options, self._replica_counts = build_replica_options(
-                self.global_expert_map, self.ep_size, valid_count)
+            self._replica_options, self._replica_counts, self._replica_card_of = \
+                build_replica_options(self.global_expert_map, self.ep_size, valid_count)
             # Move to NPU for runtime efficiency (topk_ids is on NPU)
             self._replica_options = self._replica_options.npu()
             self._replica_counts = self._replica_counts.npu()
+            self._replica_card_of = self._replica_card_of.npu()
             logger.info_once(
                 "[Metro] Replica selection enabled (strategy=%d), "
                 "max_replicas=%d", get_metro_strategy(),
@@ -475,10 +483,11 @@ class AscendFusedMoE(FusedMoE):
         if self._replica_options is not None and self.global_expert_map is not None:
             from vllm_ascend.ops.fused_moe.metro_replica import build_replica_options
             valid_count = self.global_expert_map[0].ne(-1).sum().item()
-            opts, cnts = build_replica_options(
+            opts, cnts, cards = build_replica_options(
                 self.global_expert_map, self.ep_size, valid_count)
             self._replica_options = opts.npu()
             self._replica_counts = cnts.npu()
+            self._replica_card_of = cards.npu()
 
     def clear_moe_load(self):
         if self.moe_load is not None:
@@ -610,6 +619,7 @@ class AscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
             replica_options=self._replica_options,
             replica_counts=self._replica_counts,
+            replica_card_of=self._replica_card_of,
         )
 
         if self.dynamic_eplb:

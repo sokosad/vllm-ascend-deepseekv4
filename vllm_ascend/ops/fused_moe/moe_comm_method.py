@@ -286,17 +286,23 @@ class FusedMC2CommImpl(MoECommMethod):
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
-        # Apply log2phy or Metro replica selection
+        # Apply log2phy or Metro replica selection.
+        # Metro (select_replica) is decode-only per the paper
+        # (arXiv:2512.09277): prefill is compute-bound where token-balanced
+        # routing is correct, so Metro runs only during decode; prefill falls
+        # through to log2phy (the default routing path).
         topk_ids = fused_experts_input.topk_ids
         routing = fused_experts_input.routing
         if routing.replica_options is not None and routing.replica_counts is not None:
             from vllm_ascend.ops.fused_moe.metro_replica import (
-                get_metro_strategy, select_replica)
+                get_metro_strategy, is_decode_forward, select_replica)
             strategy = get_metro_strategy()
-            if strategy > 0:
+            if strategy > 0 and is_decode_forward():
                 topk_ids = select_replica(
                     topk_ids, routing.replica_options, routing.replica_counts,
-                    self.moe_config.ep_size, strategy)
+                    self.moe_config.ep_size, strategy,
+                    card_of_option=routing.replica_card_of,
+                    comm_group=self.token_dispatcher.ep_group)
             elif routing.log2phy is not None:
                 topk_ids = routing.log2phy[topk_ids]
         elif routing.log2phy is not None:
