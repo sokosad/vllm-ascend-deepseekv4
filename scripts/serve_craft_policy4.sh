@@ -1,0 +1,64 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+MODEL_PATH=${MODEL_PATH:-/mnt/sdb/models/DeepSeek-V4-Flash-w8a8-mtp/}
+CARDS=${CARDS:-0,1,2,3,4,5,6,7}
+DP=${DP:-2}
+TP=${TP:-4}
+POOL_SIZE=${POOL_SIZE:-1}
+HEAT=${HEAT:-60}
+ALGO=${ALGO:-10}
+PORT=${PORT:-8008}
+MNBT=${MNBT:-16384}
+MNS=${MNS:-256}
+GMU=${GMU:-0.90}
+FUSED_MC2=${FUSED_MC2:-0}
+
+EP_SIZE=$((DP * TP))
+NUM_REDUNDANT=$((POOL_SIZE * EP_SIZE))
+
+export ASCEND_RT_VISIBLE_DEVICES="$CARDS"
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:${LD_PRELOAD:-}
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=10
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export VLLM_USE_V1=1
+export VLLM_VERSION=0.18.0
+export USE_MULTI_BLOCK_POOL=1
+export USE_MULTI_GROUPS_KV_CACHE=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export VLLM_ASCEND_ENABLE_FUSED_MC2="$FUSED_MC2"
+export DYNAMIC_EPLB=true
+export VLLM_ENGINE_READY_TIMEOUT_S=1200
+
+ADDITIONAL_CONFIG=$(printf '%s' \
+  '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false,"fuse_norm_quant":false},' \
+  '"enable_cpu_binding":"true","multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false,' \
+  '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":4,' \
+  '"num_redundant_experts":'"$NUM_REDUNDANT"',"craft_pool_size":'"$POOL_SIZE"',' \
+  '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"'}}')
+
+echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2"
+echo "[CRAFT] additional_config=$ADDITIONAL_CONFIG"
+
+exec vllm serve "$MODEL_PATH" \
+  --max-model-len 1024000 \
+  --max-num-batched-tokens "$MNBT" \
+  --served-model-name dsv4 \
+  --gpu-memory-utilization "$GMU" \
+  --api-server-count 1 \
+  --max-num-seqs "$MNS" \
+  --no-enable-prefix-caching \
+  --data-parallel-size "$DP" \
+  --tensor-parallel-size "$TP" \
+  --enable-expert-parallel \
+  --tokenizer-mode deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v4 \
+  --safetensors-load-strategy prefetch \
+  --quantization ascend \
+  --port "$PORT" \
+  --block-size 128 \
+  --additional-config "$ADDITIONAL_CONFIG" \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","pass_config":{"enable_sp":false}}'
