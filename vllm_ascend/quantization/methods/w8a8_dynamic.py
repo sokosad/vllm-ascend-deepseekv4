@@ -34,6 +34,7 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     zero_experts_compute,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.fused_moe import _log_logical_topk_cooccurrence, _log_logical_topk_ct
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType
@@ -262,6 +263,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 global_num_experts=global_num_experts,
                 tid2eid=tid2eid,
             )
+        _log_logical_topk_cooccurrence(topk_ids, getattr(layer, "moe_instance_id", 0), getattr(layer, "ep_rank", -1))
+        _log_logical_topk_ct(topk_ids, getattr(layer, "moe_instance_id", 0), getattr(layer, "ep_rank", -1), global_num_experts, getattr(layer, "ep_size", 8))
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
