@@ -149,6 +149,23 @@ class EplbWorker:
                     new_placement[layer_id] = old_placement[layer_id]
                     break
 
+                # Experts that remain on a rank must keep their local slots so
+                # only pool replacement requires weight movement.
+                invalid_movement = False
+                for slot_id in torch.where(new_valid_slots)[0]:
+                    expert_id = new_placement_check[slot_id]
+                    old_slots = torch.where(old_placement_check == expert_id)[0]
+                    if old_slots.numel() > 0 and old_slots[0].item() != slot_id.item():
+                        invalid_movement = True
+                        break
+                if invalid_movement:
+                    logger.error(
+                        "There exists expert movement inside NPU; expert placement on "
+                        f"layer {layer_id}, rank {rank_id} is invalid"
+                    )
+                    new_placement[layer_id] = old_placement[layer_id]
+                    break
+
     @staticmethod
     def _check_expert_placement_legacy(old_placement, new_placement):
         num_layers = old_placement.shape[0]
@@ -172,22 +189,6 @@ class EplbWorker:
 
                 expert_not_move = torch.isin(new_placement_check, old_placement_check)
                 if not torch.equal(new_placement_check[expert_not_move], old_placement_check[expert_not_move]):
-                    logger.error(
-                        "There exists expert movement inside NPU; expert placement on "
-                        f"layer {layer_id}, rank {rank_id} is invalid"
-                    )
-                    new_placement[layer_id] = old_placement[layer_id]
-                    break
-
-                # check if there is any experts movement inside one NPU
-                invalid_movement = False
-                for slot_id in torch.where(new_valid_slots)[0]:
-                    expert_id = new_placement_check[slot_id]
-                    old_slots = torch.where(old_placement_check == expert_id)[0]
-                    if old_slots.numel() > 0 and old_slots[0].item() != slot_id.item():
-                        invalid_movement = True
-                        break
-                if invalid_movement:
                     logger.error(
                         "There exists expert movement inside NPU; expert placement on "
                         f"layer {layer_id}, rank {rank_id} is invalid"

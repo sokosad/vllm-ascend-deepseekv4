@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 
 from vllm_ascend.eplb.core.eplb_worker import EplbWorker
@@ -55,8 +56,44 @@ def test_policy2_pack_update_info_keeps_rank_local_plan():
     assert packed == [([], [(0, 2)], [0, -1, 1], [2, 1, 3], 3)]
 
 
+def test_policy2_placement_validation_uses_legacy_path_without_pool_symbols():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 2
+    old_placement = torch.tensor([[[0, 1], [2, 3]]], dtype=torch.long)
+    new_placement = old_placement.clone()
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
+def test_policy4_placement_validation_accepts_padded_pool_slots():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    old_placement = torch.tensor([[[0, 1, 4], [2, 3, -1]]], dtype=torch.long)
+    new_placement = old_placement.clone()
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
+def test_compute_imbalance_handles_padded_layer_table():
+    deployment = torch.tensor([[[0, 1, 4], [2, 3, -1]]], dtype=torch.long)
+    hotness = np.asarray([[10.0, 20.0, 30.0, 40.0, 50.0]])
+
+    mean_imbalance, max_imbalance = EplbWorker._compute_imbalance(deployment, hotness)
+
+    assert np.isfinite(mean_imbalance)
+    assert np.isfinite(max_imbalance)
+    assert mean_imbalance == max_imbalance
+
+
 def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
+    suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
+    suite.addTest(unittest.FunctionTestCase(test_compute_imbalance_handles_padded_layer_table))
     return suite
