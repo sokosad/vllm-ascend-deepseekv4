@@ -39,6 +39,10 @@ class VllmEplbAdaptor:
 
         self.num_local_experts_per_layer = self._get_num_local_experts_per_layer()
         self.num_local_experts = max(self.num_local_experts_per_layer.values(), default=0)
+        self.craft_pool_enabled = any(
+            getattr(self.model.model.layers[layer_idx].mlp.experts, "craft_pool_enabled", False)
+            for layer_idx in self.num_local_experts_per_layer
+        )
         self.expert_param_per_layer = dict()
         self.init_expert_param_per_layer()
 
@@ -151,6 +155,24 @@ class VllmEplbAdaptor:
         if self.rank_id == 0:
             expert_maps_list = expert_maps.tolist()
             record: dict[str, Any] = {"moe_layer_count": len(expert_maps_list), "layer_list": []}
+            if not self.craft_pool_enabled:
+                num_local_experts = int(expert_maps.max().item()) + 1
+                for layer_idx, layer_data in enumerate(expert_maps_list):
+                    layer_record: dict[str, Any] = {
+                        "layer_id": layer_idx,
+                        "device_count": len(layer_data),
+                        "device_list": [],
+                    }
+                    for device_idx, experts in enumerate(layer_data):
+                        placement = [experts.index(i) for i in range(num_local_experts)]
+                        layer_record["device_list"].append(
+                            {"device_id": device_idx, "device_expert": placement}
+                        )
+                    record["layer_list"].append(layer_record)
+                with open(expert_map_record_path, "w") as f:
+                    json.dump(record, f, indent=4)
+                return
+
             pool_start = len(expert_maps_list[0][0]) // len(expert_maps_list[0]) if expert_maps_list else 0
             has_pool = False
 

@@ -82,6 +82,14 @@ class FusedMoEEvents:
     swiglu_limit: int = 0
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _metro_debug_enabled() -> bool:
     if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
         return False
@@ -433,7 +441,7 @@ class AscendFusedMoE(FusedMoE):
 
         # init moe
         eplb_config = ascend_config.eplb_config
-        self.metro_routing = bool(getattr(eplb_config, "metro_routing", False))
+        self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
         self.global_expert_map, self._expert_map, self.log2phy, self.global_redundant_expert_num = init_eplb_config(
             eplb_config, self.moe_instance_id, self.moe_config
         )

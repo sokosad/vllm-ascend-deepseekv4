@@ -392,7 +392,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             self.is_eplb_warmuped = False
             self.policy_type = eplb_config.eplb_policy_type
-            self.eplb_loader = D2DExpertWeightLoader()
+            self.eplb_loader = D2DExpertWeightLoader(policy_type=self.policy_type)
             self.manager = Manager()
             self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
             self.eplb_process = EplbProcess(
@@ -1931,15 +1931,21 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32)
             return False, num_tokens_after_padding, cudagraph_mode, eplb_active
 
-        tensor = torch.zeros(3, self.dp_size, device="cpu", dtype=torch.int32)
+        sync_eplb_active = (
+            getattr(self, "dynamic_eplb", False)
+            and getattr(self, "policy_type", None) == 4
+        )
+        tensor_rows = 3 if sync_eplb_active else 2
+        tensor = torch.zeros(tensor_rows, self.dp_size, device="cpu", dtype=torch.int32)
         tensor[0][self.dp_rank] = num_tokens_padded
         tensor[1][self.dp_rank] = cudagraph_mode
-        tensor[2][self.dp_rank] = int(eplb_active)
+        if sync_eplb_active:
+            tensor[2][self.dp_rank] = int(eplb_active)
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
         num_tokens_across_dp = tensor[0, :]
         max_num_tokens = int(num_tokens_across_dp.max().item())
-        all_dp_eplb_active = bool(tensor[2, :].min().item())
+        all_dp_eplb_active = bool(tensor[2, :].min().item()) if sync_eplb_active else eplb_active
 
         if allow_dp_padding:
             num_tokens_after_padding = torch.tensor(
@@ -2417,7 +2423,16 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        dummy_updates_eplb = self.dynamic_eplb and not is_profile and not skip_eplb and not is_graph_capturing
+        craft_dummy_updates_eplb = (
+            self.dynamic_eplb
+            and self.policy_type == 4
+            and not is_profile
+            and not skip_eplb
+            and not is_graph_capturing
+        )
+        legacy_dummy_updates_eplb = self.dynamic_eplb and self.policy_type != 4 and not is_profile
+        if legacy_dummy_updates_eplb:
+            self.eplb_updator.forward_before()
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -2436,7 +2451,7 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
-            eplb_active=not dummy_updates_eplb,
+            eplb_active=not craft_dummy_updates_eplb,
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2454,7 +2469,7 @@ class NPUModelRunner(GPUModelRunner):
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
 
-        if dummy_updates_eplb:
+        if craft_dummy_updates_eplb:
             with record_function_or_nullcontext("EPLB dummy step"):
                 self.eplb_updator.forward_before(skip_update=True)
 
@@ -2634,7 +2649,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
             if is_profile and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
-            if dummy_updates_eplb:
+            if craft_dummy_updates_eplb or (self.dynamic_eplb and self.policy_type != 4):
                 self.eplb_updator.forward_end()
             
             if self.use_compress and force_attention:

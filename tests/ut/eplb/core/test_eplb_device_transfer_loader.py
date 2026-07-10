@@ -63,17 +63,15 @@ def test_asyn_transfer_and_update():
 
     reqs: list[MagicMock] = []
 
-    loader_obj._send_transfer_tasks = [("dst", "expert", ["tensor"])]
-
-    with patch.object(loader.D2DExpertWeightLoader, "_transfer_expert_weights_sync") as mock_transfer, \
-         patch.object(loader.D2DExpertWeightLoader, "_barrier_device_group") as mock_barrier, \
-         patch.object(loader.D2DExpertWeightLoader, "_synchronize_device"):
+    with patch("torch.distributed.batch_isend_irecv",
+               return_value=[MagicMock(), MagicMock()]) as mock_batch, \
+         patch.object(loader.D2DExpertWeightLoader, "_synchronize_device") as mock_sync:
         loader_obj.asyn_expert_weight_transfer(reqs)
 
     assert loader_obj.state == loader.ExpertWeightUpdateState.TRANSFERRING
-    assert reqs == []
-    mock_transfer.assert_called_once()
-    mock_barrier.assert_called_once()
+    assert len(reqs) == 2
+    mock_batch.assert_called_once_with(["fake_op"])
+    mock_sync.assert_not_called()
 
     mock_req = MagicMock()
     mock_req.wait.return_value = None
@@ -85,8 +83,9 @@ def test_asyn_transfer_and_update():
     loader_obj.layer_id = 0
     loader_obj.comm_op_list = ["op"]
 
-    with patch.object(loader.D2DExpertWeightLoader, "_synchronize_device"):
+    with patch.object(loader.D2DExpertWeightLoader, "_synchronize_device") as mock_sync:
         loader_obj.update_expert_map_and_weight(reqs)
+    mock_sync.assert_not_called()
 
     mock_adaptor.do_update_expert_map.assert_called_once()
     mock_adaptor.do_update_log2phy_map.assert_called_once()
@@ -96,13 +95,31 @@ def test_asyn_transfer_and_update():
     assert loader_obj.recv_expert_list == []
 
 
+def test_policy4_staging_uses_batched_transfer():
+    fake_group = MagicMock()
+    with patch("vllm_ascend.eplb.core.eplb_device_transfer_loader.get_dynamic_eplb_group",
+               return_value=fake_group):
+        loader_obj = loader.D2DExpertWeightLoader(policy_type=4)
+
+    loader_obj.comm_op_list = ["fake_op"]
+    loader_obj.state = loader.ExpertWeightUpdateState.READY
+    reqs = []
+    with patch("torch.distributed.batch_isend_irecv", return_value=[MagicMock()]) as mock_batch, \
+         patch.object(loader.D2DExpertWeightLoader, "_synchronize_device") as mock_sync:
+        loader_obj.asyn_expert_weight_transfer(reqs)
+
+    mock_sync.assert_called_once()
+    mock_batch.assert_called_once_with(["fake_op"])
+    assert len(reqs) == 1
+
+
 def test_generate_task_stages_offset_tensors():
     mock_adaptor = make_mock_adaptor()
     fake_group = MagicMock()
     fake_group.device_group = "device_group"
     with patch("vllm_ascend.eplb.core.eplb_device_transfer_loader.get_dynamic_eplb_group",
                return_value=fake_group):
-        loader_obj = loader.D2DExpertWeightLoader()
+        loader_obj = loader.D2DExpertWeightLoader(policy_type=4)
     loader_obj.set_adator(mock_adaptor)
 
     send_base = torch.arange(8.0)
@@ -116,12 +133,14 @@ def test_generate_task_stages_offset_tensors():
     mock_adaptor.expert_param_per_layer = {0: {0: [send_view]}}
     mock_adaptor.buffer_tensor_list = [[recv_view]]
 
-    loader_obj.generate_expert_d2d_transfer_task([(1, 10)], [(2, 20)],
-                                                 {20: torch.tensor(0)}, 0)
+    with patch("torch.distributed.P2POp") as mock_p2p:
+        mock_p2p.side_effect = lambda op, tensor, rank, group=None: MagicMock(tensor=tensor)
+        loader_obj.generate_expert_d2d_transfer_task([(1, 10)], [(2, 20)],
+                                                     {20: torch.tensor(0)}, 0)
 
     assert loader_obj.state == loader.ExpertWeightUpdateState.READY
-    send_tensor = loader_obj._send_transfer_tasks[0][2][0]
-    recv_tensor = loader_obj._recv_transfer_tasks[0][3][0]
+    send_tensor = loader_obj.comm_op_list[0].tensor
+    recv_tensor = loader_obj.comm_op_list[1].tensor
     assert send_tensor.storage_offset() == 0
     assert recv_tensor.storage_offset() == 0
     assert torch.equal(send_tensor, send_view)
@@ -133,7 +152,7 @@ def test_update_copies_staged_recv_buffer():
     mock_adaptor = make_mock_adaptor()
     with patch("vllm_ascend.eplb.core.eplb_device_transfer_loader.get_dynamic_eplb_group",
                return_value=None):
-        loader_obj = loader.D2DExpertWeightLoader()
+        loader_obj = loader.D2DExpertWeightLoader(policy_type=4)
     loader_obj.set_adator(mock_adaptor)
 
     dst_buffer = torch.zeros(3)
@@ -189,6 +208,7 @@ def load_tests(loader_obj, tests, pattern):
     for test_func in (
         test_generate_task_and_state_flow,
         test_asyn_transfer_and_update,
+        test_policy4_staging_uses_batched_transfer,
         test_generate_task_stages_offset_tensors,
         test_update_copies_staged_recv_buffer,
         test_set_log2phy_map,

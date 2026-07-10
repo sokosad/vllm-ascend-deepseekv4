@@ -1,4 +1,5 @@
 import unittest
+from queue import Empty
 from unittest.mock import MagicMock, patch
 import torch
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
@@ -114,6 +115,57 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         self.assertEqual(update_info, ["rank0-plan"])
 
+    def test_full_rank_plan_non_source_does_not_wait_on_local_planner(self):
+        self.updator.rank_id = 1
+        self.updator.plan_src_rank = 0
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            - 1
+        )
+        full_plan = [
+            {
+                "send_all": [[], [], [], []],
+                "recv_all": [[], [], [], []],
+                "maps_all": [[0], [0], [0], [0]],
+                "log2phy_all": [[0], [0], [0], [0]],
+                "layer_id": 0,
+            }
+        ]
+
+        with patch.object(self.updator, "_broadcast_update_info", return_value=full_plan):
+            self.updator.forward_before()
+
+        self.eplb_process.block_update_q.get.assert_not_called()
+        self.assertEqual(len(self.updator.update_info_all), 1)
+
+    def test_full_rank_plan_timeout_broadcasts_skip(self):
+        self.updator.rank_id = 0
+        self.updator.plan_src_rank = 0
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            - 1
+        )
+        self.eplb_process.block_update_q.get.side_effect = Empty
+
+        with patch.object(self.updator, "_broadcast_update_info", return_value=None) as mock_broadcast:
+            self.updator.forward_before()
+
+        self.eplb_process.block_update_q.get.assert_called_once_with(timeout=self.updator.plan_timeout_s)
+        mock_broadcast.assert_called_once_with(None)
+        self.assertEqual(self.updator.update_info_all, [])
+
+    def test_full_rank_plan_only_wakes_source_worker(self):
+        self.updator.rank_id = 1
+        self.updator.plan_src_rank = 0
+        self.updator.wakeup_eplb_worker()
+        self.eplb_process.planner_q.put.assert_not_called()
+
+        self.updator.rank_id = 0
+        self.updator.wakeup_eplb_worker()
+        self.eplb_process.planner_q.put.assert_called_once_with(1)
+
     def test_forward_before_selects_update_info_by_index_without_pop(self):
         self.updator.cur_iterations = (
             self.updator.expert_heat_collection_interval
@@ -135,6 +187,24 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         self.assertEqual(args[0], [(2, 3)])
         self.assertEqual(args[1], [(0, 3)])
         self.assertEqual(args[3], 3)
+        self.loader.asyn_expert_weight_transfer.assert_called_once()
+
+    def test_policy2_consumes_rank_local_plan_with_original_pop_order(self):
+        self.updator.full_rank_plan = False
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+        )
+        self.updator.update_info_all = [
+            ([(2, 3)], [(0, 3)], [1, 0], [[1, 0]], 0),
+            ([], [], [0, 1], [[0, 1]], 1),
+        ]
+
+        self.updator.forward_before(skip_update=True)
+
+        self.assertFalse(self.updator.skip_current_step)
+        self.assertEqual(len(self.updator.update_info_all), 1)
+        self.loader.generate_expert_d2d_transfer_task.assert_called_once()
         self.loader.asyn_expert_weight_transfer.assert_called_once()
 
     def test_skip_update_step_holds_iteration_without_transfer(self):

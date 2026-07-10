@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this updator.
+from queue import Empty
+
 import numpy
 import torch
 import torch.distributed as dist
@@ -27,6 +29,22 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _positive_float(value, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result > 0 else default
+
+
 class EplbUpdator:
     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
         self.eplb_config = eplb_config
@@ -36,6 +54,13 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
+        self.full_rank_plan = self.eplb_config.eplb_policy_type == 4 or _coerce_bool(
+            getattr(self.eplb_config, "metro_routing", False)
+        )
+        self.plan_timeout_s = _positive_float(
+            getattr(self.eplb_config, "craft_plan_timeout_s", 60.0),
+            60.0,
+        )
         rank_in_group = getattr(self.comm_group, "rank_in_group", self.rank_id)
         self.rank_in_group = rank_in_group if isinstance(rank_in_group, int) else self.rank_id
         group_ranks = getattr(self.comm_group, "ranks", None)
@@ -107,7 +132,8 @@ class EplbUpdator:
         )
 
     def wakeup_eplb_worker(self):
-        self.eplb_process.planner_q.put(1)
+        if not self.full_rank_plan or self.rank_id == self.plan_src_rank:
+            self.eplb_process.planner_q.put(1)
 
     def _broadcast_update_info(self, update_info_all):
         object_list = [update_info_all if self.rank_id == self.plan_src_rank else None]
@@ -137,26 +163,42 @@ class EplbUpdator:
         return selected_update_info
 
     def forward_before(self, skip_update: bool = False):
-        self.skip_current_step = skip_update
+        self.skip_current_step = skip_update and self.full_rank_plan
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
-            update_info_all = self.eplb_process.block_update_q.get()
-            update_info_all = self._broadcast_update_info(update_info_all)
-            self.update_info_all = self._select_rank_update_info(update_info_all)
+            if self.full_rank_plan:
+                update_info_all = None
+                if self.rank_id == self.plan_src_rank:
+                    try:
+                        update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
+                    except Empty:
+                        logger.error(
+                            "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
+                            self.plan_timeout_s,
+                        )
+                self.update_info_all = self._broadcast_update_info(update_info_all)
+                if self.update_info_all is None:
+                    self.update_info_all = []
+                else:
+                    self.update_info_all = self._select_rank_update_info(self.update_info_all)
+            else:
+                self.update_info_all = self.eplb_process.block_update_q.get()
             self.update_info_index = 0
         if self.skip_current_step:
             return
         if self.update_expert_weight_flag():
-            self.update_info_index = self.current_weight_update_index()
-            if self.update_info_index < 0 or self.update_info_index >= len(self.update_info_all):
-                logger.warning_once(
-                    "EPLB update info is not ready for index %s; skipping this step",
-                    self.update_info_index,
-                )
-                return
-            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all[
-                self.update_info_index
-            ]
+            if self.full_rank_plan:
+                self.update_info_index = self.current_weight_update_index()
+                if self.update_info_index < 0 or self.update_info_index >= len(self.update_info_all):
+                    logger.warning_once(
+                        "EPLB update info is not ready for index %s; skipping this step",
+                        self.update_info_index,
+                    )
+                    return
+                update_info = self.update_info_all[self.update_info_index]
+            else:
+                update_info = self.update_info_all.pop(0)
+            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = update_info
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
             updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))

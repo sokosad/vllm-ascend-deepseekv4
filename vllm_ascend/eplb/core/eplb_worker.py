@@ -45,18 +45,19 @@ def _coerce_bool(value) -> bool:
 class EplbWorker:
     def __init__(self, shared_dict, policy_type, enable_d2d: bool = True, eplb_config=None):
         self.policy_type = policy_type
-        self.policy = PolicyFactory.generate_policy(policy_type, self._build_policy_config(eplb_config))
+        self.policy = PolicyFactory.generate_policy(policy_type, self._build_policy_config(policy_type, eplb_config))
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
+        self.full_rank_plan = policy_type == 4 or self.metro_routing
 
     @staticmethod
-    def _build_policy_config(eplb_config=None):
+    def _build_policy_config(policy_type, eplb_config=None):
         policy_config = DynamicConfig()
-        if eplb_config is None:
+        if policy_type != 4 or eplb_config is None:
             return policy_config
         for field in CRAFT_POOL_POLICY_CONFIG_FIELDS:
             if hasattr(eplb_config, field):
@@ -117,6 +118,10 @@ class EplbWorker:
         return packed_update_info
 
     def check_expert_placement(self, old_placement, new_placement):
+        if self.policy_type != 4:
+            self._check_expert_placement_legacy(old_placement, new_placement)
+            return
+
         num_layers = old_placement.shape[0]
         num_ranks = old_placement.shape[1]
 
@@ -139,6 +144,36 @@ class EplbWorker:
                 if new_valid_experts.numel() != torch.unique(new_valid_experts).numel():
                     logger.error(
                         "Replicated experts are placed on the same NPU; expert placement on "
+                        f"layer {layer_id}, rank {rank_id} is invalid"
+                    )
+                    new_placement[layer_id] = old_placement[layer_id]
+                    break
+
+    @staticmethod
+    def _check_expert_placement_legacy(old_placement, new_placement):
+        num_layers = old_placement.shape[0]
+        num_ranks = old_placement.shape[1]
+        for layer_id in range(num_layers):
+            if torch.unique(new_placement[layer_id]).numel() < torch.unique(old_placement[layer_id]).numel():
+                logger.error(f"There exists expert not placed on any rank in layer {layer_id}")
+                new_placement[layer_id] = old_placement[layer_id]
+                continue
+
+            for rank_id in range(num_ranks):
+                new_placement_check = new_placement[layer_id][rank_id]
+                old_placement_check = old_placement[layer_id][rank_id]
+                if new_placement_check.numel() != torch.unique(new_placement_check).numel():
+                    logger.error(
+                        "Replicated experts are placed on the same NPU; expert placement on "
+                        f"layer {layer_id}, rank {rank_id} is invalid"
+                    )
+                    new_placement[layer_id] = old_placement[layer_id]
+                    break
+
+                expert_not_move = torch.isin(new_placement_check, old_placement_check)
+                if not torch.equal(new_placement_check[expert_not_move], old_placement_check[expert_not_move]):
+                    logger.error(
+                        "There exists expert movement inside NPU; expert placement on "
                         f"layer {layer_id}, rank {rank_id} is invalid"
                     )
                     new_placement[layer_id] = old_placement[layer_id]
@@ -296,11 +331,26 @@ class EplbWorker:
         all ranks; the runtime broadcasts rank 0's full plan and each rank
         selects its local slice.
         """
+        if not self.full_rank_plan:
+            send_all = []
+            recv_all = []
+            maps = []
+            log2phy_all = []
+            layer_ids = []
+            for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+                send_all.append(send_info.get(self.rank_id, []))
+                recv_all.append(recv_info.get(self.rank_id, []))
+                maps.append(new_expert_map[self.rank_id].numpy().tolist())
+                log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
+                log2phy_all.append(log2phy_map.numpy().tolist())
+                layer_ids.append(layer_id)
+            return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+
         packed_update_info = []
 
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
             num_ranks = int(new_expert_map.shape[0])
-            if self.policy_type == 4 or self.metro_routing:
+            if self.full_rank_plan:
                 shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()
                 log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
             else:
