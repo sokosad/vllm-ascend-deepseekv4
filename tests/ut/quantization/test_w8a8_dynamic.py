@@ -108,6 +108,10 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
 
     @patch('torch.npu.empty_cache')
     @patch('torch_npu.npu_format_cast')
+    @patch(
+        'vllm_ascend.quantization.methods.w8a8_dynamic.envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2',
+        1,
+    )
     def test_process_weights_after_loading_splits_craft_pool_with_stale_main(
         self,
         mock_npu_format_cast,
@@ -129,6 +133,24 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         self.assertEqual(len(new_layer.w13_weight_list), self.num_experts - 1)
         self.assertEqual(len(new_layer.w13_weight_pool_list), 1)
         self.assertEqual(len(new_layer.w2_weight_pool_list), 1)
+        fused_w1_storage = new_layer.fused_w1_scale_with_pool.untyped_storage().data_ptr()
+        fused_w2_storage = new_layer.fused_w2_scale_with_pool.untyped_storage().data_ptr()
+        self.assertTrue(
+            all(item.untyped_storage().data_ptr() == fused_w1_storage
+                for item in new_layer.fused_w1_scale_list)
+        )
+        self.assertTrue(
+            all(item.untyped_storage().data_ptr() == fused_w2_storage
+                for item in new_layer.fused_w2_scale_list)
+        )
+        self.assertEqual(
+            new_layer.fused_w1_scale_pool_list[0].untyped_storage().data_ptr(),
+            fused_w1_storage,
+        )
+        self.assertEqual(
+            new_layer.fused_w2_scale_pool_list[0].untyped_storage().data_ptr(),
+            fused_w2_storage,
+        )
 
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.select_experts")

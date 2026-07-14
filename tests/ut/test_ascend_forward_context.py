@@ -57,12 +57,33 @@ class TestCraftPoolCommSelection(unittest.TestCase):
     def test_policy4_large_prefill_uses_compact_pool_allgather(self, _mock_moe, mock_ep_group):
         mock_ep_group.return_value = MagicMock(world_size=8)
         with (
-            patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"}),
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1", "HCCL_BUFFSIZE": "200"},
+            ),
             patch("vllm_ascend.ascend_forward_context.get_mc2_tokens_capacity", return_value=256),
         ):
             result = select_moe_comm_method(16384, self._config(policy_type=4, pool_size=1))
 
         self.assertEqual(result, MoECommType.ALLGATHER)
+
+    @patch("vllm_ascend.ascend_forward_context.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.ascend_forward_context.get_ep_group")
+    @patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True)
+    def test_policy4_large_prefill_uses_fused_with_large_hccl(
+        self, _mock_moe, mock_ep_group, _mock_device
+    ):
+        mock_ep_group.return_value = MagicMock(world_size=8)
+        with (
+            patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1", "HCCL_BUFFSIZE": "4096"},
+            ),
+            patch("vllm_ascend.ascend_forward_context.get_mc2_tokens_capacity", return_value=256),
+        ):
+            result = select_moe_comm_method(16384, self._config(policy_type=4, pool_size=1))
+
+        self.assertEqual(result, MoECommType.FUSED_MC2)
 
     @patch("vllm_ascend.ascend_forward_context.get_ep_group")
     @patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True)

@@ -416,8 +416,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight_offset.data = layer.w2_weight_offset_with_pool[:main_size]
 
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-            layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
-            layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
             if pool_size > 0:
                 total_experts = main_size + pool_size
                 layer.fused_w1_scale_with_pool = _reshape_fused_expert_scale(
@@ -426,8 +424,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 layer.fused_w2_scale_with_pool = _reshape_fused_expert_scale(
                     scale_from_float_to_int64(layer.w2_weight_scale_with_pool), total_experts
                 )
+                layer.fused_w1_scale = layer.fused_w1_scale_with_pool[:main_size]
+                layer.fused_w2_scale = layer.fused_w2_scale_with_pool[:main_size]
                 layer.fused_w1_scale_pool = layer.fused_w1_scale_with_pool[main_size:]
                 layer.fused_w2_scale_pool = layer.fused_w2_scale_with_pool[main_size:]
+            else:
+                layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
+                layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
 
         if self.dynamic_eplb:
             clone_expert_views = pool_size <= 0

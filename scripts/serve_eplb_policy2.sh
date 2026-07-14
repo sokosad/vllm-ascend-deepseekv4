@@ -14,6 +14,7 @@ MNBT=${MNBT:-16384}
 MNS=${MNS:-256}
 GMU=${GMU:-0.90}
 FUSED_MC2=${FUSED_MC2:-0}
+FLASHCOMM1=${FLASHCOMM1:-1}
 GRAPH_MODE=${GRAPH_MODE:-FULL_DECODE_ONLY}
 LOG_FILE=${LOG_FILE:-}
 
@@ -30,7 +31,7 @@ export VLLM_USE_V1=1
 export VLLM_VERSION=0.18.0
 export USE_MULTI_BLOCK_POOL=1
 export USE_MULTI_GROUPS_KV_CACHE=1
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+export VLLM_ASCEND_ENABLE_FLASHCOMM1="$FLASHCOMM1"
 export VLLM_ASCEND_ENABLE_FUSED_MC2="$FUSED_MC2"
 export DYNAMIC_EPLB=true
 export VLLM_ENGINE_READY_TIMEOUT_S=1200
@@ -42,7 +43,7 @@ ADDITIONAL_CONFIG=$(printf '%s' \
   '"num_redundant_experts":'"$NUM_REDUNDANT"',' \
   '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"'}}')
 
-echo "[EPLB2] cards=$CARDS redundant=$NUM_REDUNDANT heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2 graph_mode=$GRAPH_MODE"
+echo "[EPLB2] cards=$CARDS redundant=$NUM_REDUNDANT heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
 echo "[EPLB2] additional_config=$ADDITIONAL_CONFIG"
 
 exec vllm serve "$MODEL_PATH" \

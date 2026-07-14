@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -214,6 +215,14 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
+def _craft_hccl_supports_fused_prefill() -> bool:
+    """Use fused prefill only with the HCCL size validated for large batches."""
+    try:
+        return int(os.getenv("HCCL_BUFFSIZE", "200")) >= 4096
+    except ValueError:
+        return False
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -283,10 +292,16 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     if craft_pool_mode and not policy4_fused_pool:
         return MoECommType.ALLGATHER
     mc2_tokens_capacity = get_mc2_tokens_capacity()
-    if policy4_fused_pool and num_tokens > mc2_tokens_capacity:
+    if (
+        policy4_fused_pool
+        and num_tokens > mc2_tokens_capacity
+        and not _craft_hccl_supports_fused_prefill()
+    ):
         # DispatchFFNCombine's HCCL workspace grows with the token count and is
-        # intended for the bounded decode path. Keep Policy4 prefill/profile on
-        # its compact-pool AllGather path while decode continues to use fused MC2.
+        # intended for the bounded decode path. With the default small HCCL
+        # buffer, keep Policy4 prefill/profile on its compact-pool AllGather path.
+        # A validated large HCCL buffer can use the same fused prefill path as
+        # Policy2, avoiding AllGather's additional profile activation peak.
         return MoECommType.ALLGATHER
     soc_version = get_ascend_device_type()
     quant_type = getattr(
