@@ -94,6 +94,36 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertEqual(fused_experts_input.activation, "gelu")
                 self.assertEqual(fused_experts_input.quant.quant_type, quant_type)
 
+    def test_build_fused_experts_input_preserves_layer_token_buffer(self):
+        expert_token_nums = torch.zeros((1, 33), dtype=torch.int32)
+
+        fused_experts_input = build_fused_experts_input(
+            hidden_states=torch.randn(4, 8),
+            topk_weights=torch.randn(4, 2),
+            topk_ids=torch.randint(0, 4, (4, 2), dtype=torch.int32),
+            w1=torch.randn(2, 8, 16),
+            w2=torch.randn(2, 16, 8),
+            quant_type=QuantType.W8A8,
+            dynamic_eplb=False,
+            compact_craft_pool=True,
+            expert_token_nums=expert_token_nums,
+        )
+
+        self.assertIs(fused_experts_input.expert_token_nums, expert_token_nums)
+
+    def test_build_fused_experts_input_defaults_to_shared_token_buffer(self):
+        fused_experts_input = build_fused_experts_input(
+            hidden_states=torch.randn(4, 8),
+            topk_weights=torch.randn(4, 2),
+            topk_ids=torch.randint(0, 4, (4, 2), dtype=torch.int32),
+            w1=torch.randn(2, 8, 16),
+            w2=torch.randn(2, 16, 8),
+            quant_type=QuantType.W8A8,
+            dynamic_eplb=True,
+        )
+
+        self.assertIsNone(fused_experts_input.expert_token_nums)
+
     def test_build_fused_experts_input_merges_dense_and_quant_weights(self):
         w1 = torch.randn(2, 8, 16)
         w2 = torch.randn(2, 16, 8)

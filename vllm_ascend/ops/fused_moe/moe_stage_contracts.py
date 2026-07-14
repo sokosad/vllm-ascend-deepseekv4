@@ -77,6 +77,7 @@ class MoEFusedExpertsInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     compact_craft_pool: bool = False
+    expert_token_nums: torch.Tensor | None = None
     swiglu_limit: int = 0
 
 

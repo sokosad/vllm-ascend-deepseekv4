@@ -153,6 +153,7 @@ def build_fused_experts_input(
     w1_offset_pool: torch.Tensor | None = None,
     w2_offset_pool: torch.Tensor | None = None,
     compact_craft_pool: bool = False,
+    expert_token_nums: torch.Tensor | None = None,
     swiglu_limit: int = 0,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
@@ -191,6 +192,7 @@ def build_fused_experts_input(
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
         compact_craft_pool=compact_craft_pool,
+        expert_token_nums=expert_token_nums,
         quant=MoEQuantParams(
             quant_type=quant_type,
             comm_quant_mode=comm_quant_mode,

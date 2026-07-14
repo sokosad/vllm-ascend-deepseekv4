@@ -16,10 +16,13 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         # mock dist
         p1 = patch("torch.distributed.get_rank", return_value=self.rank)
         p2 = patch("torch.distributed.get_world_size", return_value=self.world_size)
+        p3 = patch("torch.distributed.all_reduce")
         self.addCleanup(p1.stop)
         self.addCleanup(p2.stop)
+        self.addCleanup(p3.stop)
         p1.start()
         p2.start()
+        p3.start()
 
         # ====================== 2. Mock comm group ======================
         self.mock_comm_group = MagicMock()
@@ -33,10 +36,10 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         self.mock_comm_group.all_gather = mock_all_gather
 
-        p3 = patch("vllm_ascend.eplb.eplb_updator.get_dynamic_eplb_group",
+        p4 = patch("vllm_ascend.eplb.eplb_updator.get_dynamic_eplb_group",
                    return_value=self.mock_comm_group)
-        self.addCleanup(p3.stop)
-        p3.start()
+        self.addCleanup(p4.stop)
+        p4.start()
 
         # ====================== 3. Mock EplbUpdator ======================
         self.eplb_config = MagicMock()
@@ -191,6 +194,7 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
     def test_policy2_consumes_rank_local_plan_with_original_pop_order(self):
         self.updator.full_rank_plan = False
+        self.updator.craft_pool_plan = False
         self.updator.cur_iterations = (
             self.updator.expert_heat_collection_interval
             + self.updator.algorithm_execution_interval
@@ -226,6 +230,58 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
             self.updator.expert_heat_collection_interval
             + self.updator.algorithm_execution_interval,
         )
+        self.assertFalse(self.updator.skip_current_step)
+
+    def test_full_rank_plan_skips_when_any_eplb_rank_is_inactive(self):
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+        )
+        self.updator.update_info_all = [
+            ([(2, 3)], [(0, 3)], [1, 0], [[1, 0]], 0),
+        ]
+
+        def mark_remote_rank_inactive(update_allowed, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            self.assertEqual(group, "cpu_group")
+            update_allowed.zero_()
+
+        with patch("torch.distributed.all_reduce", side_effect=mark_remote_rank_inactive):
+            self.updator.forward_before(skip_update=False)
+
+        self.assertTrue(self.updator.skip_current_step)
+        self.loader.generate_expert_d2d_transfer_task.assert_not_called()
+
+    def test_policy2_does_not_add_full_rank_activity_collective(self):
+        self.updator.full_rank_plan = False
+        self.updator.craft_pool_plan = False
+
+        with patch("torch.distributed.all_reduce") as mock_all_reduce:
+            self.updator.forward_before(skip_update=True)
+
+        mock_all_reduce.assert_not_called()
+
+    def test_metro_does_not_add_craft_activity_collective(self):
+        self.updator.full_rank_plan = True
+        self.updator.craft_pool_plan = False
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+        )
+        self.updator.update_info_all = []
+
+        with patch("torch.distributed.all_reduce") as mock_all_reduce:
+            self.updator.forward_before(skip_update=True)
+
+        mock_all_reduce.assert_not_called()
+
+    def test_policy4_only_synchronizes_activity_during_migration(self):
+        self.updator.cur_iterations = self.updator.expert_heat_collection_interval
+
+        with patch("torch.distributed.all_reduce") as mock_all_reduce:
+            self.updator.forward_before(skip_update=True)
+
+        mock_all_reduce.assert_not_called()
         self.assertFalse(self.updator.skip_current_step)
 
 

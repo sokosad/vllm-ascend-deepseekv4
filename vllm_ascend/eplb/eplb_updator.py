@@ -54,7 +54,8 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
-        self.full_rank_plan = self.eplb_config.eplb_policy_type == 4 or _coerce_bool(
+        self.craft_pool_plan = self.eplb_config.eplb_policy_type == 4
+        self.full_rank_plan = self.craft_pool_plan or _coerce_bool(
             getattr(self.eplb_config, "metro_routing", False)
         )
         self.plan_timeout_s = _positive_float(
@@ -162,8 +163,24 @@ class EplbUpdator:
             )
         return selected_update_info
 
+    def _synchronize_skip_update(self, skip_update: bool) -> bool:
+        if not self.craft_pool_plan or not self.update_expert_weight_flag():
+            return False
+
+        cpu_group = getattr(self.comm_group, "cpu_group", None)
+        sync_device = "cpu" if cpu_group is not None else self.device
+        group = cpu_group if cpu_group is not None else self.comm_group.device_group
+        update_allowed = torch.tensor(
+            [not skip_update], dtype=torch.int32, device=sync_device
+        )
+        dist.all_reduce(update_allowed, op=dist.ReduceOp.MIN, group=group)
+        return not bool(update_allowed.item())
+
     def forward_before(self, skip_update: bool = False):
-        self.skip_current_step = skip_update and self.full_rank_plan
+        # A pool migration may pair any two EP ranks. DP synchronization only
+        # covers ranks at the same TP position, so all EPLB ranks must agree to
+        # enter a migration step before any P2P operation is launched.
+        self.skip_current_step = self._synchronize_skip_update(skip_update)
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
             if self.full_rank_plan:

@@ -25,7 +25,6 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import math
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -78,25 +77,6 @@ from vllm_ascend.ops.triton.mul_add import muls_add_triton
 from vllm_ascend.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 logger = init_logger(__name__)
-
-
-def _metro_debug_enabled() -> bool:
-    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
-        return False
-    try:
-        dynamo = getattr(torch, "_dynamo", None)
-        if dynamo is not None and dynamo.is_compiling():
-            return False
-    except Exception:
-        pass
-    try:
-        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
-            return False
-    except Exception:
-        pass
-    return True
 
 
 def hadamard_transform_ref(x: torch.Tensor, scale=1.0):
@@ -369,64 +349,15 @@ class DeepseekV4MoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        metro_debug = _metro_debug_enabled()
-        if metro_debug:
-            torch.npu.synchronize()
-            print(
-                "[METRO_DEBUG][dsv4_moe_input] "
-                f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                f"hidden_shape={tuple(hidden_states.shape)} hidden_contig={hidden_states.is_contiguous()} "
-                f"hidden_stride={hidden_states.stride()} sp={self.is_sequence_parallel}",
-                flush=True,
-            )
-
         if self.experts.is_internal_router:
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_experts_call_before] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} internal_router=True",
-                    flush=True,
-                )
             # In this case, the gate/router runs inside the FusedMoE class
             fused_moe_out = self.experts(hidden_states=hidden_states,
                                          router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_router_before] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"hidden_shape={tuple(hidden_states.shape)} gate_shape={tuple(self.gate.weight.shape)} "
-                    f"hidden_dtype={hidden_states.dtype} gate_dtype={self.gate.weight.dtype} "
-                    f"has_tid2eid={self.gate.tid2eid is not None} "
-                    f"has_bias={self.gate.e_score_correction_bias is not None}",
-                    flush=True,
-                )
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_router_after] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"router_shape={tuple(router_logits.shape)} router_dtype={router_logits.dtype}",
-                    flush=True,
-                )
-                print(
-                    "[METRO_DEBUG][dsv4_experts_call_before] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} internal_router=False",
-                    flush=True,
-                )
             fused_moe_out = self.experts(hidden_states=hidden_states,
                                          router_logits=router_logits)
-        if metro_debug:
-            torch.npu.synchronize()
-            print(
-                "[METRO_DEBUG][dsv4_experts_call_after] "
-                f"layer={self.layer_idx} ep_rank={self.ep_rank}",
-                flush=True,
-            )
 
         shared_output, final_hidden_states = fused_moe_out
         if self.shared_experts is None:
@@ -436,84 +367,21 @@ class DeepseekV4MoE(nn.Module):
             if not self.is_rocm_aiter_moe_enabled:
                 if self.shared_experts is not None:
                     assert shared_output is not None
-                    if metro_debug:
-                        torch.npu.synchronize()
-                        print(
-                            "[METRO_DEBUG][dsv4_merge_before] "
-                            f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                            f"final_shape={tuple(final_hidden_states.shape)} "
-                            f"shared_shape={tuple(shared_output.shape)} "
-                            f"final_contig={final_hidden_states.is_contiguous()} "
-                            f"shared_contig={shared_output.is_contiguous()} "
-                            f"final_stride={final_hidden_states.stride()} "
-                            f"shared_stride={shared_output.stride()} "
-                            f"scale={self.routed_scaling_factor}",
-                            flush=True,
-                        )
                     final_hidden_states = muls_add_triton(
                         final_hidden_states, shared_output,
                         self.routed_scaling_factor)
-                    if metro_debug:
-                        torch.npu.synchronize()
-                        print(
-                            "[METRO_DEBUG][dsv4_merge_after] "
-                            f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                            f"final_shape={tuple(final_hidden_states.shape)} "
-                            f"final_contig={final_hidden_states.is_contiguous()}",
-                            flush=True,
-                        )
                 else:
                     final_hidden_states *= self.routed_scaling_factor
         elif self.shared_experts is not None:
             assert shared_output is not None
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_merge_before] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"final_shape={tuple(final_hidden_states.shape)} "
-                    f"shared_shape={tuple(shared_output.shape)} "
-                    f"final_contig={final_hidden_states.is_contiguous()} "
-                    f"shared_contig={shared_output.is_contiguous()} "
-                    f"final_stride={final_hidden_states.stride()} "
-                    f"shared_stride={shared_output.stride()} "
-                    f"scale={1.0 / self.routed_scaling_factor}",
-                    flush=True,
-                )
             final_hidden_states = muls_add_triton(
                 shared_output, final_hidden_states,
                 1.0 / self.routed_scaling_factor)
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_merge_after] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"final_shape={tuple(final_hidden_states.shape)} "
-                    f"final_contig={final_hidden_states.is_contiguous()}",
-                    flush=True,
-                )
 
         if self.is_sequence_parallel:
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_sp_gather_before] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"final_shape={tuple(final_hidden_states.shape)} "
-                    f"final_contig={final_hidden_states.is_contiguous()}",
-                    flush=True,
-                )
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
-            if metro_debug:
-                torch.npu.synchronize()
-                print(
-                    "[METRO_DEBUG][dsv4_sp_gather_after] "
-                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
-                    f"final_shape={tuple(final_hidden_states.shape)}",
-                    flush=True,
-                )
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states)

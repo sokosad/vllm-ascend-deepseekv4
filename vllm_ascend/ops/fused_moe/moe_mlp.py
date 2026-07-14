@@ -15,8 +15,6 @@
 # This file is a part of the vllm-ascend project.
 
 
-import os
-
 import torch
 import torch_npu
 from torch.nn.functional import pad
@@ -39,30 +37,6 @@ from vllm_ascend.utils import (
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
     return fusion and dynamic_eplb and enable_custom_op()
-
-
-def _metro_debug_enabled() -> bool:
-    if os.getenv("VLLM_ASCEND_METRO_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
-        return False
-    try:
-        dynamo = getattr(torch, "_dynamo", None)
-        if dynamo is not None and dynamo.is_compiling():
-            return False
-    except Exception:
-        pass
-    try:
-        if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
-            return False
-    except Exception:
-        pass
-    return True
-
-
-def _weight_debug_shape(weight):
-    if isinstance(weight, list):
-        first_shape = tuple(weight[0].shape) if weight else ()
-        return f"list[{len(weight)}] first={first_shape}"
-    return f"tensor{tuple(weight.shape)}"
 
 
 def _expert_count_from_weight(
@@ -467,20 +441,6 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         fusion = False
         disable_triton_activation = True
     has_pool = w1_pool is not None and w2_pool is not None
-    metro_debug = _metro_debug_enabled()
-    if metro_debug:
-        torch.npu.synchronize()
-        group_sum = int(group_list.sum().item()) if group_list.numel() else 0
-        group_max = int(group_list.max().item()) if group_list.numel() else 0
-        print(
-            "[METRO_DEBUG][mlp_before] "
-            f"hidden_shape={tuple(hidden_states.shape)} group_shape={tuple(group_list.shape)} "
-            f"group_type={group_list_type} group_sum={group_sum} group_max={group_max} "
-            f"w1={_weight_debug_shape(w1)} w2={_weight_debug_shape(w2)} "
-            f"dynamic_eplb={dynamic_eplb} has_pool={has_pool} quant={mlp_compute_input.quant.quant_type}",
-            flush=True,
-        )
-
     if has_pool:
         if group_list_type != 1:
             raise ValueError("CRAFT pool MLP split requires count-mode group_list.")
@@ -542,7 +502,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             if not outputs:
                 return hidden_states, before_gmm2_evt
             return torch.cat(outputs, dim=0), before_gmm2_evt
-        out, evt = unquant_apply_mlp(
+        return unquant_apply_mlp(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -554,10 +514,6 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             topk_scales=topk_scales,
             need_trans=need_trans,
         )
-        if metro_debug:
-            torch.npu.synchronize()
-            print(f"[METRO_DEBUG][mlp_after] out_shape={tuple(out.shape)}", flush=True)
-        return out, evt
 
     assert w1_scale is not None and w2_scale is not None
     act_quant_type = torch.float8_e4m3fn
@@ -639,7 +595,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             return hidden_states, before_gmm2_evt
         return torch.cat(outputs, dim=0), before_gmm2_evt
 
-    out, evt = quant_apply_mlp(
+    return quant_apply_mlp(
         hidden_states=hidden_states,
         w1=w1,
         w1_scale=w1_scale,
@@ -664,7 +620,3 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         quant_type=mlp_compute_input.quant.quant_type,
         disable_triton_activation=disable_triton_activation,
     )
-    if metro_debug:
-        torch.npu.synchronize()
-        print(f"[METRO_DEBUG][mlp_after] out_shape={tuple(out.shape)}", flush=True)
-    return out, evt

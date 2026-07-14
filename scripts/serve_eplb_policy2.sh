@@ -5,7 +5,7 @@ MODEL_PATH=${MODEL_PATH:-/mnt/sdb/models/DeepSeek-V4-Flash-w8a8-mtp/}
 CARDS=${CARDS:-0,1,2,3,4,5,6,7}
 DP=${DP:-2}
 TP=${TP:-4}
-POOL_SIZE=${POOL_SIZE:-1}
+NUM_REDUNDANT=${NUM_REDUNDANT:-8}
 HEAT=${HEAT:-60}
 ALGO=${ALGO:-10}
 PORT=${PORT:-8008}
@@ -20,9 +20,6 @@ LOG_FILE=${LOG_FILE:-}
 if [[ -n "$LOG_FILE" ]]; then
   exec >"$LOG_FILE" 2>&1
 fi
-
-EP_SIZE=$((DP * TP))
-NUM_REDUNDANT=$((POOL_SIZE * EP_SIZE))
 
 export ASCEND_RT_VISIBLE_DEVICES="$CARDS"
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:${LD_PRELOAD:-}
@@ -41,12 +38,12 @@ export VLLM_ENGINE_READY_TIMEOUT_S=1200
 ADDITIONAL_CONFIG=$(printf '%s' \
   '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false,"fuse_norm_quant":false},' \
   '"enable_cpu_binding":"true","multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false,' \
-  '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":4,' \
-  '"num_redundant_experts":'"$NUM_REDUNDANT"',"craft_pool_size":'"$POOL_SIZE"',' \
+  '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":2,' \
+  '"num_redundant_experts":'"$NUM_REDUNDANT"',' \
   '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"'}}')
 
-echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2 graph_mode=$GRAPH_MODE"
-echo "[CRAFT] additional_config=$ADDITIONAL_CONFIG"
+echo "[EPLB2] cards=$CARDS redundant=$NUM_REDUNDANT heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2 graph_mode=$GRAPH_MODE"
+echo "[EPLB2] additional_config=$ADDITIONAL_CONFIG"
 
 exec vllm serve "$MODEL_PATH" \
   --max-model-len "$MAX_MODEL_LEN" \

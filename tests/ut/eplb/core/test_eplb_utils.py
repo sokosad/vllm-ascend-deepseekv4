@@ -8,7 +8,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 
 from vllm_ascend.ascend_config import EplbConfig, init_ascend_config
-from vllm_ascend.eplb.core.eplb_utils import get_configured_craft_pool_size, init_eplb_config
+from vllm_ascend.eplb.core.eplb_utils import (
+    generate_pool_log2phy_map,
+    get_configured_craft_pool_size,
+    init_eplb_config,
+)
 from vllm_ascend.eplb.utils import _stack_moe_loads
 # isort: on
 
@@ -143,3 +147,19 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(global_map.shape, torch.Size([2, 8]))
         self.assertEqual(int((expert_map >= 0).sum().item()), 5)
         self.assertEqual(log2phy.shape, torch.Size([8, 2]))
+
+    def test_pool_log2phy_shape_is_independent_of_replica_distribution(self):
+        first_placement = torch.tensor([
+            [0, 1, -1, -1],
+            [-1, -1, 0, 1],
+        ])
+        second_placement = torch.tensor([
+            [0, 1, 2, -1],
+            [0, -1, -1, 1],
+        ])
+
+        first_log2phy = generate_pool_log2phy_map(first_placement)
+        second_log2phy = generate_pool_log2phy_map(second_placement)
+
+        self.assertEqual(first_log2phy.shape, torch.Size([4, 2]))
+        self.assertEqual(second_log2phy.shape, torch.Size([4, 2]))

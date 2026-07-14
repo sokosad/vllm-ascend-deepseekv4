@@ -1,4 +1,5 @@
 import unittest
+import os
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from vllm_ascend.ops.fused_moe.moe_mlp import (
     unified_apply_mlp,
 )
 from vllm_ascend.ops.fused_moe.fused_moe import (
+    AscendFusedMoE,
     _craft_graph_buffer,
     _is_craft_pool_graph_capturing,
 )
@@ -20,6 +22,8 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
+from vllm_ascend.ascend_forward_context import MoECommType
 
 
 class TestCumsumGroupList(unittest.TestCase):
@@ -56,6 +60,24 @@ class TestCumsumGroupList(unittest.TestCase):
 
 
 class TestCraftPoolSplitHelpers(unittest.TestCase):
+    def test_pool_weight_mapping_ignores_synthetic_physical_ids(self):
+        layer = object.__new__(AscendFusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer._expert_map = torch.tensor([0, -1, 1], dtype=torch.int32)
+        layer.craft_pool_enabled = True
+
+        self.assertEqual(layer._map_global_expert_id_to_local_expert_id(2), 1)
+        self.assertEqual(layer._map_global_expert_id_to_local_expert_id(3), -1)
+
+    def test_non_pool_weight_mapping_preserves_vllm_bounds_check(self):
+        layer = object.__new__(AscendFusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer._expert_map = torch.tensor([0, -1, 1], dtype=torch.int32)
+        layer.craft_pool_enabled = False
+
+        with self.assertRaises(IndexError):
+            layer._map_global_expert_id_to_local_expert_id(3)
+
     def test_dynamic_weight_list_counts_list_entries_as_experts(self):
         per_expert_weights = [torch.empty(16, 8), torch.empty(16, 8), torch.empty(16, 8)]
         self.assertEqual(
@@ -85,6 +107,23 @@ class TestCraftPoolSplitHelpers(unittest.TestCase):
 
             self.assertTrue(_is_craft_pool_graph_capturing(layer))
 
+    def test_fused_mc2_capture_executes_real_pool_moe(self):
+        class Layer:
+            craft_pool_enabled = True
+
+        layer = Layer()
+        with (
+            patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"}),
+            patch("vllm_ascend.ops.fused_moe.fused_moe._is_craft_pool_graph_mode", return_value=True),
+            patch("vllm_ascend.ops.fused_moe.fused_moe._EXTRA_CTX") as extra_ctx,
+        ):
+            extra_ctx.moe_comm_type = MoECommType.FUSED_MC2
+            extra_ctx.capturing = True
+            extra_ctx.graph_capture_forward = True
+            extra_ctx.graph_buffer_warmup = False
+
+            self.assertFalse(_is_craft_pool_graph_capturing(layer))
+
     def test_graph_buffer_is_zero_initialized(self):
         class Layer:
             pass
@@ -95,6 +134,99 @@ class TestCraftPoolSplitHelpers(unittest.TestCase):
         self.assertEqual(buf.shape, ref.shape)
         self.assertEqual(buf.dtype, ref.dtype)
         self.assertTrue(torch.equal(buf, torch.zeros_like(ref)))
+
+
+class TestW8A8PolicyIsolation(unittest.TestCase):
+    @staticmethod
+    def _method():
+        method = object.__new__(AscendW8A8DynamicFusedMoEMethod)
+        method.dynamic_eplb = True
+        method.multistream_overlap_gate = False
+        method.in_dtype = torch.float32
+        method.quant_type = QuantType.W8A8
+        return method
+
+    @staticmethod
+    def _base_layer():
+        layer = torch.nn.Module()
+        layer.swiglu_limit = 0
+        layer.force_load_balance_routed_topk_ids = torch.tensor(
+            [[0, 1], [2, 3], [4, 5], [6, 7]], dtype=torch.int64
+        )
+        return layer
+
+    def test_policy2_profile_keeps_original_router_path(self):
+        method = self._method()
+        layer = self._base_layer()
+        layer.w13_weight_list = [torch.empty(16, 8) for _ in range(2)]
+        layer.w2_weight_list = [torch.empty(8, 8) for _ in range(2)]
+        layer.w13_weight_scale_fp32_list = [torch.ones(16) for _ in range(2)]
+        layer.w2_weight_scale_list = [torch.ones(8) for _ in range(2)]
+        router_ids = torch.tensor([[7, 6], [5, 4], [3, 2], [1, 0]])
+        router_weights = torch.full((4, 2), 0.5)
+
+        with (
+            patch(
+                "vllm_ascend.quantization.methods.w8a8_dynamic.select_experts",
+                return_value=(router_weights, router_ids),
+            ) as mock_select,
+            patch(
+                "vllm_ascend.quantization.methods.w8a8_dynamic.build_force_load_balance_routing"
+            ) as mock_force,
+            patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX") as extra_ctx,
+        ):
+            extra_ctx.moe_comm_type = MoECommType.ALLGATHER
+            extra_ctx.moe_comm_method.fused_experts.return_value = torch.empty(4, 8)
+            method.apply(
+                layer=layer,
+                x=torch.empty(4, 8),
+                router_logits=torch.empty(4, 8),
+                top_k=2,
+                renormalize=True,
+                global_num_experts=8,
+                enable_force_load_balance=True,
+            )
+
+        mock_select.assert_called_once()
+        mock_force.assert_not_called()
+        request = extra_ctx.moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertIs(request.topk_weights, router_weights)
+        self.assertTrue(torch.equal(request.topk_ids, layer.force_load_balance_routed_topk_ids))
+
+    def test_policy4_compact_pool_uses_graph_profile_routing(self):
+        method = self._method()
+        layer = self._base_layer()
+        layer.local_num_experts_pool = 1
+        layer.w13_weight_with_pool = torch.empty(3, 16, 8)
+        layer.w2_weight_with_pool = torch.empty(3, 8, 8)
+        layer.w13_weight_scale_fp32_with_pool = torch.ones(3, 16)
+        layer.w2_weight_scale_with_pool = torch.ones(3, 8)
+        layer.craft_expert_token_nums = None
+        forced_weights = torch.full((4, 2), 0.5)
+        forced_ids = layer.force_load_balance_routed_topk_ids
+
+        with (
+            patch("vllm_ascend.quantization.methods.w8a8_dynamic.select_experts") as mock_select,
+            patch(
+                "vllm_ascend.quantization.methods.w8a8_dynamic.build_force_load_balance_routing",
+                return_value=(forced_weights, forced_ids),
+            ) as mock_force,
+            patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX") as extra_ctx,
+        ):
+            extra_ctx.moe_comm_type = MoECommType.ALLGATHER
+            extra_ctx.moe_comm_method.fused_experts.return_value = torch.empty(4, 8)
+            method.apply(
+                layer=layer,
+                x=torch.empty(4, 8),
+                router_logits=torch.empty(4, 8),
+                top_k=2,
+                renormalize=True,
+                global_num_experts=8,
+                enable_force_load_balance=True,
+            )
+
+        mock_force.assert_called_once()
+        mock_select.assert_not_called()
 
 
 class TestUnifiedApplyMlpRequest(unittest.TestCase):

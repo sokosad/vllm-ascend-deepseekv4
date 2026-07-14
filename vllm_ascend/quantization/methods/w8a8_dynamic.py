@@ -34,7 +34,6 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     zero_experts_compute,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
-from vllm_ascend.ops.fused_moe.fused_moe import _log_logical_topk_cooccurrence, _log_logical_topk_ct
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType
@@ -49,6 +48,15 @@ def scale_from_float_to_int64(scale):
         np.frombuffer(scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32).astype(np.int64)
     ).to(scale.device)
     return scale
+
+
+def _reshape_fused_expert_scale(scale: torch.Tensor, num_experts: int) -> torch.Tensor:
+    if num_experts <= 0 or scale.numel() % num_experts != 0:
+        raise ValueError(
+            "Fused expert scale cannot be partitioned by expert: "
+            f"numel={scale.numel()}, num_experts={num_experts}."
+        )
+    return scale.view(num_experts, -1)
 
 
 def _resolve_craft_pool_split(layer, pool_size: int) -> int:
@@ -234,7 +242,15 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 "Number of global experts mismatch (excluding redundancy)"
             )
 
-        if enable_force_load_balance:
+        pool_size = int(getattr(layer, "local_num_experts_pool", 0) or 0)
+        compact_craft_pool = (
+            self.dynamic_eplb
+            and pool_size > 0
+            and hasattr(layer, "w13_weight_with_pool")
+            and hasattr(layer, "w2_weight_with_pool")
+        )
+
+        if enable_force_load_balance and compact_craft_pool:
             topk_weights, topk_ids = build_force_load_balance_routing(
                 layer=layer,
                 hidden_states=x,
@@ -263,8 +279,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 global_num_experts=global_num_experts,
                 tid2eid=tid2eid,
             )
-        _log_logical_topk_cooccurrence(topk_ids, getattr(layer, "moe_instance_id", 0), getattr(layer, "ep_rank", -1))
-        _log_logical_topk_ct(topk_ids, getattr(layer, "moe_instance_id", 0), getattr(layer, "ep_rank", -1), global_num_experts, getattr(layer, "ep_size", 8))
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -275,19 +289,14 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 zero_expert_type=zero_expert_type,
                 hidden_states=x,
             )
+        if enable_force_load_balance and not compact_craft_pool:
+            topk_ids = layer.force_load_balance_routed_topk_ids[: topk_ids.shape[0]]
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (
             _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
-        )
-        pool_size = int(getattr(layer, "local_num_experts_pool", 0) or 0)
-        compact_craft_pool = (
-            self.dynamic_eplb
-            and pool_size > 0
-            and hasattr(layer, "w13_weight_with_pool")
-            and hasattr(layer, "w2_weight_with_pool")
         )
         effective_dynamic_eplb = self.dynamic_eplb and not compact_craft_pool
 
@@ -357,6 +366,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w1_scale_bias_pool=w1_scale_bias_pool,
                 w2_scale_bias_pool=w2_scale_bias_pool,
                 compact_craft_pool=compact_craft_pool,
+                expert_token_nums=(
+                    layer.craft_expert_token_nums if compact_craft_pool else None
+                ),
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -407,8 +419,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)
             layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
             if pool_size > 0:
-                layer.fused_w1_scale_with_pool = scale_from_float_to_int64(layer.w13_weight_scale_with_pool)
-                layer.fused_w2_scale_with_pool = scale_from_float_to_int64(layer.w2_weight_scale_with_pool)
+                total_experts = main_size + pool_size
+                layer.fused_w1_scale_with_pool = _reshape_fused_expert_scale(
+                    scale_from_float_to_int64(layer.w13_weight_scale_with_pool), total_experts
+                )
+                layer.fused_w2_scale_with_pool = _reshape_fused_expert_scale(
+                    scale_from_float_to_int64(layer.w2_weight_scale_with_pool), total_experts
+                )
                 layer.fused_w1_scale_pool = layer.fused_w1_scale_with_pool[main_size:]
                 layer.fused_w2_scale_pool = layer.fused_w2_scale_with_pool[main_size:]
 

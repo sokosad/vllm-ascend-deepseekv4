@@ -30,7 +30,7 @@ from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_linear_available,
     ensure_mxfp8_moe_available,
 )
-from vllm_ascend.ops.fused_moe.experts_selector import build_force_load_balance_routing, select_experts
+from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType
@@ -179,30 +179,25 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
     ) -> torch.Tensor:
         expected = global_num_experts - global_redundant_expert_num
         assert router_logits.shape[1] == expected, "Number of global experts mismatch (excluding redundancy)"
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            global_num_experts=global_num_experts,
+            tid2eid=tid2eid,
+        )
+
+        # Keep the existing profile-run behavior for non-CRAFT schemes.
         if enable_force_load_balance:
-            topk_weights, topk_ids = build_force_load_balance_routing(
-                layer=layer,
-                hidden_states=x,
-                top_k=top_k,
-                log2phy=log2phy,
-                weight_dtype=router_logits.dtype,
-            )
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                global_num_experts=global_num_experts,
-                tid2eid=tid2eid,
-            )
+            topk_ids = layer.force_load_balance_routed_topk_ids[: topk_ids.shape[0]]
 
         topk_weights = topk_weights.to(x.dtype)
 

@@ -268,14 +268,26 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         "metro_routing",
         getattr(eplb_config, "metro_routing", envs_ascend.VLLM_ASCEND_METRO_ROUTING),
     )
-    if (
+    expert_map_pool_mode = expert_file_has_pool_mode(expert_map_path)
+    craft_pool_mode = (
         eplb_policy_type == 4
         or craft_pool_size > 0
         or _as_bool(metro_routing)
-        or expert_file_has_pool_mode(expert_map_path)
-    ):
+        or expert_map_pool_mode
+    )
+    policy4_fused_pool = (
+        eplb_policy_type == 4
+        and (craft_pool_size > 0 or expert_map_pool_mode)
+        and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+    )
+    if craft_pool_mode and not policy4_fused_pool:
         return MoECommType.ALLGATHER
     mc2_tokens_capacity = get_mc2_tokens_capacity()
+    if policy4_fused_pool and num_tokens > mc2_tokens_capacity:
+        # DispatchFFNCombine's HCCL workspace grows with the token count and is
+        # intended for the bounded decode path. Keep Policy4 prefill/profile on
+        # its compact-pool AllGather path while decode continues to use fused MC2.
+        return MoECommType.ALLGATHER
     soc_version = get_ascend_device_type()
     quant_type = getattr(
         vllm_config.model_config.hf_text_config,

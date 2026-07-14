@@ -126,8 +126,8 @@ class VllmEplbAdaptor:
             "w2_weight_list": "w2_weight_pool",
             "w13_weight_scale_fp32_list": "w13_weight_scale_fp32_pool",
             "w2_weight_scale_list": "w2_weight_scale_pool",
-            "fused_w1_scale_list": "fused_w1_scale_pool",
-            "fused_w2_scale_list": "fused_w2_scale_pool",
+            "fused_w1_scale_list": "fused_w1_scale_pool_list",
+            "fused_w2_scale_list": "fused_w2_scale_pool_list",
         }
         for name in self.expert_weight_names:
             param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"

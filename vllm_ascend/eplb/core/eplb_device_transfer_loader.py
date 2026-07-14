@@ -43,6 +43,7 @@ class D2DExpertWeightLoader:
         self.craft_pool_migration = policy_type == 4
         self._p2p_staging_tensors = []
         self._recv_staging_tasks = []
+        self._craft_transfer_tasks = []
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -59,34 +60,63 @@ class D2DExpertWeightLoader:
         self.comm_op_list = []
         self._p2p_staging_tensors = []
         self._recv_staging_tasks = []
+        self._craft_transfer_tasks = []
+        craft_comm_ops = []
+        local_rank = None
+        if self.craft_pool_migration:
+            rank_in_group = getattr(self.comm_group, "rank_in_group", None)
+            local_rank = rank_in_group if isinstance(rank_in_group, int) else dist.get_rank()
         send_bytes = 0
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
-            for src_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]:
+            for param_id, src_tensor in enumerate(
+                self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]
+            ):
                 send_tensor = self._stage_tensor_for_p2p(src_tensor) if self.craft_pool_migration else src_tensor
-                self.comm_op_list.append(
-                    dist.P2POp(dist.isend, send_tensor, dst_rank, group=self.comm_group.device_group)
+                op = dist.P2POp(
+                    dist.isend, send_tensor, dst_rank, group=self.comm_group.device_group
                 )
+                if self.craft_pool_migration:
+                    craft_comm_ops.append(
+                        ((local_rank, dst_rank, global_expert_id_to_send, param_id), op)
+                    )
+                    self._craft_transfer_tasks.append(
+                        ((local_rank, dst_rank, global_expert_id_to_send, param_id), dist.isend, send_tensor, dst_rank)
+                    )
+                else:
+                    self.comm_op_list.append(op)
                 if self.craft_pool_migration:
                     send_bytes += src_tensor.numel() * src_tensor.element_size()
 
         recv_bytes = 0
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info
-            for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:
+            for param_id, buffer_tensor in enumerate(self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]):
                 recv_tensor = (
                     self._stage_recv_tensor_for_p2p(buffer_tensor)
                     if self.craft_pool_migration
                     else buffer_tensor
                 )
-                self.comm_op_list.append(
-                    dist.P2POp(dist.irecv, recv_tensor, recv_rank, group=self.comm_group.device_group)
+                op = dist.P2POp(
+                    dist.irecv, recv_tensor, recv_rank, group=self.comm_group.device_group
                 )
+                if self.craft_pool_migration:
+                    craft_comm_ops.append(
+                        ((recv_rank, local_rank, global_expert_id_to_recv, param_id), op)
+                    )
+                    self._craft_transfer_tasks.append(
+                        ((recv_rank, local_rank, global_expert_id_to_recv, param_id), dist.irecv, recv_tensor, recv_rank)
+                    )
+                else:
+                    self.comm_op_list.append(op)
                 if self.craft_pool_migration:
                     recv_bytes += buffer_tensor.numel() * buffer_tensor.element_size()
             local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
+
+        if self.craft_pool_migration:
+            self.comm_op_list = [op for _, op in sorted(craft_comm_ops, key=lambda item: item[0])]
 
         if self.craft_pool_migration:
             logger.info(
@@ -106,9 +136,11 @@ class D2DExpertWeightLoader:
             return
 
         # set asynchronous stream for d2d expert weight transfer
-        if self.craft_pool_migration and self.comm_op_list:
+        if self.craft_pool_migration and self._craft_transfer_tasks:
             self._synchronize_device()
-        if self.comm_op_list:
+            self._transfer_craft_weights_ordered()
+            self._synchronize_device()
+        elif self.comm_op_list:
             reqs.extend(dist.batch_isend_irecv(self.comm_op_list))
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
@@ -153,8 +185,16 @@ class D2DExpertWeightLoader:
         self.updated_expert_map = None
         self.updated_log2phy_map = None
         self._p2p_staging_tensors = []
+        self._craft_transfer_tasks = []
         self.layer_id = -1
         self.state = ExpertWeightUpdateState.WAITING
+
+    def _transfer_craft_weights_ordered(self):
+        device_group = self.comm_group.device_group
+        for _, op, tensor, peer_rank in sorted(
+            self._craft_transfer_tasks, key=lambda task: task[0]
+        ):
+            op(tensor, peer_rank, group=device_group).wait()
 
     @staticmethod
     def _needs_zero_offset_staging(tensor):

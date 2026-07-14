@@ -227,6 +227,15 @@ class NPUPlatform(Platform):
                 compilation_config.splitting_ops.append(op_name)
 
     @classmethod
+    def _craft_pool_supports_full_graph(cls, parallel_config, eplb_config) -> bool:
+        return (
+            getattr(eplb_config, "eplb_policy_type", None) == 4
+            and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and cls._get_configured_ep_size(parallel_config) <= 32
+        )
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return None
 
@@ -406,10 +415,11 @@ class NPUPlatform(Platform):
         if (
             craft_pool_configured
             and compilation_config.cudagraph_mode in (CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL)
+            and not cls._craft_pool_supports_full_graph(parallel_config, ascend_config.eplb_config)
         ):
             logger.warning(
-                "CRAFT pool requires value-dependent MoE routing and is not compatible with full ACL graph "
-                "capture. Falling back to PIECEWISE so the rest of the model can still use graph capture."
+                "CRAFT pool full ACL graph capture requires fused MC2 on A3 with EP<=32. "
+                "Falling back to PIECEWISE so the rest of the model can still use graph capture."
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             compilation_config.mode = CompilationMode.VLLM_COMPILE

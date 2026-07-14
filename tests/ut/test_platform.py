@@ -210,6 +210,34 @@ class TestNPUPlatform(TestBase):
         for op_name in CRAFT_POOL_MOE_SPLITTING_OPS + CRAFT_POOL_ASCEND_SPLITTING_OPS:
             self.assertIn(op_name, compilation_config.splitting_ops)
 
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch.dict("os.environ", {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"})
+    def test_craft_pool_full_graph_supported_with_fused_mc2(self, _mock_device_type):
+        parallel_config = MagicMock()
+        parallel_config.enable_expert_parallel = True
+        parallel_config.tensor_parallel_size = 4
+        parallel_config.data_parallel_size = 2
+
+        self.assertTrue(
+            self.platform._craft_pool_supports_full_graph(
+                parallel_config, MagicMock(eplb_policy_type=4)
+            )
+        )
+
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch.dict("os.environ", {"VLLM_ASCEND_ENABLE_FUSED_MC2": "0"})
+    def test_craft_pool_full_graph_requires_fused_mc2(self, _mock_device_type):
+        parallel_config = MagicMock()
+        parallel_config.enable_expert_parallel = True
+        parallel_config.tensor_parallel_size = 4
+        parallel_config.data_parallel_size = 2
+
+        self.assertFalse(
+            self.platform._craft_pool_supports_full_graph(
+                parallel_config, MagicMock(eplb_policy_type=4)
+            )
+        )
+
     @patch("vllm_ascend.platform.refresh_block_size")
     @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
