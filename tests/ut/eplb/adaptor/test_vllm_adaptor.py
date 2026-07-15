@@ -73,7 +73,9 @@ class TestVllmAdaptor(unittest.TestCase):
     def test_log2phy_update_preserves_captured_tensor(self):
         adaptor = object.__new__(VllmEplbAdaptor)
         captured_log2phy = torch.full((4, 2), -1, dtype=torch.int32)
+        captured_counts = torch.zeros(4, dtype=torch.int64)
         adaptor.log2phy_map_per_layer = {3: captured_log2phy}
+        adaptor.log2phy_counts_per_layer = {3: captured_counts}
         updated_log2phy = torch.tensor(
             [[0, 4], [1, -1], [2, -1], [3, -1]], dtype=torch.int32
         )
@@ -81,7 +83,9 @@ class TestVllmAdaptor(unittest.TestCase):
         adaptor.do_update_log2phy_map(3, updated_log2phy)
 
         self.assertIs(adaptor.log2phy_map_per_layer[3], captured_log2phy)
+        self.assertIs(adaptor.log2phy_counts_per_layer[3], captured_counts)
         self.assertTrue(torch.equal(captured_log2phy, updated_log2phy))
+        self.assertTrue(torch.equal(captured_counts, torch.tensor([2, 1, 1, 1])))
 
     def test_expert_cost_metadata_uses_actual_tensor_sizes(self):
         adaptor = object.__new__(VllmEplbAdaptor)

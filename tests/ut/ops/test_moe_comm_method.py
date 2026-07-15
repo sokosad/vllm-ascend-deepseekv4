@@ -57,7 +57,9 @@ class TestMoECommMethod(TestBase):
             dtype=torch.int32,
         )
 
-        routed = _apply_log2phy(log2phy, topk_ids)
+        replica_counts = torch.tensor([2, 2, 1], dtype=torch.int64)
+        fallback_routed = _apply_log2phy(log2phy, topk_ids)
+        routed = _apply_log2phy(log2phy, topk_ids, replica_counts=replica_counts)
 
         expected = torch.tensor(
             [
@@ -68,6 +70,24 @@ class TestMoECommMethod(TestBase):
             ],
             dtype=torch.int32,
         )
+        self.assertTrue(torch.equal(fallback_routed, expected))
+        self.assertTrue(torch.equal(routed, expected))
+
+    def test_apply_log2phy_offsets_replica_by_source_rank(self):
+        log2phy = torch.tensor(
+            [[0, 4, -1], [1, 5, -1], [2, -1, -1]], dtype=torch.int32
+        )
+        topk_ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+        replica_counts = torch.tensor([2, 2, 1], dtype=torch.int64)
+
+        routed = _apply_log2phy(
+            log2phy,
+            topk_ids,
+            replica_counts=replica_counts,
+            source_rank=1,
+        )
+
+        expected = torch.tensor([[4, 1], [0, 5]], dtype=torch.int32)
         self.assertTrue(torch.equal(routed, expected))
 
     def test_apply_log2phy_metro_routing_keeps_expert_on_one_replica(self):
@@ -89,7 +109,14 @@ class TestMoECommMethod(TestBase):
             dtype=torch.int32,
         )
 
-        routed = _apply_log2phy(log2phy, topk_ids, metro_routing=True)
+        replica_counts = torch.tensor([2, 2, 1], dtype=torch.int64)
+        routed = _apply_log2phy(
+            log2phy,
+            topk_ids,
+            metro_routing=True,
+            replica_counts=replica_counts,
+            source_rank=1,
+        )
 
         expected = torch.tensor(
             [

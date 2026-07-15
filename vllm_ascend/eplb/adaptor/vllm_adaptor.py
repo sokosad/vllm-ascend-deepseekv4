@@ -51,10 +51,13 @@ class VllmEplbAdaptor:
         self.init_buffer_tensor(num_buffer_tensor)
 
         self.log2phy_map_per_layer = dict()
+        self.log2phy_counts_per_layer = dict()
         for layer_idx in range(self.num_moe_layers):
-            self.log2phy_map_per_layer[self.num_dense_layers + layer_idx] = self.model.get_log2phy_map(
-                self.num_dense_layers + layer_idx
-            )
+            layer_id = self.num_dense_layers + layer_idx
+            self.log2phy_map_per_layer[layer_id] = self.model.get_log2phy_map(layer_id)
+            if self.craft_pool_enabled:
+                experts = self.model.model.layers[layer_id].mlp.experts
+                self.log2phy_counts_per_layer[layer_id] = experts.get_log2phy_counts()
 
     def _get_num_local_experts_per_layer(self):
         num_local_experts_per_layer = {}
@@ -242,6 +245,10 @@ class VllmEplbAdaptor:
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
         if self.log2phy_map_per_layer[layer_id] is not None:
             self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
+        replica_counts = self.log2phy_counts_per_layer.get(layer_id)
+        if replica_counts is not None:
+            updated_counts = torch.sum(updated_log2phy_map >= 0, dim=-1).to(dtype=replica_counts.dtype)
+            replica_counts.copy_(updated_counts)
 
     def get_global_expert_map(self):
         all_layer_global_expert_map = []

@@ -400,6 +400,7 @@ class AscendFusedMoE(FusedMoE):
 
         self._expert_map = None
         self.log2phy = None
+        self.log2phy_counts = None
 
         if tid2eid is not None:
             self.tid2eid = tid2eid
@@ -496,6 +497,8 @@ class AscendFusedMoE(FusedMoE):
                     self.ep_size,
                     self.ep_rank,
                 ).npu()
+        if self.craft_pool_enabled and self.log2phy is not None and self.log2phy.dim() == 2:
+            self.log2phy_counts = torch.sum(self.log2phy >= 0, dim=-1)
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -601,6 +604,9 @@ class AscendFusedMoE(FusedMoE):
 
     def get_log2phy_map(self):
         return self.log2phy
+
+    def get_log2phy_counts(self):
+        return self.log2phy_counts
 
     def clear_moe_load(self):
         if self.moe_load is not None:
@@ -1177,4 +1183,3 @@ def _coloc_profile(topk_ids, layer_id, ep_rank, n_experts=256, ep_size=8):
     _log_logical_topk_cooccurrence(topk_ids, layer_id, ep_rank)
     _log_logical_topk_ct(topk_ids, layer_id, ep_rank, n_experts, ep_size)
     _dump_topk_ids(topk_ids, layer_id, ep_rank)
-

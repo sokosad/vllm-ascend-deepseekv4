@@ -340,6 +340,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale_bias_pool = (
             [torch.tensor([], dtype=torch.float32)] if fused_scale_flag and w2_pool is not None else None
         )
+        replica_counts = getattr(layer, "log2phy_counts", None)
+        if not isinstance(replica_counts, torch.Tensor):
+            replica_counts = None
+        source_rank = getattr(layer, "ep_rank", 0) if replica_counts is not None else 0
+        source_rank = source_rank if isinstance(source_rank, int) else 0
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -355,6 +360,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 mc2_mask=mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 log2phy=log2phy,
+                replica_counts=replica_counts,
+                source_rank=source_rank,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
                 w1_scale=w1_scale,
