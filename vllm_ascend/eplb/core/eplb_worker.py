@@ -53,6 +53,20 @@ class EplbWorker:
         self.multi_stage = policy_type == 3
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
         self.full_rank_plan = policy_type == 4 or self.metro_routing
+        self.expert_heat_collection_interval = max(
+            1, int(getattr(eplb_config, "expert_heat_collection_interval", 1))
+        )
+        configured_payback_steps = int(
+            getattr(eplb_config, "craft_pool_max_payback_steps", 0)
+        )
+        self.craft_max_payback_steps = (
+            configured_payback_steps
+            if configured_payback_steps > 0
+            else self.expert_heat_collection_interval
+        )
+        self.craft_migration_cost_ratio = max(
+            0.0, float(getattr(eplb_config, "craft_pool_migration_cost_ratio", 1.0))
+        )
 
     @staticmethod
     def _build_policy_config(policy_type, eplb_config=None):
@@ -90,11 +104,13 @@ class EplbWorker:
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
-        if self.rank_id == 0:
+        hotness = None
+        if self.rank_id == 0 or self.policy_type == 4:
             if self.multi_stage:
                 hotness = self._calculate_hotness(old_placement, load_info.sum(0))
             else:
                 hotness = self._calculate_hotness(old_placement, load_info)
+        if self.rank_id == 0:
             current_mean, current_max = self._compute_imbalance(old_placement, hotness)
             update_mean, update_max = self._compute_imbalance(new_placement, hotness)
             logger.info(
@@ -106,6 +122,10 @@ class EplbWorker:
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
+        if self.policy_type == 4 and hotness is not None:
+            new_placement = self._apply_craft_migration_cost_gate(
+                old_placement, new_placement, hotness
+            )
         new_expert_maps = self.local2global(new_placement)
         changed_layers = None
         if self.policy_type == 4:
@@ -123,6 +143,78 @@ class EplbWorker:
         packed_update_info = self.pack_update_info(update_info, changed_layers=changed_layers)
 
         return packed_update_info
+
+    @staticmethod
+    def _rank_loads(deployment, hotness):
+        deployment = np.asarray(deployment)
+        hotness = np.asarray(hotness, dtype=np.float64)
+        valid = deployment >= 0
+        if not valid.any() or hotness.size == 0:
+            return np.zeros(deployment.shape[0], dtype=np.float64)
+        counts = np.bincount(deployment[valid].reshape(-1), minlength=hotness.shape[0])
+        unit_hotness = np.divide(
+            hotness,
+            counts,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=counts != 0,
+        )
+        return np.asarray(
+            [unit_hotness[rank[rank >= 0]].sum() for rank in deployment],
+            dtype=np.float64,
+        )
+
+    def _apply_craft_migration_cost_gate(self, old_placement, new_placement, hotness):
+        metadata = self.shared_dict.get("craft_expert_cost_metadata", None)
+        if not metadata:
+            logger.warning_once(
+                "CRAFT expert cost metadata is unavailable; migration payback gating is disabled."
+            )
+            return new_placement
+
+        old_table = np.asarray(old_placement)
+        new_table = np.asarray(new_placement).copy()
+        for layer_id in range(min(len(metadata), old_table.shape[0])):
+            changed_slots = int(np.count_nonzero(old_table[layer_id] != new_table[layer_id]))
+            if changed_slots == 0:
+                continue
+            transfer_bytes = int(metadata[layer_id].get("transfer_bytes", 0))
+            compute_bytes = int(metadata[layer_id].get("compute_bytes", 0))
+            if transfer_bytes <= 0 or compute_bytes <= 0:
+                continue
+
+            old_load = self._rank_loads(old_table[layer_id], hotness[layer_id])
+            new_load = self._rank_loads(new_table[layer_id], hotness[layer_id])
+            load_delta = max(0.0, float(old_load.max() - new_load.max()))
+            saved_compute_bytes_per_step = (
+                load_delta * compute_bytes / self.expert_heat_collection_interval
+            )
+            migration_bytes = changed_slots * transfer_bytes
+            if saved_compute_bytes_per_step <= 0:
+                payback_steps = float("inf")
+            else:
+                payback_steps = (
+                    migration_bytes * self.craft_migration_cost_ratio
+                    / saved_compute_bytes_per_step
+                )
+
+            accepted = payback_steps <= self.craft_max_payback_steps
+            logger.info(
+                "[CRAFT-COST] layer=%d changed_slots=%d migration_mb=%.2f "
+                "load_delta=%.3f payback_steps=%.1f limit=%d accepted=%s",
+                layer_id,
+                changed_slots,
+                migration_bytes / 1e6,
+                load_delta,
+                payback_steps,
+                self.craft_max_payback_steps,
+                accepted,
+            )
+            if not accepted:
+                new_table[layer_id] = old_table[layer_id]
+
+        return torch.as_tensor(
+            new_table, dtype=new_placement.dtype, device=new_placement.device
+        )
 
     def check_expert_placement(self, old_placement, new_placement):
         if self.policy_type != 4:

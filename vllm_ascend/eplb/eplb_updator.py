@@ -74,6 +74,8 @@ class EplbUpdator:
         self.world_size = dist.get_world_size()
         self.device = local_load.device
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
+        if self.craft_pool_plan:
+            self.shared_dict["craft_expert_cost_metadata"] = self.adaptor.get_expert_cost_metadata()
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()

@@ -83,6 +83,30 @@ class TestVllmAdaptor(unittest.TestCase):
         self.assertIs(adaptor.log2phy_map_per_layer[3], captured_log2phy)
         self.assertTrue(torch.equal(captured_log2phy, updated_log2phy))
 
+    def test_expert_cost_metadata_uses_actual_tensor_sizes(self):
+        adaptor = object.__new__(VllmEplbAdaptor)
+        adaptor.num_dense_layers = 1
+        adaptor.model = SimpleNamespace(config=SimpleNamespace(num_hidden_layers=2))
+        adaptor.expert_param_per_layer = {
+            1: [
+                [
+                    torch.zeros(8, dtype=torch.int8),
+                    torch.zeros(4, dtype=torch.int8),
+                    torch.zeros(2, dtype=torch.float32),
+                ],
+                [
+                    torch.zeros(16, dtype=torch.int8),
+                    torch.zeros(8, dtype=torch.int8),
+                    torch.zeros(2, dtype=torch.float32),
+                ],
+            ]
+        }
+
+        self.assertEqual(
+            adaptor.get_expert_cost_metadata(),
+            [{"transfer_bytes": 32, "compute_bytes": 24}],
+        )
+
     def tearDown(self):
         self.mock_rank.stop()
         self.mock_size.stop()

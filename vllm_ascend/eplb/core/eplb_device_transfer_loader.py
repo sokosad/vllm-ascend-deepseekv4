@@ -44,6 +44,7 @@ class D2DExpertWeightLoader:
         self._p2p_staging_tensors = []
         self._recv_staging_tasks = []
         self._craft_transfer_tasks = []
+        self._craft_transfer_ms = 0.0
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -137,9 +138,11 @@ class D2DExpertWeightLoader:
 
         # set asynchronous stream for d2d expert weight transfer
         if self.craft_pool_migration and self._craft_transfer_tasks:
+            transfer_started_at = time.perf_counter()
             self._synchronize_device()
             self._transfer_craft_weights_ordered()
             self._synchronize_device()
+            self._craft_transfer_ms = (time.perf_counter() - transfer_started_at) * 1e3
         elif self.comm_op_list:
             reqs.extend(dist.batch_isend_irecv(self.comm_op_list))
 
@@ -156,6 +159,11 @@ class D2DExpertWeightLoader:
             req.wait()
         if self.craft_pool_migration:
             self._synchronize_device()
+            logger.info(
+                "[EPLB-MIG] layer=%d payload transfer %.1f ms",
+                self.layer_id,
+                self._craft_transfer_ms,
+            )
             logger.info("[EPLB-MIG] layer=%d transfer wait %.1f ms",
                         self.layer_id, (time.perf_counter() - t0) * 1e3)
 
@@ -186,6 +194,7 @@ class D2DExpertWeightLoader:
         self.updated_log2phy_map = None
         self._p2p_staging_tensors = []
         self._craft_transfer_tasks = []
+        self._craft_transfer_ms = 0.0
         self.layer_id = -1
         self.state = ExpertWeightUpdateState.WAITING
 
