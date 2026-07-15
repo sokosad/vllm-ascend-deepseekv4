@@ -104,6 +104,52 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         self.assertEqual(selected, [(["s2"], ["r2"], ["m2"], ["l2"], 7)])
 
+    def test_select_rank_update_info_preserves_noop_layer(self):
+        selected = self.updator._select_rank_update_info(
+            [{"noop": True, "layer_id": 2}]
+        )
+
+        self.assertEqual(selected, [None])
+
+    def test_unchanged_cycle_finishes_without_layer_updates(self):
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            - 1
+        )
+        noop_plan = [
+            {"noop": True, "layer_id": layer_id}
+            for layer_id in range(self.updator.num_moe_layers)
+        ]
+        self.eplb_process.block_update_q.get.return_value = noop_plan
+
+        with patch.object(self.updator, "_broadcast_update_info", return_value=noop_plan):
+            self.updator.forward_before()
+            self.updator.forward_end()
+
+        self.assertEqual(self.updator.cur_iterations, 0)
+        self.assertEqual(self.updator.update_info_all, [])
+        self.adaptor.model.clear_all_moe_loads.assert_called_once()
+        self.loader.generate_expert_d2d_transfer_task.assert_not_called()
+
+    def test_unchanged_layer_advances_without_touching_loader(self):
+        first_update_iteration = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+        )
+        self.updator.cur_iterations = first_update_iteration
+        self.updator.update_info_all = [None] + [
+            ([], [], [0], [[0]], layer_id)
+            for layer_id in range(1, self.updator.num_moe_layers)
+        ]
+
+        self.updator.forward_before()
+        self.updator.forward_end()
+
+        self.assertEqual(self.updator.cur_iterations, first_update_iteration + 1)
+        self.loader.generate_expert_d2d_transfer_task.assert_not_called()
+        self.loader.update_expert_map_and_weight.assert_not_called()
+
     def test_broadcast_update_info_uses_rank0_plan(self):
         self.updator.rank_id = 1
         self.updator.plan_src_rank = 0

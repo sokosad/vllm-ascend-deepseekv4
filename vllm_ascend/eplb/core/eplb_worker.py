@@ -107,13 +107,20 @@ class EplbWorker:
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
-        self.update_expert_map(new_expert_maps)
+        changed_layers = None
+        if self.policy_type == 4:
+            changed_layers = [
+                not torch.equal(new_expert_maps[layer_id], self.old_expert_maps[layer_id])
+                for layer_id in range(new_expert_maps.shape[0])
+            ]
+        if changed_layers is None or any(changed_layers):
+            self.update_expert_map(new_expert_maps)
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
         self.old_expert_maps = new_expert_maps
         logger.debug("EPLB Process compute complete")
 
-        packed_update_info = self.pack_update_info(update_info)
+        packed_update_info = self.pack_update_info(update_info, changed_layers=changed_layers)
 
         return packed_update_info
 
@@ -323,7 +330,7 @@ class EplbWorker:
 
         return placement_global
 
-    def pack_update_info(self, update_info_generator):
+    def pack_update_info(self, update_info_generator, changed_layers=None):
         """
         Pack a list of update info records for efficient IPC.
 
@@ -350,6 +357,9 @@ class EplbWorker:
         packed_update_info = []
 
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+            if changed_layers is not None and not changed_layers[layer_id]:
+                packed_update_info.append({"noop": True, "layer_id": layer_id})
+                continue
             num_ranks = int(new_expert_map.shape[0])
             if self.full_rank_plan:
                 shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()

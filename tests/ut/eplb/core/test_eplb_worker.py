@@ -34,6 +34,20 @@ def test_pack_update_info_returns_full_rank_plan():
     assert record["log2phy_all"][0] == record["log2phy_all"][1]
 
 
+def test_policy4_pack_update_info_marks_unchanged_layer_as_noop():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.metro_routing = False
+    worker.full_rank_plan = True
+
+    new_expert_map = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+    packed = worker.pack_update_info(
+        [({}, {}, new_expert_map, 0)], changed_layers=[False]
+    )
+
+    assert packed == [{"noop": True, "layer_id": 0}]
+
+
 def test_policy2_pack_update_info_keeps_rank_local_plan():
     worker = EplbWorker.__new__(EplbWorker)
     worker.policy_type = 2
@@ -92,6 +106,7 @@ def test_compute_imbalance_handles_padded_layer_table():
 def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
     suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
