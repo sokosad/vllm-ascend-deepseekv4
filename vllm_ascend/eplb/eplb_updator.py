@@ -118,6 +118,8 @@ class EplbUpdator:
 
             self.adaptor.model.clear_all_moe_loads()
             self.cur_iterations = 0
+            return True
+        return False
 
     def get_update_info_flag(self):
         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
@@ -267,8 +269,10 @@ class EplbUpdator:
             return
 
         if self.update_expert_weight_flag() and self.noop_current_step:
-            self.update_iteration()
+            cycle_completed = self.update_iteration()
             self.noop_current_step = False
+            if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+                logger.info("[EPLB] completed CRAFT update cycle.")
             return
 
         if (
@@ -278,7 +282,9 @@ class EplbUpdator:
         ):
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
-        self.update_iteration()
+        cycle_completed = self.update_iteration()
+        if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+            logger.info("[EPLB] completed CRAFT update cycle.")
         self.skip_current_step = False
         self.noop_current_step = False
 

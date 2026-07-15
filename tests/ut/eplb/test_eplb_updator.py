@@ -150,6 +150,23 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         self.loader.generate_expert_d2d_transfer_task.assert_not_called()
         self.loader.update_expert_map_and_weight.assert_not_called()
 
+    def test_last_unchanged_layer_logs_craft_cycle_completion(self):
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            + self.updator.num_moe_layers
+            - 1
+        )
+        self.updator.update_info_all = [None] * self.updator.num_moe_layers
+
+        with patch("vllm_ascend.eplb.eplb_updator.logger.info") as mock_info:
+            self.updator.forward_before()
+            self.updator.forward_end()
+
+        self.assertEqual(self.updator.cur_iterations, 0)
+        self.adaptor.model.clear_all_moe_loads.assert_called_once()
+        mock_info.assert_called_once_with("[EPLB] completed CRAFT update cycle.")
+
     def test_broadcast_update_info_uses_rank0_plan(self):
         self.updator.rank_id = 1
         self.updator.plan_src_rank = 0
