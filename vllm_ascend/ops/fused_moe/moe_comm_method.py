@@ -82,7 +82,6 @@ def _apply_log2phy(
 
     if compact_craft_pool:
         candidate_map = log2phy[:, :-1]
-        candidates = candidate_map[topk_ids]
         replica_counts = (-log2phy[:, -1] - 1)[topk_ids]
     else:
         candidates = log2phy[topk_ids]
@@ -96,6 +95,8 @@ def _apply_log2phy(
         while token_selector.dim() < topk_ids.dim():
             token_selector = token_selector.unsqueeze(-1)
         replica_selector = (token_selector + topk_ids.to(torch.int64)) % replica_counts
+    if compact_craft_pool:
+        return candidate_map[topk_ids.to(torch.int64), replica_selector]
     return candidates.gather(-1, replica_selector.unsqueeze(-1)).squeeze(-1)
 
 
