@@ -104,3 +104,44 @@ def test_global_pool_assigns_each_physical_slot_to_one_layer():
     assert changed
     assert torch.all(torch.sum(updated[:, :, 2:] >= 0, dim=0) == 1)
     assert updated[1, 1, 2].item() == 0
+
+
+def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
+    num_layers = 43
+    num_ranks = 8
+    num_experts = 256
+    pool_size = 2
+    main_size = num_experts // num_ranks
+
+    config = DynamicConfig()
+    config.craft_global_pool_size = num_ranks * pool_size
+    config.craft_pool_min_hotness_delta = 0.05
+    policy = PoolBalanceEplb(config)
+
+    current = torch.full(
+        (num_layers, num_ranks, main_size + pool_size),
+        -1,
+        dtype=torch.long,
+    )
+    home = torch.arange(num_experts, dtype=torch.long).view(num_ranks, main_size)
+    current[:, :, :main_size] = home
+    workload = torch.ones_like(current)
+    workload[18, 2, 19] = 10_000
+    workload[42, 7, 31] = 8_000
+
+    changed, _, updated_list = policy.rebalance_experts(current, workload)
+    updated = torch.tensor(updated_list)
+
+    assert changed
+    assert torch.equal(updated[:, :, :main_size], current[:, :, :main_size])
+    assert torch.all(torch.sum(updated[:, :, main_size:] >= 0, dim=0) == 1)
+    for layer_id in range(num_layers):
+        for rank_id in range(num_ranks):
+            valid = updated[layer_id, rank_id]
+            valid = valid[valid >= 0]
+            assert valid.numel() == torch.unique(valid).numel()
+
+    changed_again, _, stable_list = policy.rebalance_experts(updated, workload)
+
+    assert not changed_again
+    assert torch.equal(torch.tensor(stable_list), updated)
