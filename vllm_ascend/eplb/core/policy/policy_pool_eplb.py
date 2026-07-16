@@ -402,6 +402,40 @@ class PoolBalanceEplb(EplbPolicy):
                         best = (key, layer_id, expert_id, rank_id, new_loads)
             return best
 
+        def cold_choice():
+            best = None
+            fallback_limit = max(total_slots * self.candidate_factor, total_slots)
+            for rank_id in range(num_ranks):
+                if len(assignments[rank_id]) >= pool_size:
+                    continue
+                considered = 0
+                for layer_id, expert_id in cold_candidates:
+                    if not eligible(layer_id, expert_id, rank_id):
+                        continue
+                    gain, new_loads = self._global_assignment_gain(
+                        rank_loads,
+                        hotness,
+                        copy_counts,
+                        hosts,
+                        layer_id,
+                        expert_id,
+                        rank_id,
+                    )
+                    key = (
+                        gain,
+                        -float(hotness[layer_id, expert_id]),
+                        -len(assignments[rank_id]),
+                        -layer_id,
+                        -expert_id,
+                        -rank_id,
+                    )
+                    if best is None or key > best[0]:
+                        best = (key, layer_id, expert_id, rank_id, new_loads)
+                    considered += 1
+                    if considered >= fallback_limit:
+                        break
+            return best
+
         for _ in range(total_slots):
             choice = best_choice(candidates)
             if choice is None or choice[0][0] < 0:
@@ -417,7 +451,7 @@ class PoolBalanceEplb(EplbPolicy):
                 ):
                     choice = preferred_choice
             if choice is None or choice[0][0] < 0:
-                choice = best_choice(cold_candidates)
+                choice = cold_choice()
             if choice is None:
                 raise ValueError(
                     "CRAFT global pool cannot fill every rank slot without duplicating "
