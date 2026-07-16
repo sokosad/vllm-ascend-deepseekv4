@@ -555,8 +555,15 @@ class EplbWorker:
             return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
         packed_update_info = []
+        any_layer_changed = changed_layers is not None and any(changed_layers)
 
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+            route_only = bool(
+                changed_layers is not None
+                and getattr(self, "craft_global_pool_size", 0) > 0
+                and any_layer_changed
+                and not changed_layers[layer_id]
+            )
             if (
                 changed_layers is not None
                 and not changed_layers[layer_id]
@@ -582,6 +589,16 @@ class EplbWorker:
                     generate_log2phy_map(new_expert_map, rank_id).numpy().tolist()
                     for rank_id in range(num_ranks)
                 ]
+
+            if route_only:
+                packed_update_info.append(
+                    {
+                        "route_only": True,
+                        "log2phy_map": shared_log2phy_map,
+                        "layer_id": layer_id,
+                    }
+                )
+                continue
 
             packed_update_info.append(
                 {

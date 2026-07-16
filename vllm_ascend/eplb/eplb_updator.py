@@ -59,6 +59,7 @@ class EplbUpdator:
             int(getattr(self.eplb_config, "craft_global_pool_size", 0) or 0) > 0
         )
         self.global_pool_routes_suspended = False
+        self.route_only_current_step = None
         self.full_rank_plan = self.craft_pool_plan or _coerce_bool(
             getattr(self.eplb_config, "metro_routing", False)
         )
@@ -160,6 +161,9 @@ class EplbUpdator:
             if isinstance(record, dict) and record.get("noop", False):
                 selected_update_info.append(None)
                 continue
+            if isinstance(record, dict) and record.get("route_only", False):
+                selected_update_info.append(record)
+                continue
             if not isinstance(record, dict) or "send_all" not in record:
                 selected_update_info.append(record)
                 continue
@@ -239,6 +243,12 @@ class EplbUpdator:
             if self.craft_global_pool_plan and not self.global_pool_routes_suspended:
                 self.adaptor.suspend_global_pool_routes()
                 self.global_pool_routes_suspended = True
+            if isinstance(update_info, dict) and update_info.get("route_only", False):
+                self.route_only_current_step = (
+                    update_info["layer_id"],
+                    torch.from_numpy(numpy.asarray(update_info["log2phy_map"])),
+                )
+                return
             (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = update_info
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
@@ -285,6 +295,20 @@ class EplbUpdator:
                 self.global_pool_routes_suspended = False
             return
 
+        if self.update_expert_weight_flag() and self.route_only_current_step is not None:
+            layer_id, log2phy_map = self.route_only_current_step
+            self.adaptor.do_update_log2phy_map(
+                layer_id + self.adaptor.num_dense_layers,
+                log2phy_map,
+            )
+            cycle_completed = self.update_iteration()
+            if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+                logger.info("[EPLB] completed CRAFT update cycle.")
+            if cycle_completed:
+                self.global_pool_routes_suspended = False
+            self.route_only_current_step = None
+            return
+
         if (
             self.update_expert_weight_flag()
             and not self.skip_current_step
@@ -299,6 +323,7 @@ class EplbUpdator:
             self.global_pool_routes_suspended = False
         self.skip_current_step = False
         self.noop_current_step = False
+        self.route_only_current_step = None
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

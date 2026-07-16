@@ -60,6 +60,10 @@ def test_global_pool_restores_unchanged_layer_routes_during_changed_cycle():
     packed = worker.pack_update_info(records, changed_layers=[True, False])
 
     assert all("noop" not in record for record in packed)
+    assert "route_only" not in packed[0]
+    assert packed[1]["route_only"] is True
+    assert "send_all" not in packed[1]
+    assert "maps_all" not in packed[1]
     assert packed[1]["layer_id"] == 1
 
 
