@@ -95,11 +95,14 @@ The details of each configuration option are as follows:
 | `num_redundant_experts`          | int | `0`    | Specify redundant experts during initialization. |
 | `craft_pool_size`                | int | `0`    | Specify a uniform CRAFT pool size per rank for every MoE layer. |
 | `craft_pool_layer_sizes`         | list/dict | `None` | Specify per-MoE-layer CRAFT pool sizes. Unspecified layers use pool size 0. |
+| `craft_global_pool_size`         | int | `0`    | Specify the total number of model-level CRAFT pool slots across all EP ranks. The per-rank capacity is this value divided by the EP size and is independent of the number of MoE layers. |
 | `craft_pool_top_m`               | int | `0`    | Limit CRAFT pool planning to the top-M hot experts. When set to 0, the planner uses `craft_pool_top_m_factor`. |
 | `craft_pool_top_m_factor`        | int | `4`    | Multiplier for automatic CRAFT pool candidate count: `craft_pool_size * ep_size * factor`. |
 | `craft_pool_min_hotness_delta`   | float | `0.05` | Skip CRAFT pool replanning for a layer when hotness changes less than this relative threshold. |
 | `craft_pool_min_improvement`     | float | `0.01` | Skip CRAFT pool migration when estimated max-rank-load improvement is below this threshold. |
 | `metro_routing`                  | bool | `False` | Enable METRO-style replica routing for normal EPLB redundant experts. When enabled, each logical expert is routed to one preferred physical replica in the batch to reduce activated expert weights. |
+
+`craft_global_pool_size` requires dynamic EPLB policy 4 and must be divisible by the EP size. It cannot be combined with `num_redundant_experts`, `craft_pool_size`, `craft_pool_layer_sizes`, or an expert map file. The current implementation supports W8A8 dynamic MoE weights.
 
 ### Example
 
