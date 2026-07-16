@@ -8,6 +8,8 @@ TP=${TP:-4}
 POOL_SIZE=${POOL_SIZE:-1}
 HEAT=${HEAT:-60}
 ALGO=${ALGO:-10}
+CRAFT_MIN_HOTNESS_DELTA=${CRAFT_MIN_HOTNESS_DELTA:-0.05}
+CRAFT_MIN_IMPROVEMENT=${CRAFT_MIN_IMPROVEMENT:-0.01}
 PORT=${PORT:-8008}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-1024000}
 MNBT=${MNBT:-16384}
@@ -44,9 +46,11 @@ ADDITIONAL_CONFIG=$(printf '%s' \
   '"enable_cpu_binding":"true","multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false,' \
   '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":4,' \
   '"num_redundant_experts":'"$NUM_REDUNDANT"',"craft_pool_size":'"$POOL_SIZE"',' \
-  '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"'}}')
+  '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"',' \
+  '"craft_pool_min_hotness_delta":'"$CRAFT_MIN_HOTNESS_DELTA"',' \
+  '"craft_pool_min_improvement":'"$CRAFT_MIN_IMPROVEMENT"'}}')
 
-echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE heat=$HEAT algo=$ALGO fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
+echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE heat=$HEAT algo=$ALGO min_hotness_delta=$CRAFT_MIN_HOTNESS_DELTA min_improvement=$CRAFT_MIN_IMPROVEMENT fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
 echo "[CRAFT] additional_config=$ADDITIONAL_CONFIG"
 
 exec vllm serve "$MODEL_PATH" \
