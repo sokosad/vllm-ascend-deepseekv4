@@ -130,6 +130,25 @@ def test_global_pool_hotness_gate_accumulates_top_candidate_changes():
     assert policy._global_hotness_changed(np.array([[60.0, 40.0]]), total_slots=1)
 
 
+def test_global_pool_imbalance_weights_layers_by_traffic():
+    table = np.array(
+        [
+            [[0], [1]],
+            [[0], [1]],
+        ]
+    )
+    hotness = np.array(
+        [
+            [100.0, 0.0],
+            [1.0, 1.0],
+        ]
+    )
+
+    imbalance = PoolBalanceEplb._global_imbalance(table, hotness)
+
+    assert np.isclose(imbalance, (2.0 * 100.0 + 1.0 * 2.0) / 102.0)
+
+
 def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
     num_layers = 43
     num_ranks = 8

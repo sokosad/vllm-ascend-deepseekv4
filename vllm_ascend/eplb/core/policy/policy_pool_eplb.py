@@ -421,7 +421,8 @@ class PoolBalanceEplb(EplbPolicy):
 
     @staticmethod
     def _global_imbalance(table, hotness):
-        layer_ratios = []
+        weighted_ratio = 0.0
+        total_weight = 0.0
         for layer_id in range(table.shape[0]):
             valid = table[layer_id] >= 0
             counts = np.bincount(
@@ -439,9 +440,11 @@ class PoolBalanceEplb(EplbPolicy):
                 dtype=np.float64,
             )
             mean_load = float(rank_loads.mean())
-            if mean_load > 0:
-                layer_ratios.append(float(rank_loads.max()) / mean_load)
-        return float(np.mean(layer_ratios)) if layer_ratios else 0.0
+            layer_weight = float(np.sum(hotness[layer_id]))
+            if mean_load > 0 and layer_weight > 0:
+                weighted_ratio += float(rank_loads.max()) / mean_load * layer_weight
+                total_weight += layer_weight
+        return weighted_ratio / total_weight if total_weight > 0 else 0.0
 
     def _rebalance_global_pool(self, current_expert_table, expert_workload, pool_start):
         old_table = current_expert_table.detach().cpu().numpy()
