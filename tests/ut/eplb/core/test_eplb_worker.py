@@ -103,6 +103,34 @@ def test_compute_imbalance_handles_padded_layer_table():
     assert mean_imbalance == max_imbalance
 
 
+def test_craft_pool_utilization_reports_active_pool_slots():
+    deployment = torch.tensor(
+        [
+            [[0, 1, 4], [2, 3, 1]],
+            [[0, 1, 2], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    load_info = torch.tensor(
+        [
+            [[10, 20, 5], [30, 40, 0]],
+            [[10, 20, 0], [30, 40, 7]],
+        ],
+        dtype=torch.int64,
+    )
+
+    stats = EplbWorker._craft_pool_utilization(deployment, load_info)
+
+    assert stats is not None
+    assert stats["total_slots"] == 4
+    assert stats["active_slots"] == 2
+    assert stats["active_ratio"] == 0.5
+    assert stats["pool_tokens"] == 12.0
+    assert stats["pool_token_share"] == 12.0 / 212.0
+    assert stats["zero_hit_layers"] == 0
+    assert stats["top_layers"] == [(1, 7, 1), (0, 5, 1)]
+
+
 def test_craft_migration_cost_gate_rejects_slow_payback():
     worker = EplbWorker.__new__(EplbWorker)
     worker.shared_dict = {
@@ -153,6 +181,7 @@ def load_tests(loader_obj, tests, pattern):
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
     suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
     suite.addTest(unittest.FunctionTestCase(test_compute_imbalance_handles_padded_layer_table))
+    suite.addTest(unittest.FunctionTestCase(test_craft_pool_utilization_reports_active_pool_slots))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_rejects_slow_payback))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_accepts_fast_payback))
     return suite

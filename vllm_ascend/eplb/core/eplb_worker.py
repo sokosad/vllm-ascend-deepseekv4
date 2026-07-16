@@ -102,6 +102,8 @@ class EplbWorker:
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+        if self.policy_type == 4 and self.rank_id == 0:
+            self._log_craft_pool_utilization(old_placement, load_info)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         hotness = None
@@ -143,6 +145,73 @@ class EplbWorker:
         packed_update_info = self.pack_update_info(update_info, changed_layers=changed_layers)
 
         return packed_update_info
+
+    @staticmethod
+    def _craft_pool_utilization(deployment, load_info):
+        deployment = (
+            deployment.detach().cpu().numpy()
+            if torch.is_tensor(deployment)
+            else np.asarray(deployment)
+        )
+        load_info = (
+            load_info.detach().cpu().numpy()
+            if torch.is_tensor(load_info)
+            else np.asarray(load_info)
+        )
+        if deployment.ndim != 3 or load_info.shape != deployment.shape:
+            return None
+
+        valid = deployment >= 0
+        if not valid.any() or deployment.shape[1] <= 0:
+            return None
+        num_logical_experts = int(deployment[valid].max()) + 1
+        pool_start = num_logical_experts // deployment.shape[1]
+        if pool_start >= deployment.shape[2]:
+            return None
+
+        pool_valid = valid[:, :, pool_start:]
+        total_slots = int(pool_valid.sum())
+        if total_slots == 0:
+            return None
+        pool_load = np.where(pool_valid, load_info[:, :, pool_start:], 0)
+        active = pool_valid & (load_info[:, :, pool_start:] > 0)
+        layer_tokens = pool_load.sum(axis=(1, 2))
+        layer_active = active.sum(axis=(1, 2))
+        total_tokens = float(np.where(valid, load_info, 0).sum())
+        pool_tokens = float(pool_load.sum())
+        top_layers = np.argsort(-layer_tokens)[: min(5, len(layer_tokens))]
+        return {
+            "total_slots": total_slots,
+            "active_slots": int(active.sum()),
+            "active_ratio": float(active.sum()) / total_slots,
+            "pool_tokens": pool_tokens,
+            "pool_token_share": pool_tokens / total_tokens if total_tokens > 0 else 0.0,
+            "zero_hit_layers": int(np.count_nonzero(layer_active == 0)),
+            "top_layers": [
+                (int(layer_id), int(layer_tokens[layer_id]), int(layer_active[layer_id]))
+                for layer_id in top_layers
+            ],
+        }
+
+    def _log_craft_pool_utilization(self, deployment, load_info):
+        stats = self._craft_pool_utilization(deployment, load_info)
+        if stats is None:
+            return
+        top_layers = ",".join(
+            f"{layer_id}:{tokens}/{active}"
+            for layer_id, tokens, active in stats["top_layers"]
+        )
+        logger.info(
+            "[CRAFT-SLOT] active=%d/%d ratio=%.3f pool_tokens=%.0f "
+            "pool_share=%.4f zero_hit_layers=%d top_layers=%s",
+            stats["active_slots"],
+            stats["total_slots"],
+            stats["active_ratio"],
+            stats["pool_tokens"],
+            stats["pool_token_share"],
+            stats["zero_hit_layers"],
+            top_layers,
+        )
 
     @staticmethod
     def _rank_loads(deployment, hotness):
