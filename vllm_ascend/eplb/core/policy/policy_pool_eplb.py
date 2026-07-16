@@ -317,70 +317,117 @@ class PoolBalanceEplb(EplbPolicy):
             loads.append(sum(per_copy[expert_id] for expert_id in experts))
         return np.asarray(loads, dtype=np.float64)
 
-    def _desired_global_assignments(self, home, hotness, pool_size):
+    @staticmethod
+    def _global_assignment_gain(
+        rank_loads,
+        hotness,
+        copy_counts,
+        hosts,
+        layer_id,
+        expert_id,
+        rank_id,
+    ):
+        copies = int(copy_counts[layer_id, expert_id])
+        expert_hotness = float(hotness[layer_id, expert_id])
+        old_loads = rank_loads[layer_id]
+        new_loads = old_loads.copy()
+        decrease = expert_hotness / (copies * (copies + 1))
+        for host_rank in hosts[layer_id][expert_id]:
+            new_loads[host_rank] -= decrease
+        new_loads[rank_id] += expert_hotness / (copies + 1)
+        return float(old_loads.max() - new_loads.max()), new_loads
+
+    def _desired_global_assignments(
+        self,
+        home,
+        hotness,
+        pool_size,
+        preferred_assignments=None,
+    ):
         num_layers, num_experts = hotness.shape
         num_ranks = len(home[0])
         total_slots = pool_size * num_ranks
         candidates = self._global_candidates(hotness, total_slots)
-        candidate_mask = np.zeros((num_layers, num_experts), dtype=bool)
-        for layer_id, expert_id in candidates:
-            candidate_mask[layer_id, expert_id] = True
-
-        extra_copies = np.zeros((num_layers, num_experts), dtype=np.int64)
-        items = []
-        for _ in range(total_slots):
-            scores = np.divide(
-                hotness,
-                1 + extra_copies,
-                out=np.zeros_like(hotness, dtype=np.float64),
-                where=candidate_mask,
-            )
-            scores[~candidate_mask] = -1.0
-            scores[extra_copies >= num_ranks - 1] = -1.0
-            flat_index = int(np.argmax(scores))
-            layer_id, expert_id = divmod(flat_index, num_experts)
-            if scores[layer_id, expert_id] < 0:
-                break
-            extra_copies[layer_id, expert_id] += 1
-            items.append((layer_id, expert_id, float(scores[layer_id, expert_id])))
-
         assignments: list[list[tuple[int, int]]] = [[] for _ in range(num_ranks)]
-        for layer_id, expert_id, _ in sorted(items, key=lambda item: -item[2]):
-            loads = self._layer_rank_loads(home[layer_id], assignments, hotness[layer_id], layer_id)
-            eligible = [
-                rank_id
-                for rank_id in range(num_ranks)
-                if len(assignments[rank_id]) < pool_size
-                and expert_id not in home[layer_id][rank_id]
-                and (layer_id, expert_id) not in assignments[rank_id]
-            ]
-            if eligible:
-                rank_id = min(eligible, key=lambda rank: (loads[rank], rank))
-                assignments[rank_id].append((layer_id, expert_id))
+        copy_counts = np.ones((num_layers, num_experts), dtype=np.int64)
+        hosts = [[[] for _ in range(num_experts)] for _ in range(num_layers)]
+        rank_loads = np.zeros((num_layers, num_ranks), dtype=np.float64)
+        for layer_id in range(num_layers):
+            for rank_id in range(num_ranks):
+                for expert_id in home[layer_id][rank_id]:
+                    hosts[layer_id][expert_id].append(rank_id)
+                    rank_loads[layer_id, rank_id] += hotness[layer_id, expert_id]
 
-        all_candidates = [
-            (layer_id, expert_id)
-            for layer_id in range(num_layers)
-            for expert_id in range(num_experts)
-        ]
-        selected = set(candidates)
-        fallback_candidates = candidates + [item for item in all_candidates if item not in selected]
-        for rank_id in range(num_ranks):
-            while len(assignments[rank_id]) < pool_size:
-                added = False
-                for layer_id, expert_id in fallback_candidates:
-                    if (
-                        expert_id not in home[layer_id][rank_id]
-                        and (layer_id, expert_id) not in assignments[rank_id]
-                    ):
-                        assignments[rank_id].append((layer_id, expert_id))
-                        added = True
-                        break
-                if not added:
-                    raise ValueError(
-                        "CRAFT global pool cannot fill every rank slot without duplicating "
-                        f"a home expert: rank={rank_id}, pool_size={pool_size}."
+        preferred = preferred_assignments or [[] for _ in range(num_ranks)]
+        cold_candidates = sorted(
+            (
+                (layer_id, expert_id)
+                for layer_id in range(num_layers)
+                for expert_id in range(num_experts)
+            ),
+            key=lambda item: (hotness[item], item[0], item[1]),
+        )
+
+        def eligible(layer_id, expert_id, rank_id):
+            return (
+                len(assignments[rank_id]) < pool_size
+                and rank_id not in hosts[layer_id][expert_id]
+                and copy_counts[layer_id, expert_id] < num_ranks
+            )
+
+        def best_choice(candidate_items):
+            best = None
+            for layer_id, expert_id in candidate_items:
+                for rank_id in range(num_ranks):
+                    if not eligible(layer_id, expert_id, rank_id):
+                        continue
+                    gain, new_loads = self._global_assignment_gain(
+                        rank_loads,
+                        hotness,
+                        copy_counts,
+                        hosts,
+                        layer_id,
+                        expert_id,
+                        rank_id,
                     )
+                    key = (
+                        gain,
+                        float(hotness[layer_id, expert_id]),
+                        -len(assignments[rank_id]),
+                        -layer_id,
+                        -expert_id,
+                        -rank_id,
+                    )
+                    if best is None or key > best[0]:
+                        best = (key, layer_id, expert_id, rank_id, new_loads)
+            return best
+
+        for _ in range(total_slots):
+            choice = best_choice(candidates)
+            if choice is None or choice[0][0] < 0:
+                preferred_items = [
+                    item
+                    for rank_items in preferred
+                    for item in rank_items
+                    if item not in candidates
+                ]
+                preferred_choice = best_choice(preferred_items)
+                if preferred_choice is not None and (
+                    choice is None or preferred_choice[0] > choice[0]
+                ):
+                    choice = preferred_choice
+            if choice is None or choice[0][0] < 0:
+                choice = best_choice(cold_candidates)
+            if choice is None:
+                raise ValueError(
+                    "CRAFT global pool cannot fill every rank slot without duplicating "
+                    "a home expert."
+                )
+            _, layer_id, expert_id, rank_id, new_loads = choice
+            assignments[rank_id].append((layer_id, expert_id))
+            copy_counts[layer_id, expert_id] += 1
+            hosts[layer_id][expert_id].append(rank_id)
+            rank_loads[layer_id] = new_loads
         return assignments
 
     @staticmethod
@@ -466,7 +513,20 @@ class PoolBalanceEplb(EplbPolicy):
             ]
             for layer_id in range(old_table.shape[0])
         ]
-        desired = self._desired_global_assignments(home, hotness, pool_size)
+        preferred_assignments = [[] for _ in range(num_ranks)]
+        for layer_id in range(old_table.shape[0]):
+            for rank_id in range(num_ranks):
+                preferred_assignments[rank_id].extend(
+                    (layer_id, int(expert_id))
+                    for expert_id in old_table[layer_id, rank_id, pool_start:]
+                    if expert_id >= 0
+                )
+        desired = self._desired_global_assignments(
+            home,
+            hotness,
+            pool_size,
+            preferred_assignments=preferred_assignments,
+        )
         new_table = self._place_global_assignments(old_table, desired, pool_start, pool_size)
         old_pool_active = bool(np.any(old_table[:, :, pool_start:] >= 0))
         old_imbalance = self._global_imbalance(old_table, hotness)

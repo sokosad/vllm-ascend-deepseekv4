@@ -1,3 +1,5 @@
+import unittest
+
 import numpy as np
 import torch
 
@@ -147,6 +149,18 @@ def test_global_pool_imbalance_weights_layers_by_traffic():
     imbalance = PoolBalanceEplb._global_imbalance(table, hotness)
 
     assert np.isclose(imbalance, (2.0 * 100.0 + 1.0 * 2.0) / 102.0)
+
+
+class TestGlobalPoolMarginalPlacement(unittest.TestCase):
+    def test_prefers_marginal_balance_gain_over_raw_hotness(self):
+        policy = PoolBalanceEplb(DynamicConfig())
+        home = [[[0, 1], [2, 3]]]
+        hotness = np.array([[80.0, 70.0, 100.0, 0.0]])
+
+        assignments = policy._desired_global_assignments(home, hotness, pool_size=1)
+
+        self.assertEqual(assignments[1], [(0, 1)])
+        self.assertEqual(assignments[0], [(0, 3)])
 
 
 def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
