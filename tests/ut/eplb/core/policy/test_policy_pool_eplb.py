@@ -106,6 +106,30 @@ def test_global_pool_assigns_each_physical_slot_to_one_layer():
     assert updated[1, 1, 2].item() == 0
 
 
+def test_global_pool_hotness_gate_ignores_cold_layer_noise():
+    config = DynamicConfig()
+    config.craft_pool_top_m = 2
+    config.craft_pool_min_hotness_delta = 0.05
+    policy = PoolBalanceEplb(config)
+
+    first = np.array([[1000.0, 500.0], [1.0, 0.0]])
+    cold_layer_shift = np.array([[1000.0, 500.0], [0.0, 1.0]])
+
+    assert policy._global_hotness_changed(first, total_slots=1)
+    assert not policy._global_hotness_changed(cold_layer_shift, total_slots=1)
+
+
+def test_global_pool_hotness_gate_accumulates_top_candidate_changes():
+    config = DynamicConfig()
+    config.craft_pool_top_m = 2
+    config.craft_pool_min_hotness_delta = 0.5
+    policy = PoolBalanceEplb(config)
+
+    assert policy._global_hotness_changed(np.array([[100.0, 0.0]]), total_slots=1)
+    assert not policy._global_hotness_changed(np.array([[80.0, 20.0]]), total_slots=1)
+    assert policy._global_hotness_changed(np.array([[60.0, 40.0]]), total_slots=1)
+
+
 def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
     num_layers = 43
     num_ranks = 8

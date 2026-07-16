@@ -239,23 +239,40 @@ class PoolBalanceEplb(EplbPolicy):
             new_rank_slots[slot_id] = expert_id
         return new_rank_slots
 
-    def _global_hotness_changed(self, hotness: np.ndarray) -> bool:
+    def _global_hotness_changed(self, hotness: np.ndarray, total_slots: int) -> bool:
         if self.min_hotness_delta <= 0:
             return True
-        layer_totals = np.sum(np.abs(hotness), axis=1, keepdims=True)
-        normalized = np.divide(
-            hotness,
-            layer_totals,
-            out=np.zeros_like(hotness, dtype=np.float64),
-            where=layer_totals > 0,
+        flat_hotness = np.abs(hotness).reshape(-1)
+        total_hotness = float(flat_hotness.sum())
+        normalized = (
+            flat_hotness / total_hotness
+            if total_hotness > 0
+            else np.zeros_like(flat_hotness, dtype=np.float64)
         )
         previous = self._last_global_hotness
-        self._last_global_hotness = normalized.copy()
         if previous is None or previous.shape != normalized.shape:
+            self._last_global_hotness = normalized.copy()
             return True
-        layer_deltas = np.sum(np.abs(normalized - previous), axis=1)
-        max_delta = float(layer_deltas.max()) if layer_deltas.size else 0.0
-        return max_delta >= self.min_hotness_delta
+
+        top_m = self.candidate_top_m
+        if top_m <= 0:
+            top_m = max(total_slots * self.candidate_factor, total_slots)
+
+        def top_indices(values):
+            positive = np.flatnonzero(values > 0)
+            count = min(top_m, positive.size)
+            if count == 0:
+                return np.empty(0, dtype=np.int64)
+            if count == positive.size:
+                return positive
+            return positive[np.argpartition(-values[positive], count - 1)[:count]]
+
+        candidates = np.union1d(top_indices(normalized), top_indices(previous))
+        delta = float(np.sum(np.abs(normalized[candidates] - previous[candidates])))
+        if delta < self.min_hotness_delta:
+            return False
+        self._last_global_hotness = normalized.copy()
+        return True
 
     def _global_candidates(self, hotness: np.ndarray, total_slots: int) -> list[tuple[int, int]]:
         flat = hotness.reshape(-1)
@@ -436,7 +453,7 @@ class PoolBalanceEplb(EplbPolicy):
                 f"configured={self.global_pool_total_size}, table={pool_size * num_ranks}."
             )
         hotness = self._expert_hotness(current_expert_table, expert_workload)
-        if not self._global_hotness_changed(hotness):
+        if not self._global_hotness_changed(hotness, pool_size * num_ranks):
             return False, None, current_expert_table.tolist()
         home = [
             [
