@@ -362,8 +362,10 @@ class EplbWorker:
             num_logical_experts = int(valid.max().item()) + 1 if valid.numel() else 0
             pool_start = num_logical_experts // num_ranks if num_ranks else 0
             pool_owners = torch.sum(new_placement[:, :, pool_start:] >= 0, dim=0)
-            if torch.any(pool_owners > 1):
-                logger.error("CRAFT global pool slot is assigned to more than one layer")
+            if torch.any(pool_owners != 1):
+                logger.error(
+                    "Every CRAFT global pool slot must be assigned to exactly one layer"
+                )
                 new_placement.copy_(old_placement)
 
     @staticmethod

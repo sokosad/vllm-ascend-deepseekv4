@@ -129,6 +129,22 @@ def test_policy4_placement_validation_accepts_padded_pool_slots():
     assert torch.equal(new_placement, old_placement)
 
 
+def test_global_pool_validation_rejects_unowned_slot():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.craft_global_pool_size = 2
+    old_placement = torch.tensor([
+        [[0, 1, 2], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, 0]],
+    ])
+    new_placement = old_placement.clone()
+    new_placement[1, 1, 2] = -1
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
 def test_compute_imbalance_handles_padded_layer_table():
     deployment = torch.tensor([[[0, 1, 4], [2, 3, -1]]], dtype=torch.long)
     hotness = np.asarray([[10.0, 20.0, 30.0, 40.0, 50.0]])
@@ -219,6 +235,7 @@ def load_tests(loader_obj, tests, pattern):
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
     suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_rejects_unowned_slot))
     suite.addTest(unittest.FunctionTestCase(test_compute_imbalance_handles_padded_layer_table))
     suite.addTest(unittest.FunctionTestCase(test_craft_pool_utilization_reports_active_pool_slots))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_rejects_slow_payback))
