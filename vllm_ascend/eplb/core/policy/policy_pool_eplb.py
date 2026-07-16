@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import torch
+from vllm.logger import logger
 
 from .policy_abstract import DynamicConfig, EplbPolicy
 
@@ -468,14 +469,34 @@ class PoolBalanceEplb(EplbPolicy):
         desired = self._desired_global_assignments(home, hotness, pool_size)
         new_table = self._place_global_assignments(old_table, desired, pool_start, pool_size)
         old_pool_active = bool(np.any(old_table[:, :, pool_start:] >= 0))
+        old_imbalance = self._global_imbalance(old_table, hotness)
+        new_imbalance = self._global_imbalance(new_table, hotness)
+        relative_improvement = (
+            (old_imbalance - new_imbalance) / old_imbalance
+            if old_imbalance > 0
+            else 0.0
+        )
+        changed_slots = int(np.count_nonzero(old_table != new_table))
+        changed_layers = int(
+            np.count_nonzero(np.any(old_table != new_table, axis=(1, 2)))
+        )
+        accepted = not (
+            old_pool_active
+            and self.min_improvement > 0
+            and relative_improvement < self.min_improvement
+        )
+        logger.info(
+            "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
+            "current=%.4f proposed=%.4f improvement=%.4f accepted=%s",
+            pool_size * num_ranks,
+            changed_slots,
+            changed_layers,
+            old_imbalance,
+            new_imbalance,
+            relative_improvement,
+            accepted,
+        )
         if old_pool_active and self.min_improvement > 0:
-            old_imbalance = self._global_imbalance(old_table, hotness)
-            new_imbalance = self._global_imbalance(new_table, hotness)
-            relative_improvement = (
-                (old_imbalance - new_imbalance) / old_imbalance
-                if old_imbalance > 0
-                else 0.0
-            )
             if relative_improvement < self.min_improvement:
                 return False, None, current_expert_table.tolist()
         changed = not np.array_equal(old_table, new_table)
