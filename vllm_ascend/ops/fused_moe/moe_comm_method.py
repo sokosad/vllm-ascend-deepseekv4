@@ -73,8 +73,6 @@ def _apply_log2phy(
     log2phy: torch.Tensor | None,
     topk_ids: torch.Tensor,
     metro_routing: bool = False,
-    replica_counts: torch.Tensor | None = None,
-    source_rank: int = 0,
 ) -> torch.Tensor:
     if log2phy is None:
         return topk_ids
@@ -82,19 +80,16 @@ def _apply_log2phy(
         return log2phy[topk_ids]
 
     candidates = log2phy[topk_ids]
-    if replica_counts is None:
-        selected_replica_counts = torch.sum(candidates >= 0, dim=-1)
-    else:
-        selected_replica_counts = replica_counts[topk_ids]
-    selected_replica_counts = torch.clamp(selected_replica_counts, min=1)
+    replica_counts = torch.sum(candidates >= 0, dim=-1)
+    replica_counts = torch.clamp(replica_counts, min=1)
 
     if metro_routing:
-        replica_selector = topk_ids.to(torch.int64) % selected_replica_counts
+        replica_selector = topk_ids.to(torch.int64) % replica_counts
     else:
         token_selector = torch.arange(topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64)
         while token_selector.dim() < topk_ids.dim():
             token_selector = token_selector.unsqueeze(-1)
-        replica_selector = (token_selector + topk_ids.to(torch.int64) + source_rank) % selected_replica_counts
+        replica_selector = (token_selector + topk_ids.to(torch.int64)) % replica_counts
     return candidates.gather(-1, replica_selector.unsqueeze(-1)).squeeze(-1)
 
 
@@ -170,8 +165,6 @@ class MoECommMethod(ABC):
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
             getattr(self.moe_config, "metro_routing", False),
-            fused_experts_input.routing.replica_counts,
-            fused_experts_input.routing.source_rank,
         )
 
         token_dispatch_input = build_token_dispatch_input(
@@ -352,8 +345,6 @@ class FusedMC2CommImpl(MoECommMethod):
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
             getattr(self.moe_config, "metro_routing", False),
-            fused_experts_input.routing.replica_counts,
-            fused_experts_input.routing.source_rank,
         )
 
         expert_tokens = None

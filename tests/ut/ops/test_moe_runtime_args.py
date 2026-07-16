@@ -67,7 +67,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 hidden_states = torch.randn(4, 8)
                 topk_weights = torch.randn(4, 2)
                 topk_ids = torch.randint(0, 4, (4, 2), dtype=torch.int32)
-                replica_counts = torch.tensor([1, 1, 1, 1], dtype=torch.int64)
                 fused_experts_input = build_fused_experts_input(
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
@@ -81,8 +80,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                     mc2_mask=torch.tensor([True, False, True, False]),
                     apply_router_weight_on_input=True,
                     log2phy=torch.tensor([3, 2, 1, 0], dtype=torch.int32),
-                    replica_counts=replica_counts,
-                    source_rank=3,
                     pertoken_scale=torch.randn(4),
                     activation="gelu",
                     mxfp_act_quant_type=torch.float8_e4m3fn if quant_type == QuantType.MXFP8 else None,
@@ -94,8 +91,6 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertTrue(fused_experts_input.dynamic_eplb)
                 self.assertTrue(fused_experts_input.routing.apply_router_weight_on_input)
                 self.assertEqual(fused_experts_input.routing.global_redundant_expert_num, 2)
-                self.assertIs(fused_experts_input.routing.replica_counts, replica_counts)
-                self.assertEqual(fused_experts_input.routing.source_rank, 3)
                 self.assertEqual(fused_experts_input.activation, "gelu")
                 self.assertEqual(fused_experts_input.quant.quant_type, quant_type)
 
