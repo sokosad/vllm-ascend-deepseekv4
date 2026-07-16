@@ -48,7 +48,7 @@ def test_policy4_pack_update_info_marks_unchanged_layer_as_noop():
     assert packed == [{"noop": True, "layer_id": 0}]
 
 
-def test_global_pool_restores_unchanged_layer_routes_during_changed_cycle():
+def test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle():
     worker = EplbWorker.__new__(EplbWorker)
     worker.policy_type = 4
     worker.full_rank_plan = True
@@ -59,12 +59,8 @@ def test_global_pool_restores_unchanged_layer_routes_during_changed_cycle():
 
     packed = worker.pack_update_info(records, changed_layers=[True, False])
 
-    assert all("noop" not in record for record in packed)
-    assert "route_only" not in packed[0]
-    assert packed[1]["route_only"] is True
-    assert "send_all" not in packed[1]
-    assert "maps_all" not in packed[1]
-    assert packed[1]["layer_id"] == 1
+    assert "noop" not in packed[0]
+    assert packed[1] == {"noop": True, "layer_id": 1}
 
 
 def test_global_pool_migration_always_uses_home_rank_source():
@@ -234,7 +230,7 @@ def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
-    suite.addTest(unittest.FunctionTestCase(test_global_pool_restores_unchanged_layer_routes_during_changed_cycle))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle))
     suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_always_uses_home_rank_source))
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))

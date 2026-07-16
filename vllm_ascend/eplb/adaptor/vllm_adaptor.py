@@ -278,10 +278,17 @@ class VllmEplbAdaptor:
         if self.log2phy_map_per_layer[layer_id] is not None:
             self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
 
-    def suspend_global_pool_routes(self):
+    def suspend_global_pool_routes(self, moe_layer_ids=None):
         if not self.craft_global_pool_enabled:
             return
-        for layer_id in range(self.num_dense_layers, self.model.config.num_hidden_layers):
+        if moe_layer_ids is None:
+            layer_ids = range(self.num_dense_layers, self.model.config.num_hidden_layers)
+        else:
+            layer_ids = (
+                self.num_dense_layers + layer_id
+                for layer_id in sorted(set(moe_layer_ids))
+            )
+        for layer_id in layer_ids:
             experts = self.model.model.layers[layer_id].mlp.experts
             main_only_route = generate_craft_route_map(
                 experts.global_expert_map,

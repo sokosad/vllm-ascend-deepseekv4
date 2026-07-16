@@ -111,23 +111,6 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         self.assertEqual(selected, [None])
 
-    def test_select_rank_update_info_preserves_route_only_layer(self):
-        self.updator.rank_in_group = 2
-        selected = self.updator._select_rank_update_info(
-            [
-                {
-                    "log2phy_map": [[0, -2]],
-                    "layer_id": 3,
-                    "route_only": True,
-                }
-            ]
-        )
-
-        self.assertEqual(
-            selected,
-            [{"route_only": True, "log2phy_map": [[0, -2]], "layer_id": 3}],
-        )
-
     def test_unchanged_cycle_finishes_without_layer_updates(self):
         self.updator.cur_iterations = (
             self.updator.expert_heat_collection_interval
@@ -165,27 +148,6 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         self.assertEqual(self.updator.cur_iterations, first_update_iteration + 1)
         self.loader.generate_expert_d2d_transfer_task.assert_not_called()
-        self.loader.update_expert_map_and_weight.assert_not_called()
-
-    def test_global_pool_route_only_layer_skips_weight_transfer(self):
-        first_update_iteration = (
-            self.updator.expert_heat_collection_interval
-            + self.updator.algorithm_execution_interval
-        )
-        self.updator.cur_iterations = first_update_iteration
-        self.updator.craft_global_pool_plan = True
-        self.updator.update_info_all = [
-            {"route_only": True, "log2phy_map": [[0, -2]], "layer_id": 0}
-        ]
-
-        self.updator.forward_before()
-        self.updator.forward_end()
-
-        self.assertEqual(self.updator.cur_iterations, first_update_iteration + 1)
-        self.adaptor.suspend_global_pool_routes.assert_called_once()
-        self.adaptor.do_update_log2phy_map.assert_called_once()
-        self.loader.generate_expert_d2d_transfer_task.assert_not_called()
-        self.loader.asyn_expert_weight_transfer.assert_not_called()
         self.loader.update_expert_map_and_weight.assert_not_called()
 
     def test_last_unchanged_layer_logs_craft_cycle_completion(self):
@@ -292,6 +254,24 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         self.assertEqual(args[1], [(0, 3)])
         self.assertEqual(args[3], 3)
         self.loader.asyn_expert_weight_transfer.assert_called_once()
+
+    def test_global_pool_suspends_only_changed_layer_routes(self):
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            + 1
+        )
+        self.updator.craft_global_pool_plan = True
+        self.updator.update_info_all = [
+            None,
+            ([], [], [0, 1], [[0, 1]], 1),
+            None,
+            ([], [], [0, 1], [[0, 1]], 3),
+        ]
+
+        self.updator.forward_before()
+
+        self.adaptor.suspend_global_pool_routes.assert_called_once_with([1, 3])
 
     def test_policy2_consumes_rank_local_plan_with_original_pop_order(self):
         self.updator.full_rank_plan = False

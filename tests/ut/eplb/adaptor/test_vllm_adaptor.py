@@ -83,6 +83,24 @@ class TestVllmAdaptor(unittest.TestCase):
         self.assertIs(adaptor.log2phy_map_per_layer[3], captured_log2phy)
         self.assertTrue(torch.equal(captured_log2phy, updated_log2phy))
 
+    @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.generate_craft_route_map")
+    def test_suspend_global_pool_routes_limits_updates_to_changed_layers(self, mock_route):
+        adaptor = object.__new__(VllmEplbAdaptor)
+        adaptor.craft_global_pool_enabled = True
+        adaptor.num_dense_layers = 2
+        adaptor.model = MagicMock()
+        adaptor.model.config.num_hidden_layers = 6
+        for layer_id in range(2, 6):
+            experts = adaptor.model.model.layers[layer_id].mlp.experts
+            experts.local_num_experts = 33
+        adaptor.do_update_log2phy_map = MagicMock()
+        mock_route.return_value = torch.zeros((256, 9), dtype=torch.int32)
+
+        adaptor.suspend_global_pool_routes([3, 1, 3])
+
+        updated_layers = [call.args[0] for call in adaptor.do_update_log2phy_map.call_args_list]
+        self.assertEqual(updated_layers, [3, 5])
+
     def test_expert_cost_metadata_uses_actual_tensor_sizes(self):
         adaptor = object.__new__(VllmEplbAdaptor)
         adaptor.num_dense_layers = 1
