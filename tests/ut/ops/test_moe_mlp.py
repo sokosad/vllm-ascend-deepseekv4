@@ -12,8 +12,10 @@ from vllm_ascend.ops.fused_moe.moe_mlp import (
 )
 from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendFusedMoE,
+    _copy_to_craft_graph_buffer,
     _craft_graph_buffer,
     _is_craft_pool_graph_capturing,
+    _is_craft_pool_graph_mode,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
@@ -114,7 +116,6 @@ class TestCraftPoolSplitHelpers(unittest.TestCase):
         layer = Layer()
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"}),
-            patch("vllm_ascend.ops.fused_moe.fused_moe._is_craft_pool_graph_mode", return_value=True),
             patch("vllm_ascend.ops.fused_moe.fused_moe._EXTRA_CTX") as extra_ctx,
         ):
             extra_ctx.moe_comm_type = MoECommType.FUSED_MC2
@@ -123,6 +124,22 @@ class TestCraftPoolSplitHelpers(unittest.TestCase):
             extra_ctx.graph_buffer_warmup = False
 
             self.assertFalse(_is_craft_pool_graph_capturing(layer))
+
+    def test_fused_mc2_does_not_retain_pool_graph_shadow_buffer(self):
+        class Layer:
+            craft_pool_enabled = True
+
+        layer = Layer()
+        value = torch.randn(2, 4)
+        with (
+            patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"}),
+            patch("vllm_ascend.ops.fused_moe.fused_moe._EXTRA_CTX") as extra_ctx,
+        ):
+            extra_ctx.moe_comm_type = MoECommType.FUSED_MC2
+
+            self.assertFalse(_is_craft_pool_graph_mode(layer))
+            self.assertIs(_copy_to_craft_graph_buffer(layer, "routed", value), value)
+            self.assertFalse(hasattr(layer, "_craft_graph_routed_buffers"))
 
     def test_graph_buffer_is_zero_initialized(self):
         class Layer:

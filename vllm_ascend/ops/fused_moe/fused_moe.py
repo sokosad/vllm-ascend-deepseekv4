@@ -93,6 +93,14 @@ def _coerce_bool(value) -> bool:
 def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
     if not bool(getattr(layer, "craft_pool_enabled", False)):
         return False
+    # Fused MC2 executes the real MoE op during capture, so its graph already
+    # owns stable outputs. Per-layer shadow buffers only duplicate those
+    # outputs for every capture shape and retain substantial HBM.
+    if (
+        envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+        and getattr(_EXTRA_CTX, "moe_comm_type", None) == MoECommType.FUSED_MC2
+    ):
+        return False
     try:
         if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
             return True
@@ -107,11 +115,6 @@ def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
 
 def _is_craft_pool_graph_capturing(layer: torch.nn.Module) -> bool:
     if not _is_craft_pool_graph_mode(layer):
-        return False
-    if (
-        envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
-        and getattr(_EXTRA_CTX, "moe_comm_type", None) == MoECommType.FUSED_MC2
-    ):
         return False
     try:
         return bool(
