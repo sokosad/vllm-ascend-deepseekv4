@@ -6,6 +6,7 @@ CARDS=${CARDS:-0,1,2,3,4,5,6,7}
 DP=${DP:-2}
 TP=${TP:-4}
 POOL_SIZE=${POOL_SIZE:-1}
+GLOBAL_POOL_SIZE=${GLOBAL_POOL_SIZE:-0}
 HEAT=${HEAT:-60}
 ALGO=${ALGO:-10}
 CRAFT_MIN_HOTNESS_DELTA=${CRAFT_MIN_HOTNESS_DELTA:-0.05}
@@ -26,6 +27,20 @@ fi
 
 EP_SIZE=$((DP * TP))
 NUM_REDUNDANT=$((POOL_SIZE * EP_SIZE))
+if (( GLOBAL_POOL_SIZE > 0 )); then
+  if (( POOL_SIZE > 0 )); then
+    echo "GLOBAL_POOL_SIZE conflicts with POOL_SIZE; set POOL_SIZE=0 for the global pool." >&2
+    exit 2
+  fi
+  if (( GLOBAL_POOL_SIZE % EP_SIZE != 0 )); then
+    echo "GLOBAL_POOL_SIZE must be divisible by EP size $EP_SIZE." >&2
+    exit 2
+  fi
+  POOL_CONFIG='"craft_global_pool_size":'"$GLOBAL_POOL_SIZE"
+  NUM_REDUNDANT=0
+else
+  POOL_CONFIG='"num_redundant_experts":'"$NUM_REDUNDANT"',"craft_pool_size":'"$POOL_SIZE"
+fi
 
 export ASCEND_RT_VISIBLE_DEVICES="$CARDS"
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:${LD_PRELOAD:-}
@@ -45,12 +60,12 @@ ADDITIONAL_CONFIG=$(printf '%s' \
   '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false,"fuse_norm_quant":false},' \
   '"enable_cpu_binding":"true","multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false,' \
   '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":4,' \
-  '"num_redundant_experts":'"$NUM_REDUNDANT"',"craft_pool_size":'"$POOL_SIZE"',' \
+  "$POOL_CONFIG," \
   '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"',' \
   '"craft_pool_min_hotness_delta":'"$CRAFT_MIN_HOTNESS_DELTA"',' \
   '"craft_pool_min_improvement":'"$CRAFT_MIN_IMPROVEMENT"'}}')
 
-echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE heat=$HEAT algo=$ALGO min_hotness_delta=$CRAFT_MIN_HOTNESS_DELTA min_improvement=$CRAFT_MIN_IMPROVEMENT fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
+echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE global_pool_size=$GLOBAL_POOL_SIZE heat=$HEAT algo=$ALGO min_hotness_delta=$CRAFT_MIN_HOTNESS_DELTA min_improvement=$CRAFT_MIN_IMPROVEMENT fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
 echo "[CRAFT] additional_config=$ADDITIONAL_CONFIG"
 
 exec vllm serve "$MODEL_PATH" \
