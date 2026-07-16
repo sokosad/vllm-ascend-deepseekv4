@@ -26,6 +26,7 @@ class TestVllmAdaptor(unittest.TestCase):
             experts = self.model.model.layers[layer_idx].mlp.experts
             experts.local_num_experts = 2
             experts.craft_pool_enabled = False
+            experts.craft_global_pool_enabled = False
             experts.quant_type = QuantType.W8A8
 
         self.mock_rank = patch("vllm_ascend.eplb.adaptor.vllm_adaptor.dist.get_rank", return_value=0).start()
@@ -93,6 +94,10 @@ class TestVllmAdaptor(unittest.TestCase):
         for layer_id in range(2, 6):
             experts = adaptor.model.model.layers[layer_id].mlp.experts
             experts.local_num_experts = 33
+            experts.local_num_experts_main = 32
+            experts.global_expert_map = torch.tensor(
+                [[0, 1, -1, -1], [-1, -1, 0, 1]], dtype=torch.int32
+            )
         adaptor.do_update_log2phy_map = MagicMock()
         mock_route.return_value = torch.zeros((256, 9), dtype=torch.int32)
 
@@ -100,6 +105,26 @@ class TestVllmAdaptor(unittest.TestCase):
 
         updated_layers = [call.args[0] for call in adaptor.do_update_log2phy_map.call_args_list]
         self.assertEqual(updated_layers, [3, 5])
+
+    def test_suspend_global_pool_routes_removes_pool_candidates(self):
+        adaptor = object.__new__(VllmEplbAdaptor)
+        adaptor.craft_global_pool_enabled = True
+        adaptor.num_dense_layers = 0
+        adaptor.model = MagicMock()
+        adaptor.model.config.num_hidden_layers = 1
+        experts = adaptor.model.model.layers[0].mlp.experts
+        experts.local_num_experts = 3
+        experts.local_num_experts_main = 2
+        experts.global_expert_map = torch.tensor(
+            [[0, 1, -1, 2], [-1, -1, 0, 1]], dtype=torch.int32
+        )
+        adaptor.do_update_log2phy_map = MagicMock()
+
+        adaptor.suspend_global_pool_routes([0])
+
+        route = adaptor.do_update_log2phy_map.call_args.args[1]
+        self.assertEqual(route[3, 0].item(), 4)
+        self.assertNotIn(2, route[3, :-1].tolist())
 
     def test_expert_cost_metadata_uses_actual_tensor_sizes(self):
         adaptor = object.__new__(VllmEplbAdaptor)

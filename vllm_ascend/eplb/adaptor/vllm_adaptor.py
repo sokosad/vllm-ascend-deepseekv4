@@ -290,8 +290,12 @@ class VllmEplbAdaptor:
             )
         for layer_id in layer_ids:
             experts = self.model.model.layers[layer_id].mlp.experts
+            main_only_expert_map = experts.global_expert_map.clone()
+            main_only_expert_map[
+                main_only_expert_map >= experts.local_num_experts_main
+            ] = -1
             main_only_route = generate_craft_route_map(
-                experts.global_expert_map,
+                main_only_expert_map,
                 local_slots=experts.local_num_experts,
             )
             self.do_update_log2phy_map(layer_id, main_only_route)
