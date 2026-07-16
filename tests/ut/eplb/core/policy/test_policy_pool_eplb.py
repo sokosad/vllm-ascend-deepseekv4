@@ -56,6 +56,15 @@ def test_pool_policy_accumulates_small_hotness_changes_before_recompute():
     assert not policy._should_skip_layer(0, np.array([60.0, 40.0]))
 
 
+def test_pool_policy_ignores_sampling_volume_changes():
+    policy = PoolBalanceEplb(DynamicConfig())
+    policy.min_hotness_delta = 0.05
+
+    assert not policy._should_skip_layer(0, np.array([90.0, 10.0]))
+    assert policy._should_skip_layer(0, np.array([9000.0, 1000.0]))
+    assert not policy._should_skip_layer(0, np.array([70.0, 30.0]))
+
+
 def test_pool_policy_skips_migration_when_improvement_is_too_small():
     policy = PoolBalanceEplb(DynamicConfig())
     policy.min_hotness_delta = 0.0

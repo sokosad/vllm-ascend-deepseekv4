@@ -105,15 +105,20 @@ class PoolBalanceEplb(EplbPolicy):
     def _should_skip_layer(self, layer_id, hotness):
         if self.min_hotness_delta <= 0:
             return False
+        total_hotness = float(np.sum(np.abs(hotness)))
+        normalized_hotness = (
+            hotness / total_hotness
+            if total_hotness > 0
+            else np.zeros_like(hotness, dtype=np.float64)
+        )
         last_hotness = self._last_layer_hotness.get(layer_id)
-        if last_hotness is None or last_hotness.shape != hotness.shape:
-            self._last_layer_hotness[layer_id] = hotness.copy()
+        if last_hotness is None or last_hotness.shape != normalized_hotness.shape:
+            self._last_layer_hotness[layer_id] = normalized_hotness.copy()
             return False
-        scale = max(float(np.sum(np.abs(last_hotness))), float(np.sum(np.abs(hotness))), 1.0)
-        delta = float(np.sum(np.abs(hotness - last_hotness))) / scale
+        delta = float(np.sum(np.abs(normalized_hotness - last_hotness)))
         if delta < self.min_hotness_delta:
             return True
-        self._last_layer_hotness[layer_id] = hotness.copy()
+        self._last_layer_hotness[layer_id] = normalized_hotness.copy()
         return False
 
     def _desired_pool_sets(self, home, hotness, pool_size):
