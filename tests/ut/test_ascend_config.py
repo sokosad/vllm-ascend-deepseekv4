@@ -18,7 +18,7 @@ from unittest.mock import patch
 from vllm.config import VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import EplbConfig, clear_ascend_config, get_ascend_config, init_ascend_config
 
 
 class TestAscendConfig(TestBase):
@@ -189,6 +189,26 @@ class TestAscendConfig(TestBase):
 
         with self.assertRaises(ValueError):
             init_ascend_config(test_vllm_config)
+
+    @patch.dict("os.environ", {"DYNAMIC_EPLB": "true"})
+    def test_eplb_config_accepts_global_pool_total(self):
+        config = EplbConfig({
+            "dynamic_eplb": True,
+            "eplb_policy_type": 4,
+            "craft_global_pool_size": 16,
+        })
+
+        self.assertEqual(config.craft_global_pool_size, 16)
+
+    @patch.dict("os.environ", {"DYNAMIC_EPLB": "true"})
+    def test_eplb_config_rejects_global_pool_conflicts(self):
+        with self.assertRaises(ValueError):
+            EplbConfig({
+                "dynamic_eplb": True,
+                "eplb_policy_type": 4,
+                "craft_global_pool_size": 16,
+                "craft_pool_size": 1,
+            })
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")

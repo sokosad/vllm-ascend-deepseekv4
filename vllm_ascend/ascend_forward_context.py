@@ -262,6 +262,13 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         getattr(eplb_config, "craft_pool_size", envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE),
     )
     craft_pool_size = int(craft_pool_size or 0)
+    craft_global_pool_size = int(
+        ascend_eplb_config.get(
+            "craft_global_pool_size",
+            getattr(eplb_config, "craft_global_pool_size", 0),
+        )
+        or 0
+    )
     craft_pool_layer_sizes = ascend_eplb_config.get(
         "craft_pool_layer_sizes",
         getattr(eplb_config, "craft_pool_layer_sizes", None),
@@ -286,7 +293,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     )
     policy4_fused_pool = (
         eplb_policy_type == 4
-        and (craft_pool_size > 0 or expert_map_pool_mode)
+        and (craft_pool_size > 0 or craft_global_pool_size > 0 or expert_map_pool_mode)
         and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
     )
     if craft_pool_mode and not policy4_fused_pool:

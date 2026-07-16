@@ -24,6 +24,7 @@ from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_ep_group
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.eplb.global_expert_pool import bind_global_craft_expert_pool
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -159,6 +160,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
 
     # Declare the quantization type for this scheme
     quant_type: QuantType = QuantType.W8A8
+    supports_global_craft_pool = True
 
     def __init__(self):
         self.ep_group = get_ep_group()
@@ -244,11 +246,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             )
 
         pool_size = int(getattr(layer, "local_num_experts_pool", 0) or 0)
+        global_craft_pool = bool(getattr(layer, "craft_global_pool_enabled", False))
         compact_craft_pool = (
             self.dynamic_eplb
             and pool_size > 0
-            and hasattr(layer, "w13_weight_with_pool")
-            and hasattr(layer, "w2_weight_with_pool")
+            and (
+                global_craft_pool
+                or (
+                    hasattr(layer, "w13_weight_with_pool")
+                    and hasattr(layer, "w2_weight_with_pool")
+                )
+            )
         )
 
         if enable_force_load_balance and compact_craft_pool:
@@ -300,9 +308,25 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         fused_scale_flag = (
             _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
         )
-        effective_dynamic_eplb = self.dynamic_eplb and not compact_craft_pool
+        effective_dynamic_eplb = self.dynamic_eplb and (
+            global_craft_pool or not compact_craft_pool
+        )
 
-        if compact_craft_pool:
+        if global_craft_pool:
+            pool = layer.craft_global_expert_pool.parameters
+            w1 = layer.w13_weight_list + pool["w13_weight_list"]
+            w1_scale = (
+                layer.fused_w1_scale_list + pool["fused_w1_scale_list"]
+                if fused_scale_flag
+                else layer.w13_weight_scale_fp32_list + pool["w13_weight_scale_fp32_list"]
+            )
+            w2 = layer.w2_weight_list + pool["w2_weight_list"]
+            w2_scale = (
+                layer.fused_w2_scale_list + pool["fused_w2_scale_list"]
+                if fused_scale_flag
+                else layer.w2_weight_scale_list + pool["w2_weight_scale_list"]
+            )
+        elif compact_craft_pool:
             w1 = [layer.w13_weight_with_pool]
             w1_scale = (
                 [layer.fused_w1_scale_with_pool]
@@ -321,7 +345,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale = [layer.fused_w1_scale] if fused_scale_flag else [layer.w13_weight_scale_fp32]
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
-        if pool_size > 0 and not compact_craft_pool:
+        if pool_size > 0 and not compact_craft_pool and not global_craft_pool:
             w1_pool = [layer.w13_weight_pool]
             w1_scale_pool = [layer.fused_w1_scale_pool] if fused_scale_flag else [layer.w13_weight_scale_fp32_pool]
             w2_pool = [layer.w2_weight_pool]
@@ -391,7 +415,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
         pool_size = getattr(layer, "local_num_experts_pool", 0)
-        if pool_size > 0:
+        global_craft_pool = bool(getattr(layer, "craft_global_pool_enabled", False))
+        if pool_size > 0 and not global_craft_pool:
             main_size = _resolve_craft_pool_split(layer, pool_size)
             layer.w13_weight_with_pool = layer.w13_weight.data
             layer.w2_weight_with_pool = layer.w2_weight.data
@@ -418,7 +443,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight_offset.data = layer.w2_weight_offset_with_pool[:main_size]
 
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-            if pool_size > 0:
+            if pool_size > 0 and not global_craft_pool:
                 total_experts = main_size + pool_size
                 layer.fused_w1_scale_with_pool = _reshape_fused_expert_scale(
                     scale_from_float_to_int64(layer.w13_weight_scale_with_pool), total_experts
@@ -435,7 +460,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 layer.fused_w2_scale = scale_from_float_to_int64(layer.w2_weight_scale.data)
 
         if self.dynamic_eplb:
-            clone_expert_views = pool_size <= 0
+            clone_expert_views = pool_size <= 0 or global_craft_pool
             layer.w13_weight_list = [
                 weight.clone() if clone_expert_views else weight for weight in layer.w13_weight.data.unbind(dim=0)
             ]
@@ -450,7 +475,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 weight.clone() if clone_expert_views else weight
                 for weight in layer.w2_weight_scale.data.unbind(dim=0)
             ]
-            if pool_size > 0:
+            if pool_size > 0 and not global_craft_pool:
                 layer.w13_weight_pool_list = [weight for weight in layer.w13_weight_pool.data.unbind(dim=0)]
                 layer.w2_weight_pool_list = [weight for weight in layer.w2_weight_pool.data.unbind(dim=0)]
                 layer.w13_weight_scale_fp32_pool_list = [
@@ -468,7 +493,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                     weight.clone() if clone_expert_views else weight
                     for weight in layer.fused_w2_scale.view(len(layer.w2_weight_list), -1).data.unbind(dim=0)
                 ]
-                if pool_size > 0:
+                if pool_size > 0 and not global_craft_pool:
                     layer.fused_w1_scale_pool_list = [
                         weight
                         for weight in layer.fused_w1_scale_pool.view(pool_size, -1).data.unbind(dim=0)
@@ -477,6 +502,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                         weight
                         for weight in layer.fused_w2_scale_pool.view(pool_size, -1).data.unbind(dim=0)
                     ]
+            if global_craft_pool:
+                parameter_names = [
+                    "w13_weight_list",
+                    "w2_weight_list",
+                    "w13_weight_scale_fp32_list",
+                    "w2_weight_scale_list",
+                ]
+                if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+                    parameter_names.extend(["fused_w1_scale_list", "fused_w2_scale_list"])
+                layer.craft_global_pool_parameter_names = parameter_names
+                bind_global_craft_expert_pool(layer, pool_size, parameter_names)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale

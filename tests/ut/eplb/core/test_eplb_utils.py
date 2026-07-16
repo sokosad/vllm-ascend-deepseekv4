@@ -11,6 +11,8 @@ from vllm_ascend.ascend_config import EplbConfig, init_ascend_config
 from vllm_ascend.eplb.core.eplb_utils import (
     generate_craft_route_map,
     generate_pool_log2phy_map,
+    get_craft_global_pool_size_per_rank,
+    get_configured_craft_global_pool_size,
     get_configured_craft_pool_size,
     init_eplb_config,
 )
@@ -115,6 +117,39 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(get_configured_craft_pool_size(eplb_config, 0), 0)
         self.assertEqual(get_configured_craft_pool_size(eplb_config, 1), 2)
         self.assertEqual(get_configured_craft_pool_size(eplb_config, 4), 0)
+
+    def test_init_eplb_config_with_global_craft_pool(self):
+        self.vllm_config.additional_config = {
+            "refresh": True,
+            "eplb_config": {
+                "dynamic_eplb": True,
+                "eplb_policy_type": 4,
+                "craft_global_pool_size": 4,
+            },
+        }
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        global_map, expert_map, log2phy, redundant_experts = init_eplb_config(
+            eplb_config, 0, self.moe_config
+        )
+
+        self.assertEqual(get_configured_craft_global_pool_size(eplb_config), 4)
+        self.assertEqual(get_craft_global_pool_size_per_rank(eplb_config, 2), 2)
+        self.assertEqual(redundant_experts, 0)
+        self.assertEqual(int((expert_map >= 0).sum().item()), 4)
+        self.assertEqual(global_map.shape, torch.Size([2, 8]))
+        self.assertEqual(log2phy.shape, torch.Size([8, 3]))
+        self.assertEqual(log2phy[4, 0].item(), 6)
+
+    def test_global_craft_pool_requires_ep_divisibility(self):
+        eplb_config = EplbConfig({
+            "dynamic_eplb": True,
+            "eplb_policy_type": 4,
+            "craft_global_pool_size": 3,
+        })
+
+        with self.assertRaises(ValueError):
+            get_craft_global_pool_size_per_rank(eplb_config, 2)
 
     def test_init_eplb_config_with_per_layer_craft_pool_size(self):
         self.vllm_config.additional_config = {

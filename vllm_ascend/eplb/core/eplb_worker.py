@@ -31,6 +31,7 @@ from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFac
 
 
 CRAFT_POOL_POLICY_CONFIG_FIELDS = (
+    "craft_global_pool_size",
     "craft_pool_top_m",
     "craft_pool_top_m_factor",
     "craft_pool_min_hotness_delta",
@@ -56,6 +57,9 @@ class EplbWorker:
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
+        self.craft_global_pool_size = max(
+            0, int(getattr(eplb_config, "craft_global_pool_size", 0) or 0)
+        )
         self.full_rank_plan = policy_type == 4 or self.metro_routing
         self.expert_heat_collection_interval = max(
             1, int(getattr(eplb_config, "expert_heat_collection_interval", 1))
@@ -96,6 +100,17 @@ class EplbWorker:
             self.old_expert_maps = self.get_init_expert_maps()
             if self.old_expert_maps is not None:
                 self.num_local_experts = self._max_local_experts(self.old_expert_maps)
+                if self.craft_global_pool_size > 0:
+                    num_ranks = int(self.old_expert_maps.shape[1])
+                    num_logical_experts = int(self.old_expert_maps.shape[2])
+                    if self.craft_global_pool_size % num_ranks != 0:
+                        raise ValueError(
+                            "craft_global_pool_size must be divisible by the EPLB rank count."
+                        )
+                    self.num_local_experts = (
+                        num_logical_experts // num_ranks
+                        + self.craft_global_pool_size // num_ranks
+                    )
             else:
                 raise ValueError("Failed to get expert_maps from shared_dict.")
 
@@ -128,7 +143,11 @@ class EplbWorker:
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
-        if self.policy_type == 4 and hotness is not None:
+        if (
+            self.policy_type == 4
+            and getattr(self, "craft_global_pool_size", 0) == 0
+            and hotness is not None
+        ):
             new_placement = self._apply_craft_migration_cost_gate(
                 old_placement, new_placement, hotness
             )
@@ -338,6 +357,15 @@ class EplbWorker:
                     new_placement[layer_id] = old_placement[layer_id]
                     break
 
+        if getattr(self, "craft_global_pool_size", 0) > 0:
+            valid = new_placement[new_placement >= 0]
+            num_logical_experts = int(valid.max().item()) + 1 if valid.numel() else 0
+            pool_start = num_logical_experts // num_ranks if num_ranks else 0
+            pool_owners = torch.sum(new_placement[:, :, pool_start:] >= 0, dim=0)
+            if torch.any(pool_owners > 1):
+                logger.error("CRAFT global pool slot is assigned to more than one layer")
+                new_placement.copy_(old_placement)
+
     @staticmethod
     def _check_expert_placement_legacy(old_placement, new_placement):
         num_layers = old_placement.shape[0]
@@ -404,7 +432,12 @@ class EplbWorker:
                 if dst_rank_id not in expert_recv_info_this_layer:
                     expert_recv_info_this_layer[dst_rank_id] = []
 
-                if not torch.isin(torch.tensor(expert_id), experts_to_send).any():
+                if getattr(self, "craft_global_pool_size", 0) > 0:
+                    num_logical_experts = current_expert_maps_this_layer.shape[1]
+                    main_experts_per_rank = num_logical_experts // current_expert_maps_this_layer.shape[0]
+                    src_rank_id = expert_id // main_experts_per_rank
+                    candidate_src_rank_indices = torch.tensor([src_rank_id])
+                elif not torch.isin(torch.tensor(expert_id), experts_to_send).any():
                     # if expert_id are not sent out from any npu, it will be copied from one npu holding this expert
                     candidate_src_rank_indices = torch.where(current_expert_maps_this_layer[:, expert_id] != -1)[0]
                 else:
@@ -522,12 +555,22 @@ class EplbWorker:
         packed_update_info = []
 
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
-            if changed_layers is not None and not changed_layers[layer_id]:
+            if (
+                changed_layers is not None
+                and not changed_layers[layer_id]
+                and (
+                    getattr(self, "craft_global_pool_size", 0) == 0
+                    or not any(changed_layers)
+                )
+            ):
                 packed_update_info.append({"noop": True, "layer_id": layer_id})
                 continue
             num_ranks = int(new_expert_map.shape[0])
             if self.policy_type == 4:
-                shared_log2phy_map = generate_craft_route_map(new_expert_map).numpy().tolist()
+                shared_log2phy_map = generate_craft_route_map(
+                    new_expert_map,
+                    local_slots=getattr(self, "num_local_experts", None),
+                ).numpy().tolist()
                 log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
             elif self.full_rank_plan:
                 shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()

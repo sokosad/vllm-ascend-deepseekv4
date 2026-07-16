@@ -82,3 +82,25 @@ def test_pool_policy_skips_migration_when_improvement_is_too_small():
 
     assert not changed
     assert torch.equal(torch.tensor(updated), current)
+
+
+def test_global_pool_assigns_each_physical_slot_to_one_layer():
+    config = DynamicConfig()
+    config.craft_global_pool_size = 2
+    config.craft_pool_min_hotness_delta = 0.0
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([
+        [[0, 1, -1], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, -1]],
+    ])
+    workload = torch.tensor([
+        [[10, 1, 0], [9, 1, 0]],
+        [[100, 1, 0], [2, 1, 0]],
+    ])
+
+    changed, _, updated = policy.rebalance_experts(current, workload)
+    updated = torch.tensor(updated)
+
+    assert changed
+    assert torch.all(torch.sum(updated[:, :, 2:] >= 0, dim=0) == 1)
+    assert updated[1, 1, 2].item() == 0

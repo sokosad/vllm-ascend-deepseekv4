@@ -44,7 +44,17 @@ class PoolBalanceEplb(EplbPolicy):
             0.0,
             _get_float_config(config, "craft_pool_min_improvement", "CRAFT_POOL_MIN_IMPROVEMENT", 0.01),
         )
+        self.global_pool_total_size = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_global_pool_size",
+                "VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",
+                0,
+            ),
+        )
         self._last_layer_hotness: dict[int, np.ndarray] = {}
+        self._last_global_hotness: np.ndarray | None = None
 
     @staticmethod
     def _infer_pool_start(current_expert_table: torch.Tensor) -> int:
@@ -229,12 +239,236 @@ class PoolBalanceEplb(EplbPolicy):
             new_rank_slots[slot_id] = expert_id
         return new_rank_slots
 
+    def _global_hotness_changed(self, hotness: np.ndarray) -> bool:
+        if self.min_hotness_delta <= 0:
+            return True
+        layer_totals = np.sum(np.abs(hotness), axis=1, keepdims=True)
+        normalized = np.divide(
+            hotness,
+            layer_totals,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=layer_totals > 0,
+        )
+        previous = self._last_global_hotness
+        self._last_global_hotness = normalized.copy()
+        if previous is None or previous.shape != normalized.shape:
+            return True
+        layer_deltas = np.sum(np.abs(normalized - previous), axis=1)
+        max_delta = float(layer_deltas.max()) if layer_deltas.size else 0.0
+        return max_delta >= self.min_hotness_delta
+
+    def _global_candidates(self, hotness: np.ndarray, total_slots: int) -> list[tuple[int, int]]:
+        flat = hotness.reshape(-1)
+        positive = np.flatnonzero(flat > 0)
+        if positive.size == 0:
+            return [
+                (layer_id, expert_id)
+                for layer_id in range(hotness.shape[0])
+                for expert_id in range(hotness.shape[1])
+            ]
+        top_m = self.candidate_top_m
+        if top_m <= 0:
+            top_m = max(total_slots * self.candidate_factor, total_slots)
+        top_m = min(top_m, positive.size)
+        selected = positive[np.argpartition(-flat[positive], top_m - 1)[:top_m]]
+        selected = selected[np.argsort(-flat[selected], kind="stable")]
+        num_experts = hotness.shape[1]
+        return [(int(index // num_experts), int(index % num_experts)) for index in selected]
+
+    @staticmethod
+    def _layer_rank_loads(home, assignments, hotness, layer_id):
+        copy_counts = np.ones(len(hotness), dtype=np.float64)
+        for rank_items in assignments:
+            for item_layer, expert_id in rank_items:
+                if item_layer == layer_id:
+                    copy_counts[expert_id] += 1.0
+        per_copy = np.divide(
+            hotness,
+            copy_counts,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=copy_counts > 0,
+        )
+        loads = []
+        for rank_id, home_experts in enumerate(home):
+            experts = set(home_experts)
+            experts.update(
+                expert_id
+                for item_layer, expert_id in assignments[rank_id]
+                if item_layer == layer_id
+            )
+            loads.append(sum(per_copy[expert_id] for expert_id in experts))
+        return np.asarray(loads, dtype=np.float64)
+
+    def _desired_global_assignments(self, home, hotness, pool_size):
+        num_layers, num_experts = hotness.shape
+        num_ranks = len(home[0])
+        total_slots = pool_size * num_ranks
+        candidates = self._global_candidates(hotness, total_slots)
+        candidate_mask = np.zeros((num_layers, num_experts), dtype=bool)
+        for layer_id, expert_id in candidates:
+            candidate_mask[layer_id, expert_id] = True
+
+        extra_copies = np.zeros((num_layers, num_experts), dtype=np.int64)
+        items = []
+        for _ in range(total_slots):
+            scores = np.divide(
+                hotness,
+                1 + extra_copies,
+                out=np.zeros_like(hotness, dtype=np.float64),
+                where=candidate_mask,
+            )
+            scores[~candidate_mask] = -1.0
+            scores[extra_copies >= num_ranks - 1] = -1.0
+            flat_index = int(np.argmax(scores))
+            layer_id, expert_id = divmod(flat_index, num_experts)
+            if scores[layer_id, expert_id] < 0:
+                break
+            extra_copies[layer_id, expert_id] += 1
+            items.append((layer_id, expert_id, float(scores[layer_id, expert_id])))
+
+        assignments: list[list[tuple[int, int]]] = [[] for _ in range(num_ranks)]
+        for layer_id, expert_id, _ in sorted(items, key=lambda item: -item[2]):
+            loads = self._layer_rank_loads(home[layer_id], assignments, hotness[layer_id], layer_id)
+            eligible = [
+                rank_id
+                for rank_id in range(num_ranks)
+                if len(assignments[rank_id]) < pool_size
+                and expert_id not in home[layer_id][rank_id]
+                and (layer_id, expert_id) not in assignments[rank_id]
+            ]
+            if eligible:
+                rank_id = min(eligible, key=lambda rank: (loads[rank], rank))
+                assignments[rank_id].append((layer_id, expert_id))
+
+        all_candidates = [
+            (layer_id, expert_id)
+            for layer_id in range(num_layers)
+            for expert_id in range(num_experts)
+        ]
+        selected = set(candidates)
+        fallback_candidates = candidates + [item for item in all_candidates if item not in selected]
+        for rank_id in range(num_ranks):
+            while len(assignments[rank_id]) < pool_size:
+                added = False
+                for layer_id, expert_id in fallback_candidates:
+                    if (
+                        expert_id not in home[layer_id][rank_id]
+                        and (layer_id, expert_id) not in assignments[rank_id]
+                    ):
+                        assignments[rank_id].append((layer_id, expert_id))
+                        added = True
+                        break
+                if not added:
+                    raise ValueError(
+                        "CRAFT global pool cannot fill every rank slot without duplicating "
+                        f"a home expert: rank={rank_id}, pool_size={pool_size}."
+                    )
+        return assignments
+
+    @staticmethod
+    def _place_global_assignments(old_table, desired, pool_start, pool_size):
+        new_table = old_table.copy()
+        new_table[:, :, pool_start:] = -1
+        num_layers, num_ranks, _ = old_table.shape
+        for rank_id in range(num_ranks):
+            old_slots: list[tuple[int, int] | None] = []
+            for pool_slot in range(pool_size):
+                slot_id = pool_start + pool_slot
+                owners = [
+                    (layer_id, int(old_table[layer_id, rank_id, slot_id]))
+                    for layer_id in range(num_layers)
+                    if old_table[layer_id, rank_id, slot_id] >= 0
+                ]
+                if len(owners) > 1:
+                    raise ValueError(
+                        "CRAFT global pool slot has multiple layer owners: "
+                        f"rank={rank_id}, slot={pool_slot}, owners={owners}."
+                    )
+                old_slots.append(owners[0] if owners else None)
+
+            desired_set = set(desired[rank_id])
+            assigned = set()
+            free_slots = []
+            for pool_slot, old_item in enumerate(old_slots):
+                if old_item is not None and old_item in desired_set:
+                    layer_id, expert_id = old_item
+                    new_table[layer_id, rank_id, pool_start + pool_slot] = expert_id
+                    assigned.add(old_item)
+                else:
+                    free_slots.append(pool_slot)
+
+            missing = [item for item in desired[rank_id] if item not in assigned]
+            for pool_slot, (layer_id, expert_id) in zip(free_slots, missing):
+                new_table[layer_id, rank_id, pool_start + pool_slot] = expert_id
+        return new_table
+
+    @staticmethod
+    def _global_imbalance(table, hotness):
+        layer_ratios = []
+        for layer_id in range(table.shape[0]):
+            valid = table[layer_id] >= 0
+            counts = np.bincount(
+                table[layer_id][valid],
+                minlength=hotness.shape[1],
+            )
+            per_copy = np.divide(
+                hotness[layer_id],
+                counts,
+                out=np.zeros_like(hotness[layer_id], dtype=np.float64),
+                where=counts > 0,
+            )
+            rank_loads = np.asarray(
+                [per_copy[rank[rank >= 0]].sum() for rank in table[layer_id]],
+                dtype=np.float64,
+            )
+            mean_load = float(rank_loads.mean())
+            if mean_load > 0:
+                layer_ratios.append(float(rank_loads.max()) / mean_load)
+        return float(np.mean(layer_ratios)) if layer_ratios else 0.0
+
+    def _rebalance_global_pool(self, current_expert_table, expert_workload, pool_start):
+        old_table = current_expert_table.detach().cpu().numpy()
+        pool_size = old_table.shape[2] - pool_start
+        num_ranks = old_table.shape[1]
+        if pool_size <= 0 or pool_size * num_ranks != self.global_pool_total_size:
+            raise ValueError(
+                "CRAFT global pool table capacity mismatch: "
+                f"configured={self.global_pool_total_size}, table={pool_size * num_ranks}."
+            )
+        hotness = self._expert_hotness(current_expert_table, expert_workload)
+        if not self._global_hotness_changed(hotness):
+            return False, None, current_expert_table.tolist()
+        home = [
+            [
+                [int(expert_id) for expert_id in old_table[layer_id, rank_id, :pool_start] if expert_id >= 0]
+                for rank_id in range(num_ranks)
+            ]
+            for layer_id in range(old_table.shape[0])
+        ]
+        desired = self._desired_global_assignments(home, hotness, pool_size)
+        new_table = self._place_global_assignments(old_table, desired, pool_start, pool_size)
+        old_pool_active = bool(np.any(old_table[:, :, pool_start:] >= 0))
+        if old_pool_active and self.min_improvement > 0:
+            old_imbalance = self._global_imbalance(old_table, hotness)
+            new_imbalance = self._global_imbalance(new_table, hotness)
+            relative_improvement = (
+                (old_imbalance - new_imbalance) / old_imbalance
+                if old_imbalance > 0
+                else 0.0
+            )
+            if relative_improvement < self.min_improvement:
+                return False, None, current_expert_table.tolist()
+        changed = not np.array_equal(old_table, new_table)
+        return changed, None, new_table.tolist()
+
     def rebalance_experts(self, current_expert_table, expert_workload):
         if not torch.is_tensor(current_expert_table):
             current_expert_table = torch.tensor(current_expert_table)
         pool_start = self._infer_pool_start(current_expert_table)
         if pool_start <= 0:
             return False, None, current_expert_table.tolist()
+        if self.global_pool_total_size > 0:
+            return self._rebalance_global_pool(current_expert_table, expert_workload, pool_start)
 
         hotness = self._expert_hotness(current_expert_table, expert_workload)
         old_table = current_expert_table.detach().cpu().numpy()

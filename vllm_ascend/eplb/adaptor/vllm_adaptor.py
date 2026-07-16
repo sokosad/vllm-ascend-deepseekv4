@@ -24,6 +24,7 @@ from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.quantization.methods.base import QuantType
+from vllm_ascend.eplb.core.eplb_utils import generate_craft_route_map
 
 
 class VllmEplbAdaptor:
@@ -43,10 +44,24 @@ class VllmEplbAdaptor:
             getattr(self.model.model.layers[layer_idx].mlp.experts, "craft_pool_enabled", False)
             for layer_idx in self.num_local_experts_per_layer
         )
+        self.craft_global_pool_enabled = any(
+            getattr(self.model.model.layers[layer_idx].mlp.experts, "craft_global_pool_enabled", False)
+            for layer_idx in self.num_local_experts_per_layer
+        )
         self.expert_param_per_layer = dict()
         self.init_expert_param_per_layer()
 
-        num_buffer_tensor = self.num_local_experts
+        num_buffer_tensor = (
+            max(
+                (
+                    self.model.model.layers[layer_idx].mlp.experts.local_num_experts_pool
+                    for layer_idx in self.num_local_experts_per_layer
+                ),
+                default=0,
+            )
+            if self.craft_global_pool_enabled
+            else self.num_local_experts
+        )
         self.buffer_tensor_list: list[list[Any]] = [[] for _ in range(num_buffer_tensor)]
         self.init_buffer_tensor(num_buffer_tensor)
 
@@ -103,6 +118,9 @@ class VllmEplbAdaptor:
             self.expert_param_per_layer[layer_idx] = list()
             experts = self.model.model.layers[layer_idx].mlp.experts
             num_local_experts = self.num_local_experts_per_layer[layer_idx]
+            if getattr(experts, "craft_global_pool_enabled", False):
+                self._init_global_pool_expert_param_for_layer(layer_idx, experts)
+                continue
             if getattr(experts, "craft_pool_enabled", False):
                 self._init_pool_expert_param_for_layer(layer_idx, experts)
                 continue
@@ -117,6 +135,23 @@ class VllmEplbAdaptor:
                         self.param_dict["model.layers." + str(layer_idx) + ".mlp.experts." + name][local_expert_id]
                     )
                 self.expert_param_per_layer[layer_idx].append(per_expert_param)
+
+    def _init_global_pool_expert_param_for_layer(self, layer_idx, experts):
+        main_size = experts.local_num_experts_main
+        pool = experts.craft_global_expert_pool
+        for name in self.expert_weight_names:
+            param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"
+            self.param_dict[param_key] = getattr(experts, name)
+
+        for local_expert_id in range(experts.local_num_experts):
+            if local_expert_id < main_size:
+                params = [getattr(experts, name)[local_expert_id] for name in self.expert_weight_names]
+            else:
+                params = pool.parameters_for_slot(
+                    local_expert_id - main_size,
+                    self.expert_weight_names,
+                )
+            self.expert_param_per_layer[layer_idx].append(params)
 
     def _init_pool_expert_param_for_layer(self, layer_idx, experts):
         main_size = experts.local_num_experts_main
@@ -242,6 +277,17 @@ class VllmEplbAdaptor:
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
         if self.log2phy_map_per_layer[layer_id] is not None:
             self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
+
+    def suspend_global_pool_routes(self):
+        if not self.craft_global_pool_enabled:
+            return
+        for layer_id in range(self.num_dense_layers, self.model.config.num_hidden_layers):
+            experts = self.model.model.layers[layer_id].mlp.experts
+            main_only_route = generate_craft_route_map(
+                experts.global_expert_map,
+                local_slots=experts.local_num_experts,
+            )
+            self.do_update_log2phy_map(layer_id, main_only_route)
 
     def get_global_expert_map(self):
         all_layer_global_expert_map = []

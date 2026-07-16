@@ -48,6 +48,43 @@ def test_policy4_pack_update_info_marks_unchanged_layer_as_noop():
     assert packed == [{"noop": True, "layer_id": 0}]
 
 
+def test_global_pool_restores_unchanged_layer_routes_during_changed_cycle():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.full_rank_plan = True
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts = 3
+    expert_map = torch.tensor([[0, 1, -1, -1], [-1, -1, 0, 1]])
+    records = [({}, {}, expert_map, 0), ({}, {}, expert_map, 1)]
+
+    packed = worker.pack_update_info(records, changed_layers=[True, False])
+
+    assert all("noop" not in record for record in packed)
+    assert packed[1]["layer_id"] == 1
+
+
+def test_global_pool_migration_always_uses_home_rank_source():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.craft_global_pool_size = 3
+    current = torch.tensor([[
+        [-1, -1, -1, -1, 2, -1],
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, 0, 1],
+    ]])
+    updated = torch.tensor([[
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, 2, -1],
+        [-1, -1, -1, -1, 0, 1],
+    ]])
+
+    send, recv, _, _ = next(
+        worker.compose_expert_update_info_greedy(updated, current)
+    )
+
+    assert send == {2: [(1, 4)]}
+    assert recv == {1: [(2, 4)]}
+
+
 def test_policy2_pack_update_info_keeps_rank_local_plan():
     worker = EplbWorker.__new__(EplbWorker)
     worker.policy_type = 2
@@ -177,6 +214,8 @@ def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_restores_unchanged_layer_routes_during_changed_cycle))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_always_uses_home_rank_source))
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
     suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))

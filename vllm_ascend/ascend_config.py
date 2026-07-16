@@ -395,6 +395,7 @@ class EplbConfig:
         "eplb_policy_type": 1,
         "craft_pool_size": 0,
         "craft_pool_layer_sizes": None,
+        "craft_global_pool_size": 0,
         "craft_pool_top_m": 0,
         "craft_pool_top_m_factor": 4,
         "craft_pool_min_hotness_delta": 0.05,
@@ -426,6 +427,7 @@ class EplbConfig:
     def _apply_env_defaults(self, user_config: dict):
         env_defaults = {
             "craft_pool_size": (("VLLM_ASCEND_CRAFT_POOL_SIZE",), int),
+            "craft_global_pool_size": (("VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",), int),
             "craft_pool_top_m": (("CRAFT_POOL_TOP_M",), int),
             "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
@@ -475,6 +477,7 @@ class EplbConfig:
             "algorithm_execution_interval",
             "num_redundant_experts",
             "craft_pool_size",
+            "craft_global_pool_size",
             "craft_pool_max_payback_steps",
         ]:
             if not isinstance(self.config[key], int):
@@ -486,6 +489,7 @@ class EplbConfig:
         if not isinstance(self.config["metro_routing"], bool):
             raise TypeError("metro_routing must be a boolean")
         self._validate_craft_pool_layer_sizes()
+        self._validate_craft_global_pool_size()
         self._validate_craft_pool_policy_knobs()
         if self.config["dynamic_eplb"]:
             assert (
@@ -497,6 +501,7 @@ class EplbConfig:
         logger.info(f"The number of redundant experts is {self.config['num_redundant_experts']}")
         logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
         logger.info(f"The CRAFT pool layer sizes are {self.config['craft_pool_layer_sizes']}")
+        logger.info(f"The CRAFT global pool size is {self.config['craft_global_pool_size']}")
         logger.info(f"The CRAFT pool top-M candidate limit is {self.config['craft_pool_top_m']}")
         logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
         logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")
@@ -521,6 +526,23 @@ class EplbConfig:
                 raise TypeError("craft_pool_layer_sizes values must be integers")
             if pool_size < 0:
                 raise ValueError("craft_pool_layer_sizes values must be non-negative")
+
+    def _validate_craft_global_pool_size(self):
+        global_pool_size = self.config["craft_global_pool_size"]
+        if global_pool_size <= 0:
+            return
+        if self.config["craft_pool_size"] > 0:
+            raise ValueError("craft_global_pool_size conflicts with craft_pool_size.")
+        if self.config["craft_pool_layer_sizes"] is not None:
+            raise ValueError("craft_global_pool_size conflicts with craft_pool_layer_sizes.")
+        if self.config["num_redundant_experts"] > 0:
+            raise ValueError("craft_global_pool_size conflicts with num_redundant_experts.")
+        if self.config["expert_map_path"] is not None:
+            raise ValueError("craft_global_pool_size does not support expert_map_path.")
+        if self.config["expert_map_record_path"] is not None:
+            raise ValueError("craft_global_pool_size does not support expert_map_record_path.")
+        if not self.config["dynamic_eplb"] or self.config["eplb_policy_type"] != 4:
+            raise ValueError("craft_global_pool_size requires dynamic_eplb=true and eplb_policy_type=4.")
 
     def _validate_craft_pool_policy_knobs(self):
         for key in ["craft_pool_top_m", "craft_pool_top_m_factor"]:

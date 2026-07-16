@@ -89,6 +89,23 @@ def get_configured_craft_pool_size(eplb_config, layer_id: int | None = None) -> 
     return _coerce_pool_size(layer_sizes[layer_id])
 
 
+def get_configured_craft_global_pool_size(eplb_config) -> int:
+    """Return the total number of model-level CRAFT slots across all EP ranks."""
+    return _coerce_pool_size(getattr(eplb_config, "craft_global_pool_size", 0))
+
+
+def get_craft_global_pool_size_per_rank(eplb_config, ep_size: int) -> int:
+    total_size = get_configured_craft_global_pool_size(eplb_config)
+    if total_size == 0:
+        return 0
+    if ep_size <= 0 or total_size % ep_size != 0:
+        raise ValueError(
+            "craft_global_pool_size must be divisible by ep_size: "
+            f"craft_global_pool_size={total_size}, ep_size={ep_size}."
+        )
+    return total_size // ep_size
+
+
 @lru_cache(maxsize=16)
 def expert_file_has_pool_mode(expert_map_path):
     if not expert_map_path:
@@ -145,7 +162,14 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     ep_size = moe_config.ep_size
     global_placement = None
     craft_pool_size = get_configured_craft_pool_size(eplb_config, layer_id)
-    pool_mode = get_configured_craft_pool_size(eplb_config) > 0 or expert_file_has_pool_mode(expert_map_path)
+    global_pool_size = get_craft_global_pool_size_per_rank(eplb_config, ep_size)
+    if global_pool_size > 0 and n_experts % ep_size != 0:
+        raise ValueError("CRAFT global pool requires num_experts to be divisible by ep_size.")
+    pool_mode = (
+        get_configured_craft_pool_size(eplb_config) > 0
+        or global_pool_size > 0
+        or expert_file_has_pool_mode(expert_map_path)
+    )
     metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
     eplb_enable = (
         eplb_config.dynamic_eplb
@@ -195,7 +219,8 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
             local_expert_map = expert_map
     if eplb_enable:
         if pool_mode:
-            log2phy = generate_craft_route_map(global_expert_map).npu()
+            local_slots = n_experts // ep_size + global_pool_size if global_pool_size > 0 else None
+            log2phy = generate_craft_route_map(global_expert_map, local_slots=local_slots).npu()
         elif metro_routing:
             log2phy = generate_pool_log2phy_map(global_expert_map).npu()
         else:
@@ -229,7 +254,7 @@ def generate_log2phy_map(global_expert_map, ep_rank):
     return log2phy_map
 
 
-def generate_pool_log2phy_map(global_expert_map):
+def generate_pool_log2phy_map(global_expert_map, local_slots: int | None = None):
     """Return logical expert id -> candidate global physical slots.
 
     Pool mode has multiple physical copies for some logical experts. The
@@ -240,7 +265,13 @@ def generate_pool_log2phy_map(global_expert_map):
         global_expert_map = torch.stack(global_expert_map)
 
     ep_size, num_experts = global_expert_map.shape
-    local_slots = int(torch.max(global_expert_map).item()) + 1
+    inferred_local_slots = int(torch.max(global_expert_map).item()) + 1
+    if local_slots is None:
+        local_slots = inferred_local_slots
+    elif local_slots < inferred_local_slots:
+        raise ValueError(
+            f"local_slots={local_slots} is smaller than required slots={inferred_local_slots}."
+        )
     max_copies = ep_size
     log2phy = torch.full((num_experts, max_copies), -1, dtype=torch.int32)
     copy_index = torch.zeros(num_experts, dtype=torch.int64)
@@ -258,9 +289,9 @@ def generate_pool_log2phy_map(global_expert_map):
     return log2phy
 
 
-def generate_craft_route_map(global_expert_map):
+def generate_craft_route_map(global_expert_map, local_slots: int | None = None):
     """Pack CRAFT candidates and replica counts into one graph-stable tensor."""
-    candidates = generate_pool_log2phy_map(global_expert_map)
+    candidates = generate_pool_log2phy_map(global_expert_map, local_slots=local_slots)
     replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int32)
     encoded_counts = -(replica_counts + 1).unsqueeze(-1)
     return torch.cat((candidates, encoded_counts), dim=-1)
