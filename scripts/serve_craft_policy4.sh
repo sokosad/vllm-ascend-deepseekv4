@@ -55,6 +55,8 @@ export VLLM_ASCEND_ENABLE_FLASHCOMM1="$FLASHCOMM1"
 export VLLM_ASCEND_ENABLE_FUSED_MC2="$FUSED_MC2"
 export DYNAMIC_EPLB=true
 export VLLM_ENGINE_READY_TIMEOUT_S=1200
+export ACL_OP_INIT_MODE=${ACL_OP_INIT_MODE:-1}
+export ASCEND_A3_ENABLE=${ASCEND_A3_ENABLE:-1}
 
 ADDITIONAL_CONFIG=$(printf '%s' \
   '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false,"fuse_norm_quant":false},' \
