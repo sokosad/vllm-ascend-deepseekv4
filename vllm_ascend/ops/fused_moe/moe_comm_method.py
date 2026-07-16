@@ -73,14 +73,20 @@ def _apply_log2phy(
     log2phy: torch.Tensor | None,
     topk_ids: torch.Tensor,
     metro_routing: bool = False,
+    compact_craft_pool: bool = False,
 ) -> torch.Tensor:
     if log2phy is None:
         return topk_ids
     if log2phy.dim() == 1:
         return log2phy[topk_ids]
 
-    candidates = log2phy[topk_ids]
-    replica_counts = torch.sum(candidates >= 0, dim=-1)
+    if compact_craft_pool:
+        candidate_map = log2phy[:, :-1]
+        candidates = candidate_map[topk_ids]
+        replica_counts = (-log2phy[:, -1] - 1)[topk_ids]
+    else:
+        candidates = log2phy[topk_ids]
+        replica_counts = torch.sum(candidates >= 0, dim=-1)
     replica_counts = torch.clamp(replica_counts, min=1)
 
     if metro_routing:
@@ -165,6 +171,7 @@ class MoECommMethod(ABC):
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
             getattr(self.moe_config, "metro_routing", False),
+            fused_experts_input.compact_craft_pool,
         )
 
         token_dispatch_input = build_token_dispatch_input(
@@ -345,6 +352,7 @@ class FusedMC2CommImpl(MoECommMethod):
             fused_experts_input.routing.log2phy,
             fused_experts_input.topk_ids,
             getattr(self.moe_config, "metro_routing", False),
+            fused_experts_input.compact_craft_pool,
         )
 
         expert_tokens = None

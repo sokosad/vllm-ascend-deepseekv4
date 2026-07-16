@@ -194,7 +194,9 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
     if eplb_enable:
-        if pool_mode or metro_routing:
+        if pool_mode:
+            log2phy = generate_craft_route_map(global_expert_map).npu()
+        elif metro_routing:
             log2phy = generate_pool_log2phy_map(global_expert_map).npu()
         else:
             log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
@@ -254,6 +256,14 @@ def generate_pool_log2phy_map(global_expert_map):
     if torch.any(copy_index == 0):
         raise ValueError("Pool log2phy contains a logical expert without a physical replica.")
     return log2phy
+
+
+def generate_craft_route_map(global_expert_map):
+    """Pack CRAFT candidates and replica counts into one graph-stable tensor."""
+    candidates = generate_pool_log2phy_map(global_expert_map)
+    replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int32)
+    encoded_counts = -(replica_counts + 1).unsqueeze(-1)
+    return torch.cat((candidates, encoded_counts), dim=-1)
 
 
 def generate_local_physical_expert_mask(local_num_experts, ep_size, ep_rank):

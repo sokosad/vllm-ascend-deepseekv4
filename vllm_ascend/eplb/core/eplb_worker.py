@@ -22,7 +22,11 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, generate_pool_log2phy_map
+from vllm_ascend.eplb.core.eplb_utils import (
+    generate_craft_route_map,
+    generate_log2phy_map,
+    generate_pool_log2phy_map,
+)
 from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
 
@@ -522,7 +526,10 @@ class EplbWorker:
                 packed_update_info.append({"noop": True, "layer_id": layer_id})
                 continue
             num_ranks = int(new_expert_map.shape[0])
-            if self.full_rank_plan:
+            if self.policy_type == 4:
+                shared_log2phy_map = generate_craft_route_map(new_expert_map).numpy().tolist()
+                log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
+            elif self.full_rank_plan:
                 shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()
                 log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
             else:

@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoE
 
 from vllm_ascend.ascend_config import EplbConfig, init_ascend_config
 from vllm_ascend.eplb.core.eplb_utils import (
+    generate_craft_route_map,
     generate_pool_log2phy_map,
     get_configured_craft_pool_size,
     init_eplb_config,
@@ -146,7 +147,8 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(redundant_experts, 2)
         self.assertEqual(global_map.shape, torch.Size([2, 8]))
         self.assertEqual(int((expert_map >= 0).sum().item()), 5)
-        self.assertEqual(log2phy.shape, torch.Size([8, 2]))
+        self.assertEqual(log2phy.shape, torch.Size([8, 3]))
+        self.assertTrue(torch.all(log2phy[:, -1] <= -2))
 
     def test_pool_log2phy_shape_is_independent_of_replica_distribution(self):
         first_placement = torch.tensor([
@@ -163,3 +165,8 @@ class TestAscendConfig(unittest.TestCase):
 
         self.assertEqual(first_log2phy.shape, torch.Size([4, 2]))
         self.assertEqual(second_log2phy.shape, torch.Size([4, 2]))
+
+        craft_route = generate_craft_route_map(second_placement)
+        self.assertEqual(craft_route.shape, torch.Size([4, 3]))
+        self.assertTrue(torch.equal(craft_route[:, :-1], second_log2phy))
+        self.assertTrue(torch.equal(craft_route[:, -1], torch.tensor([-3, -2, -2, -2])))

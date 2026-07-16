@@ -102,6 +102,42 @@ class TestMoECommMethod(TestBase):
         )
         self.assertTrue(torch.equal(routed, expected))
 
+    def test_apply_log2phy_uses_precomputed_craft_replica_counts(self):
+        route_map = torch.tensor(
+            [
+                [0, 4, -1, -3],
+                [1, 5, -1, -3],
+                [2, -1, -1, -2],
+            ],
+            dtype=torch.int32,
+        )
+        topk_ids = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 1],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+
+        routed = _apply_log2phy(
+            route_map,
+            topk_ids,
+            compact_craft_pool=True,
+        )
+
+        expected = torch.tensor(
+            [
+                [0, 0],
+                [4, 1],
+                [5, 5],
+                [2, 4],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(routed, expected))
+
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(
         "vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather"

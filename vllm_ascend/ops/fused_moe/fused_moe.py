@@ -39,6 +39,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (
     expert_file_pool_metadata,
+    generate_craft_route_map,
     generate_local_physical_expert_mask,
     generate_pool_log2phy_map,
     get_configured_craft_pool_size,
@@ -481,7 +482,7 @@ class AscendFusedMoE(FusedMoE):
                     f"pool={self.local_num_experts_pool}.")
             self.global_num_experts = num_experts
             self.global_redundant_expert_num = 0
-            self.log2phy = generate_pool_log2phy_map(self.global_expert_map).npu()
+            self.log2phy = generate_craft_route_map(self.global_expert_map).npu()
             self.local_num_experts = self.local_num_experts_main + self.local_num_experts_pool
             self.dispatch_expert_map = generate_local_physical_expert_mask(
                 self.local_num_experts,
