@@ -78,12 +78,12 @@ class PoolBalanceEplb(EplbPolicy):
         valid_experts = table[table >= 0]
         num_experts = int(valid_experts.max()) + 1 if valid_experts.size else 0
         hotness = np.zeros((num_layers, num_experts), dtype=np.float64)
-        for layer_id in range(num_layers):
-            for rank_id in range(table.shape[1]):
-                for slot_id in range(table.shape[2]):
-                    expert_id = int(table[layer_id, rank_id, slot_id])
-                    if expert_id >= 0:
-                        hotness[layer_id, expert_id] += float(load[layer_id, rank_id, slot_id])
+        valid = table >= 0
+        layer_ids = np.broadcast_to(
+            np.arange(num_layers, dtype=np.int64)[:, None, None],
+            table.shape,
+        )
+        np.add.at(hotness, (layer_ids[valid], table[valid]), load[valid])
         return hotness
 
     def _candidate_experts(self, hotness, pool_size, num_ranks):
