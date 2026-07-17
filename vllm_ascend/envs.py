@@ -105,14 +105,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # counter in the MoE layer forward; logs cumulative tokens every N calls.
     "VLLM_ASCEND_LOG_CARD_TOKENS": lambda: bool(int(os.getenv("VLLM_ASCEND_LOG_CARD_TOKENS", "0"))),
     "VLLM_ASCEND_CARD_TOK_LOG_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_CARD_TOK_LOG_INTERVAL", "2000")),
-    "VLLM_ASCEND_LOGICAL_TOPK_COOC_LOG": lambda: bool(int(os.getenv("VLLM_ASCEND_LOGICAL_TOPK_COOC_LOG", "0"))),
-    "VLLM_ASCEND_LOGICAL_TOPK_COOC_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_LOGICAL_TOPK_COOC_INTERVAL", "200")),
-    "VLLM_ASCEND_LOGICAL_TOPK_COOC_TOP_PAIRS": lambda: int(os.getenv("VLLM_ASCEND_LOGICAL_TOPK_COOC_TOP_PAIRS", "8")),
-    "VLLM_ASCEND_LOGICAL_TOPK_CT_LOG": lambda: bool(int(os.getenv("VLLM_ASCEND_LOGICAL_TOPK_CT_LOG", "0"))),
-    "VLLM_ASCEND_LOGICAL_TOPK_CT_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_LOGICAL_TOPK_CT_INTERVAL", "200")),
-    "VLLM_ASCEND_COLOC_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_COLOC_DUMP", "0"))),
-    "VLLM_ASCEND_COLOC_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_COLOC_DUMP_DIR", "/tmp/coloc_dump"),
-    "VLLM_ASCEND_COLOC_DUMP_INTERVAL": lambda: int(os.getenv("VLLM_ASCEND_COLOC_DUMP_INTERVAL", "200")),
     # Static CRAFT pooling: extra local redundant expert slots per rank.
     # 0 keeps the existing single-tensor MoE path.
     "VLLM_ASCEND_CRAFT_POOL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0")),
