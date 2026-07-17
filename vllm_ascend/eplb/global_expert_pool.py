@@ -30,6 +30,28 @@ def clear_global_craft_expert_pools() -> None:
     _GLOBAL_POOLS.clear()
 
 
+def cache_global_craft_weight_lists(layer) -> None:
+    pool = layer.craft_global_expert_pool.parameters
+    layer.craft_global_w1 = (
+        layer.w13_weight_list + pool["w13_weight_list"]
+    )
+    layer.craft_global_w2 = layer.w2_weight_list + pool["w2_weight_list"]
+    layer.craft_global_w1_scale = (
+        layer.w13_weight_scale_fp32_list
+        + pool["w13_weight_scale_fp32_list"]
+    )
+    layer.craft_global_w2_scale = (
+        layer.w2_weight_scale_list + pool["w2_weight_scale_list"]
+    )
+    if hasattr(layer, "fused_w1_scale_list"):
+        layer.craft_global_fused_w1_scale = (
+            layer.fused_w1_scale_list + pool["fused_w1_scale_list"]
+        )
+        layer.craft_global_fused_w2_scale = (
+            layer.fused_w2_scale_list + pool["fused_w2_scale_list"]
+        )
+
+
 def bind_global_craft_expert_pool(
     layer,
     capacity: int,

@@ -5,6 +5,7 @@ import torch
 from vllm_ascend.eplb.global_expert_pool import (
     begin_global_craft_expert_pool_model,
     bind_global_craft_expert_pool,
+    cache_global_craft_weight_lists,
     clear_global_craft_expert_pools,
 )
 
@@ -78,3 +79,34 @@ def test_global_pool_rejects_different_main_expert_counts_between_layers():
         assert "same main expert count" in str(exc)
     else:
         raise AssertionError("Expected different main expert counts to fail")
+
+
+def test_cached_global_pool_lists_keep_tensor_references_after_migration():
+    clear_global_craft_expert_pools()
+    layer = SimpleNamespace(
+        w13_weight_list=[torch.tensor([1.0])],
+        w2_weight_list=[torch.tensor([2.0])],
+        w13_weight_scale_fp32_list=[torch.tensor([3.0])],
+        w2_weight_scale_list=[torch.tensor([4.0])],
+    )
+    bind_global_craft_expert_pool(
+        layer,
+        1,
+        [
+            "w13_weight_list",
+            "w2_weight_list",
+            "w13_weight_scale_fp32_list",
+            "w2_weight_scale_list",
+        ],
+    )
+
+    cache_global_craft_weight_lists(layer)
+    cached_w1 = layer.craft_global_w1
+    pool_tensor = layer.craft_global_expert_pool.parameters[
+        "w13_weight_list"
+    ][0]
+    pool_tensor.copy_(torch.tensor([9.0]))
+
+    assert layer.craft_global_w1 is cached_w1
+    assert cached_w1[-1] is pool_tensor
+    assert cached_w1[-1].item() == 9.0

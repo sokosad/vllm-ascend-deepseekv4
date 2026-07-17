@@ -24,7 +24,10 @@ from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_ep_group
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.eplb.global_expert_pool import bind_global_craft_expert_pool
+from vllm_ascend.eplb.global_expert_pool import (
+    bind_global_craft_expert_pool,
+    cache_global_craft_weight_lists,
+)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -313,18 +316,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
 
         if global_craft_pool:
-            pool = layer.craft_global_expert_pool.parameters
-            w1 = layer.w13_weight_list + pool["w13_weight_list"]
+            w1 = layer.craft_global_w1
             w1_scale = (
-                layer.fused_w1_scale_list + pool["fused_w1_scale_list"]
+                layer.craft_global_fused_w1_scale
                 if fused_scale_flag
-                else layer.w13_weight_scale_fp32_list + pool["w13_weight_scale_fp32_list"]
+                else layer.craft_global_w1_scale
             )
-            w2 = layer.w2_weight_list + pool["w2_weight_list"]
+            w2 = layer.craft_global_w2
             w2_scale = (
-                layer.fused_w2_scale_list + pool["fused_w2_scale_list"]
+                layer.craft_global_fused_w2_scale
                 if fused_scale_flag
-                else layer.w2_weight_scale_list + pool["w2_weight_scale_list"]
+                else layer.craft_global_w2_scale
             )
         elif compact_craft_pool:
             w1 = [layer.w13_weight_with_pool]
@@ -513,6 +515,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                     parameter_names.extend(["fused_w1_scale_list", "fused_w2_scale_list"])
                 layer.craft_global_pool_parameter_names = parameter_names
                 bind_global_craft_expert_pool(layer, pool_size, parameter_names)
+                cache_global_craft_weight_lists(layer)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
