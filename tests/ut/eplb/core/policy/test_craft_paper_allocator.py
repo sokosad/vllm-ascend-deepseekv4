@@ -101,3 +101,27 @@ def test_fixed_home_plan_only_uses_extra_capacity_for_replicas():
             assert rank_experts[:4] == home[layer_id][rank_id]
             assert len(rank_experts) == 4 + extra_capacities[layer_id, rank_id]
             assert len(rank_experts) == len(set(rank_experts))
+
+
+def test_top_m_adds_rank_feasibility_candidates():
+    num_ranks = 4
+    hotness = np.arange(16, 0, -1, dtype=np.float64)[None, :]
+    home = [[
+        list(range(rank_id * 4, (rank_id + 1) * 4))
+        for rank_id in range(num_ranks)
+    ]]
+
+    layer_replicas, extra_capacities, placements = plan_craft_replication(
+        hotness,
+        total_replicas=4,
+        num_ranks=num_ranks,
+        home_placements=home,
+        candidate_top_m=1,
+    )
+
+    assert layer_replicas.tolist() == [4]
+    assert extra_capacities.tolist() == [[1, 1, 1, 1]]
+    for rank_id, rank_experts in enumerate(placements[0]):
+        assert rank_experts[:4] == home[0][rank_id]
+        assert len(rank_experts) == 5
+        assert len(rank_experts) == len(set(rank_experts))

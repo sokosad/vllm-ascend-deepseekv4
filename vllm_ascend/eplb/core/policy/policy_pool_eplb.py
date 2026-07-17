@@ -600,11 +600,25 @@ class PoolBalanceEplb(EplbPolicy):
             ]
             for layer_id in range(old_table.shape[0])
         ]
+        planner_top_m = self.candidate_top_m
+        if planner_top_m <= 0:
+            planner_top_m = max(
+                num_ranks,
+                int(
+                    np.ceil(
+                        pool_size
+                        * num_ranks
+                        * self.candidate_factor
+                        / old_table.shape[0]
+                    )
+                ),
+            )
         layer_replicas, extra_capacities, placements = plan_craft_replication(
             hotness,
             pool_size * num_ranks,
             num_ranks,
             home_placements=home,
+            candidate_top_m=planner_top_m,
         )
         new_table = self._place_global_craft_plan(
             old_table,

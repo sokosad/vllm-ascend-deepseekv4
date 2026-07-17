@@ -25,6 +25,29 @@ def _balanced_capacities(total_experts: int, num_ranks: int) -> np.ndarray:
     return capacities
 
 
+def _replica_candidate_mask(
+    expert_loads: np.ndarray,
+    top_m: int,
+    home_assignments: list[list[int]] | None,
+) -> np.ndarray:
+    if top_m <= 0 or top_m >= expert_loads.size:
+        return np.ones(expert_loads.size, dtype=bool)
+
+    candidate_mask = np.zeros(expert_loads.size, dtype=bool)
+    top_indices = np.argpartition(-expert_loads, top_m - 1)[:top_m]
+    candidate_mask[top_indices] = True
+    if home_assignments is None:
+        return candidate_mask
+
+    all_experts = np.arange(expert_loads.size)
+    for rank in home_assignments:
+        eligible = ~np.isin(all_experts, rank)
+        if np.any(eligible):
+            masked_loads = np.where(eligible, expert_loads, -np.inf)
+            candidate_mask[int(np.argmax(masked_loads))] = True
+    return candidate_mask
+
+
 def _logical_copy_counts(
     expert_loads: np.ndarray,
     num_replicas: int,
@@ -51,6 +74,7 @@ def _place_fixed_home_replicas(
     num_replicas: int,
     rank_capacities: np.ndarray,
     home_assignments: list[list[int]],
+    candidate_mask: np.ndarray,
 ) -> tuple[list[list[int]], np.ndarray]:
     num_ranks = rank_capacities.size
     if len(home_assignments) != num_ranks:
@@ -89,22 +113,25 @@ def _place_fixed_home_replicas(
         for expert_id in rank:
             owner_mask[expert_id, rank_id] = True
     copy_counts = np.ones(expert_loads.size, dtype=np.int64)
-    expert_ids = np.arange(expert_loads.size, dtype=np.int64)
+    expert_ids = np.flatnonzero(candidate_mask)
+    candidate_count = expert_ids.size
     rank_ids = np.arange(num_ranks, dtype=np.int64)
-    expert_grid = np.broadcast_to(expert_ids, (num_ranks, expert_loads.size))
+    expert_grid = np.broadcast_to(expert_ids, (num_ranks, candidate_count))
     rank_grid = np.broadcast_to(rank_ids[:, None], expert_grid.shape)
-    load_grid = np.broadcast_to(expert_loads, expert_grid.shape)
+    load_grid = np.broadcast_to(expert_loads[expert_ids], expert_grid.shape)
 
     for _ in range(num_replicas):
-        old_per_copy = expert_loads / copy_counts
-        new_per_copy = expert_loads / (copy_counts + 1)
+        candidate_copy_counts = copy_counts[expert_ids]
+        candidate_expert_loads = expert_loads[expert_ids]
+        old_per_copy = candidate_expert_loads / candidate_copy_counts
+        new_per_copy = candidate_expert_loads / (candidate_copy_counts + 1)
         reduced_loads = (
             rank_loads[None, :]
-            - (old_per_copy - new_per_copy)[:, None] * owner_mask
+            - (old_per_copy - new_per_copy)[:, None] * owner_mask[expert_ids]
         )
         candidate_loads = np.broadcast_to(
             reduced_loads[None, :, :],
-            (num_ranks, expert_loads.size, num_ranks),
+            (num_ranks, candidate_count, num_ranks),
         ).copy()
         candidate_loads[rank_ids, :, rank_ids] += new_per_copy[None, :]
 
@@ -117,8 +144,8 @@ def _place_fixed_home_replicas(
         )
         valid = (
             rank_has_capacity[:, None]
-            & ~owner_mask.T
-            & (copy_counts < num_ranks)[None, :]
+            & ~owner_mask[expert_ids].T
+            & (candidate_copy_counts < num_ranks)[None, :]
         )
         if not np.any(valid):
             raise ValueError("CRAFT cannot place a fixed-home replica.")
@@ -135,13 +162,14 @@ def _place_fixed_home_replicas(
                 max_loads.ravel(),
             )
         )
-        rank_id, expert_id = np.unravel_index(
+        rank_id, candidate_id = np.unravel_index(
             int(order[0]),
             valid.shape,
         )
         rank_id = int(rank_id)
-        expert_id = int(expert_id)
-        rank_loads = candidate_loads[rank_id, expert_id]
+        candidate_id = int(candidate_id)
+        expert_id = int(expert_ids[candidate_id])
+        rank_loads = candidate_loads[rank_id, candidate_id]
         assignments[rank_id].append(expert_id)
         owner_mask[expert_id, rank_id] = True
         copy_counts[expert_id] += 1
@@ -154,6 +182,7 @@ def place_layer_experts(
     num_replicas: int,
     rank_capacities: np.ndarray,
     home_assignments: list[list[int]] | None = None,
+    candidate_mask: np.ndarray | None = None,
 ) -> tuple[list[list[int]], np.ndarray]:
     expert_loads = np.asarray(expert_loads, dtype=np.float64)
     rank_capacities = np.asarray(rank_capacities, dtype=np.int64)
@@ -162,6 +191,12 @@ def place_layer_experts(
         raise ValueError("CRAFT layer placement expects one-dimensional inputs.")
     if int(rank_capacities.sum()) != expert_loads.size + num_replicas:
         raise ValueError("CRAFT rank capacities do not match the physical expert count.")
+    if candidate_mask is None:
+        candidate_mask = np.ones(expert_loads.size, dtype=bool)
+    else:
+        candidate_mask = np.asarray(candidate_mask, dtype=bool)
+        if candidate_mask.shape != expert_loads.shape:
+            raise ValueError("CRAFT candidate mask must match the expert load shape.")
 
     if home_assignments is not None:
         return _place_fixed_home_replicas(
@@ -169,6 +204,7 @@ def place_layer_experts(
             num_replicas,
             rank_capacities,
             home_assignments,
+            candidate_mask,
         )
 
     copy_counts = _logical_copy_counts(expert_loads, num_replicas, num_ranks)
@@ -221,6 +257,7 @@ def estimate_replication_benefits(
     options: list[int],
     num_ranks: int,
     home_placements: list[list[list[int]]] | None = None,
+    candidate_masks: np.ndarray | None = None,
 ) -> np.ndarray:
     hotness = np.asarray(hotness, dtype=np.float64)
     num_layers, num_experts = hotness.shape
@@ -250,6 +287,9 @@ def estimate_replication_benefits(
             continue
         for layer_id in range(num_layers):
             home = None if home_placements is None else home_placements[layer_id]
+            candidate_mask = (
+                None if candidate_masks is None else candidate_masks[layer_id]
+            )
             if home is None:
                 capacities = _balanced_capacities(
                     num_experts + num_replicas,
@@ -276,6 +316,7 @@ def estimate_replication_benefits(
                 num_replicas,
                 capacities,
                 home_assignments=home,
+                candidate_mask=candidate_mask,
             )
             benefits[layer_id, option_id] = max(
                 0.0,
@@ -362,6 +403,7 @@ def plan_craft_replication(
     total_replicas: int,
     num_ranks: int,
     home_placements: list[list[list[int]]] | None = None,
+    candidate_top_m: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[list[list[int]]]]:
     hotness = np.asarray(hotness, dtype=np.float64)
     if hotness.ndim != 2:
@@ -379,11 +421,23 @@ def plan_craft_replication(
         )
     if home_placements is not None and len(home_placements) != hotness.shape[0]:
         raise ValueError("CRAFT home placement must have one entry per layer.")
+    candidate_masks = np.asarray(
+        [
+            _replica_candidate_mask(
+                hotness[layer_id],
+                candidate_top_m,
+                None if home_placements is None else home_placements[layer_id],
+            )
+            for layer_id in range(hotness.shape[0])
+        ],
+        dtype=bool,
+    )
     benefits = estimate_replication_benefits(
         hotness,
         options,
         num_ranks,
         home_placements=home_placements,
+        candidate_masks=candidate_masks,
     )
     layer_replicas = allocate_replica_budget(benefits, options, total_replicas)
     extra_capacities = interleaved_replica_capacities(layer_replicas, num_ranks)
@@ -404,6 +458,7 @@ def plan_craft_replication(
             int(layer_replicas[layer_id]),
             rank_capacities,
             home_assignments=home,
+            candidate_mask=candidate_masks[layer_id],
         )
         placements.append(assignments)
     return layer_replicas, extra_capacities, placements
