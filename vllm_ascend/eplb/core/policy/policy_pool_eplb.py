@@ -279,11 +279,7 @@ class PoolBalanceEplb(EplbPolicy):
         flat = hotness.reshape(-1)
         positive = np.flatnonzero(flat > 0)
         if positive.size == 0:
-            return [
-                (layer_id, expert_id)
-                for layer_id in range(hotness.shape[0])
-                for expert_id in range(hotness.shape[1])
-            ]
+            return []
         top_m = self.candidate_top_m
         if top_m <= 0:
             top_m = max(total_slots * self.candidate_factor, total_slots)
@@ -361,14 +357,6 @@ class PoolBalanceEplb(EplbPolicy):
                     rank_loads[layer_id, rank_id] += hotness[layer_id, expert_id]
 
         preferred = preferred_assignments or [[] for _ in range(num_ranks)]
-        cold_candidates = sorted(
-            (
-                (layer_id, expert_id)
-                for layer_id in range(num_layers)
-                for expert_id in range(num_experts)
-            ),
-            key=lambda item: (hotness[item], item[0], item[1]),
-        )
 
         def eligible(layer_id, expert_id, rank_id):
             return (
@@ -404,40 +392,6 @@ class PoolBalanceEplb(EplbPolicy):
                         best = (key, layer_id, expert_id, rank_id, new_loads)
             return best
 
-        def cold_choice():
-            best = None
-            fallback_limit = max(total_slots * self.candidate_factor, total_slots)
-            for rank_id in range(num_ranks):
-                if len(assignments[rank_id]) >= pool_size:
-                    continue
-                considered = 0
-                for layer_id, expert_id in cold_candidates:
-                    if not eligible(layer_id, expert_id, rank_id):
-                        continue
-                    gain, new_loads = self._global_assignment_gain(
-                        rank_loads,
-                        hotness,
-                        copy_counts,
-                        hosts,
-                        layer_id,
-                        expert_id,
-                        rank_id,
-                    )
-                    key = (
-                        gain,
-                        -float(hotness[layer_id, expert_id]),
-                        -len(assignments[rank_id]),
-                        -layer_id,
-                        -expert_id,
-                        -rank_id,
-                    )
-                    if best is None or key > best[0]:
-                        best = (key, layer_id, expert_id, rank_id, new_loads)
-                    considered += 1
-                    if considered >= fallback_limit:
-                        break
-            return best
-
         for _ in range(total_slots):
             choice = best_choice(candidates)
             if choice is None or choice[0][0] <= 0:
@@ -452,8 +406,6 @@ class PoolBalanceEplb(EplbPolicy):
                     choice is None or preferred_choice[0] > choice[0]
                 ):
                     choice = preferred_choice
-            if choice is None or choice[0][0] <= 0:
-                choice = cold_choice()
             if choice is None or choice[0][0] <= 0:
                 break
             _, layer_id, expert_id, rank_id, new_loads = choice

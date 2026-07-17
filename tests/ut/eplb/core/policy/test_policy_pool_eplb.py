@@ -236,3 +236,9 @@ def test_global_pool_returns_partial_assignment_when_capacity_cannot_help():
     )
 
     assert sum(len(rank_items) for rank_items in assignments) < 4
+
+
+def test_global_pool_zero_hotness_has_no_candidates():
+    policy = PoolBalanceEplb(DynamicConfig())
+
+    assert policy._global_candidates(np.zeros((43, 256)), 16) == []
