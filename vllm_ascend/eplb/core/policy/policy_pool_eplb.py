@@ -349,6 +349,7 @@ class PoolBalanceEplb(EplbPolicy):
             return []
         total_slots = pool_size * num_ranks
         candidates = self._global_candidates(hotness, total_slots)
+        candidate_set = set(candidates)
         assignments: list[list[tuple[int, int]]] = [[] for _ in range(num_ranks)]
         copy_counts = np.ones((num_layers, num_experts), dtype=np.int64)
         hosts = [[[] for _ in range(num_experts)] for _ in range(num_layers)]
@@ -360,6 +361,14 @@ class PoolBalanceEplb(EplbPolicy):
                     rank_loads[layer_id, rank_id] += hotness[layer_id, expert_id]
 
         preferred = preferred_assignments or [[] for _ in range(num_ranks)]
+        preferred_items = list(
+            dict.fromkeys(
+                item
+                for rank_items in preferred
+                for item in rank_items
+                if item not in candidate_set
+            )
+        )
         layer_max_loads = rank_loads.max(axis=1)
 
         def eligible(layer_id, expert_id, rank_id):
@@ -400,12 +409,6 @@ class PoolBalanceEplb(EplbPolicy):
         for _ in range(total_slots):
             choice = best_choice(candidates)
             if choice is None or choice[0][0] <= 0:
-                preferred_items = [
-                    item
-                    for rank_items in preferred
-                    for item in rank_items
-                    if item not in candidates
-                ]
                 preferred_choice = best_choice(preferred_items)
                 if preferred_choice is not None and (
                     choice is None or preferred_choice[0] > choice[0]
