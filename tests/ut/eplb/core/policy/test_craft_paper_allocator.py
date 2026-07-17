@@ -1,0 +1,103 @@
+import numpy as np
+
+from vllm_ascend.eplb.core.policy.craft_paper_allocator import (
+    interleaved_replica_capacities,
+    plan_craft_replication,
+)
+
+
+def test_replica_budget_follows_layer_skew():
+    hotness = np.ones((4, 16), dtype=np.float64)
+    hotness[0, 0] = 1_000
+    hotness[1, :4] = 250
+    hotness[2, :2] = 300
+
+    layer_replicas, extra_capacities, placements = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=4,
+    )
+
+    assert layer_replicas.tolist() == [4, 2, 2, 0]
+    assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+    for layer_id, ranks in enumerate(placements):
+        assert sum(len(rank) for rank in ranks) == 16 + layer_replicas[layer_id]
+        assert all(
+            len(rank) == 4 + extra_capacities[layer_id, rank_id]
+            for rank_id, rank in enumerate(ranks)
+        )
+
+
+def test_interleaved_capacities_balance_every_rank():
+    capacities = interleaved_replica_capacities(
+        np.asarray([4, 2, 2, 0]),
+        num_ranks=4,
+    )
+
+    assert capacities.tolist() == [
+        [1, 1, 1, 1],
+        [1, 0, 0, 1],
+        [0, 1, 1, 0],
+        [0, 0, 0, 0],
+    ]
+    assert capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+
+
+def test_deepseek_half_budget_uses_every_slot_once():
+    num_layers = 43
+    num_ranks = 8
+    num_experts = 256
+    total_replicas = 168
+    hotness = np.ones((num_layers, num_experts), dtype=np.float64)
+    hotness[18, 83] = 10_000
+    hotness[18, 93] = 8_000
+    hotness[42, 255] = 9_000
+
+    layer_replicas, extra_capacities, placements = plan_craft_replication(
+        hotness,
+        total_replicas=total_replicas,
+        num_ranks=num_ranks,
+    )
+
+    assert int(layer_replicas.sum()) == total_replicas
+    assert extra_capacities.sum(axis=0).tolist() == [21] * num_ranks
+    for layer_id, ranks in enumerate(placements):
+        flattened = []
+        for rank_id, rank_experts in enumerate(ranks):
+            assert len(rank_experts) == 32 + extra_capacities[layer_id, rank_id]
+            assert len(rank_experts) == len(set(rank_experts))
+            flattened.extend(rank_experts)
+        counts = np.bincount(flattened, minlength=num_experts)
+        assert np.all(counts >= 1)
+        assert int(counts.sum()) == num_experts + layer_replicas[layer_id]
+
+
+def test_fixed_home_plan_only_uses_extra_capacity_for_replicas():
+    num_layers = 4
+    num_ranks = 4
+    num_experts = 16
+    hotness = np.ones((num_layers, num_experts), dtype=np.float64)
+    hotness[0, 0] = 1_000
+    hotness[1, 7] = 500
+    home = [
+        [
+            list(range(rank_id * 4, (rank_id + 1) * 4))
+            for rank_id in range(num_ranks)
+        ]
+        for _ in range(num_layers)
+    ]
+
+    layer_replicas, extra_capacities, placements = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=num_ranks,
+        home_placements=home,
+    )
+
+    assert int(layer_replicas.sum()) == 8
+    assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+    for layer_id, ranks in enumerate(placements):
+        for rank_id, rank_experts in enumerate(ranks):
+            assert rank_experts[:4] == home[layer_id][rank_id]
+            assert len(rank_experts) == 4 + extra_capacities[layer_id, rank_id]
+            assert len(rank_experts) == len(set(rank_experts))

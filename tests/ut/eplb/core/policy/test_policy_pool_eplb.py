@@ -106,7 +106,7 @@ def test_global_pool_assigns_each_active_slot_to_at_most_one_layer():
     assert changed
     owners = torch.sum(updated[:, :, 2:] >= 0, dim=0)
     assert torch.all(owners <= 1)
-    assert torch.sum(owners).item() == 1
+    assert torch.sum(owners).item() == 2
     assert updated[1, 1, 2].item() == 0
 
 
@@ -194,7 +194,10 @@ def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
     assert changed
     assert torch.equal(updated[:, :, :main_size], current[:, :, :main_size])
     assert torch.all(torch.sum(updated[:, :, main_size:] >= 0, dim=0) <= 1)
+    assert torch.sum(updated[:, :, main_size:] >= 0).item() == num_ranks * pool_size
     for layer_id in range(num_layers):
+        logical_experts = updated[layer_id][updated[layer_id] >= 0]
+        assert torch.unique(logical_experts).numel() == num_experts
         for rank_id in range(num_ranks):
             valid = updated[layer_id, rank_id]
             valid = valid[valid >= 0]

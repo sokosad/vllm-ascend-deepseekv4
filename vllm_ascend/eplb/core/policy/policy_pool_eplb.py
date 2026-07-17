@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from vllm.logger import logger
 
+from .craft_paper_allocator import plan_craft_replication
 from .policy_abstract import DynamicConfig, EplbPolicy
 
 
@@ -23,11 +24,11 @@ def _get_float_config(config: DynamicConfig, attr: str, env_name: str, default: 
 
 
 class PoolBalanceEplb(EplbPolicy):
-    """Dynamic EPLB policy for fixed-capacity CRAFT pool slots.
+    """Dynamic EPLB policy for fixed-capacity CRAFT pool storage.
 
-    The first `pool_start` local slots are fixed home experts. Only slots
-    `[pool_start, E_local)` are replaced, so tensor shapes and main ownership
-    stay stable while hot experts can rotate through the pool.
+    Layer-local pools keep the first `pool_start` slots fixed. A global pool
+    shares extra storage across layers and assigns replicas with a CRAFT-style
+    per-layer budget while keeping base ownership and tensor shapes stable.
     """
 
     def __init__(self, config: DynamicConfig):
@@ -462,6 +463,94 @@ class PoolBalanceEplb(EplbPolicy):
         return new_table
 
     @staticmethod
+    def _place_global_craft_plan(
+        old_table,
+        placements,
+        extra_capacities,
+        pool_start,
+        pool_size,
+    ):
+        num_layers, num_ranks, _ = old_table.shape
+        new_table = np.full_like(old_table, -1)
+        pool_slots = list(range(pool_start, pool_start + pool_size))
+        assigned_pool_slots = [[[] for _ in range(num_ranks)] for _ in range(num_layers)]
+
+        for rank_id in range(num_ranks):
+            old_owners = {}
+            for slot_id in pool_slots:
+                owners = [
+                    layer_id
+                    for layer_id in range(num_layers)
+                    if old_table[layer_id, rank_id, slot_id] >= 0
+                ]
+                if len(owners) > 1:
+                    raise ValueError(
+                        "CRAFT global pool slot has multiple layer owners: "
+                        f"rank={rank_id}, slot={slot_id}, owners={owners}."
+                    )
+                if owners:
+                    old_owners[slot_id] = owners[0]
+
+            free_slots = set(pool_slots)
+            for layer_id in range(num_layers):
+                quota = int(extra_capacities[layer_id, rank_id])
+                old_layer_slots = [
+                    slot_id
+                    for slot_id, owner in old_owners.items()
+                    if owner == layer_id
+                ]
+                target = set(placements[layer_id][rank_id])
+                old_layer_slots.sort(
+                    key=lambda slot_id: (
+                        old_table[layer_id, rank_id, slot_id] not in target,
+                        slot_id,
+                    )
+                )
+                kept = old_layer_slots[:quota]
+                assigned_pool_slots[layer_id][rank_id].extend(kept)
+                free_slots.difference_update(kept)
+
+            for layer_id in range(num_layers):
+                quota = int(extra_capacities[layer_id, rank_id])
+                missing = quota - len(assigned_pool_slots[layer_id][rank_id])
+                selected = sorted(free_slots)[:missing]
+                assigned_pool_slots[layer_id][rank_id].extend(selected)
+                free_slots.difference_update(selected)
+
+            if free_slots:
+                raise ValueError(
+                    "CRAFT interleaved capacities did not consume every global pool slot."
+                )
+
+        for layer_id in range(num_layers):
+            for rank_id in range(num_ranks):
+                allowed_slots = list(range(pool_start)) + assigned_pool_slots[layer_id][rank_id]
+                target_experts = list(placements[layer_id][rank_id])
+                target_set = set(target_experts)
+                assigned = set()
+                for slot_id in allowed_slots:
+                    expert_id = int(old_table[layer_id, rank_id, slot_id])
+                    if expert_id >= 0 and expert_id in target_set and expert_id not in assigned:
+                        new_table[layer_id, rank_id, slot_id] = expert_id
+                        assigned.add(expert_id)
+
+                missing_experts = [
+                    expert_id for expert_id in target_experts if expert_id not in assigned
+                ]
+                free_allowed_slots = [
+                    slot_id
+                    for slot_id in allowed_slots
+                    if new_table[layer_id, rank_id, slot_id] < 0
+                ]
+                if len(missing_experts) != len(free_allowed_slots):
+                    raise ValueError(
+                        "CRAFT placement does not match the assigned layer/rank capacity."
+                    )
+                for slot_id, expert_id in zip(free_allowed_slots, missing_experts):
+                    new_table[layer_id, rank_id, slot_id] = expert_id
+        return new_table
+
+    @staticmethod
     def _global_imbalance(table, hotness):
         weighted_ratio = 0.0
         total_weight = 0.0
@@ -502,26 +591,28 @@ class PoolBalanceEplb(EplbPolicy):
             return False, None, current_expert_table.tolist()
         home = [
             [
-                [int(expert_id) for expert_id in old_table[layer_id, rank_id, :pool_start] if expert_id >= 0]
+                [
+                    int(expert_id)
+                    for expert_id in old_table[layer_id, rank_id, :pool_start]
+                    if expert_id >= 0
+                ]
                 for rank_id in range(num_ranks)
             ]
             for layer_id in range(old_table.shape[0])
         ]
-        preferred_assignments = [[] for _ in range(num_ranks)]
-        for layer_id in range(old_table.shape[0]):
-            for rank_id in range(num_ranks):
-                preferred_assignments[rank_id].extend(
-                    (layer_id, int(expert_id))
-                    for expert_id in old_table[layer_id, rank_id, pool_start:]
-                    if expert_id >= 0
-                )
-        desired = self._desired_global_assignments(
-            home,
+        layer_replicas, extra_capacities, placements = plan_craft_replication(
             hotness,
-            pool_size,
-            preferred_assignments=preferred_assignments,
+            pool_size * num_ranks,
+            num_ranks,
+            home_placements=home,
         )
-        new_table = self._place_global_assignments(old_table, desired, pool_start, pool_size)
+        new_table = self._place_global_craft_plan(
+            old_table,
+            placements,
+            extra_capacities,
+            pool_start,
+            pool_size,
+        )
         old_imbalance = self._global_imbalance(old_table, hotness)
         new_imbalance = self._global_imbalance(new_table, hotness)
         relative_improvement = (
@@ -536,7 +627,8 @@ class PoolBalanceEplb(EplbPolicy):
         accepted = relative_improvement >= self.min_improvement
         logger.info(
             "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
-            "current=%.4f proposed=%.4f improvement=%.4f accepted=%s",
+            "current=%.4f proposed=%.4f improvement=%.4f accepted=%s "
+            "layer_replicas=%s",
             pool_size * num_ranks,
             changed_slots,
             changed_layers,
@@ -544,6 +636,7 @@ class PoolBalanceEplb(EplbPolicy):
             new_imbalance,
             relative_improvement,
             accepted,
+            ",".join(str(int(value)) for value in layer_replicas),
         )
         if not accepted:
             return False, None, current_expert_table.tolist()
