@@ -86,7 +86,7 @@ def test_pool_policy_skips_migration_when_improvement_is_too_small():
     assert torch.equal(torch.tensor(updated), current)
 
 
-def test_global_pool_assigns_each_physical_slot_to_one_layer():
+def test_global_pool_assigns_each_active_slot_to_at_most_one_layer():
     config = DynamicConfig()
     config.craft_global_pool_size = 2
     config.craft_pool_min_hotness_delta = 0.0
@@ -104,7 +104,9 @@ def test_global_pool_assigns_each_physical_slot_to_one_layer():
     updated = torch.tensor(updated)
 
     assert changed
-    assert torch.all(torch.sum(updated[:, :, 2:] >= 0, dim=0) == 1)
+    owners = torch.sum(updated[:, :, 2:] >= 0, dim=0)
+    assert torch.all(owners <= 1)
+    assert torch.sum(owners).item() == 1
     assert updated[1, 1, 2].item() == 0
 
 
@@ -160,7 +162,7 @@ class TestGlobalPoolMarginalPlacement(unittest.TestCase):
         assignments = policy._desired_global_assignments(home, hotness, pool_size=1)
 
         self.assertEqual(assignments[1], [(0, 1)])
-        self.assertEqual(assignments[0], [(0, 3)])
+        self.assertEqual(assignments[0], [])
 
 
 def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
@@ -191,7 +193,7 @@ def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
 
     assert changed
     assert torch.equal(updated[:, :, :main_size], current[:, :, :main_size])
-    assert torch.all(torch.sum(updated[:, :, main_size:] >= 0, dim=0) == 1)
+    assert torch.all(torch.sum(updated[:, :, main_size:] >= 0, dim=0) <= 1)
     for layer_id in range(num_layers):
         for rank_id in range(num_ranks):
             valid = updated[layer_id, rank_id]
@@ -202,3 +204,35 @@ def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
 
     assert not changed_again
     assert torch.equal(torch.tensor(stable_list), updated)
+
+
+def test_global_pool_first_cycle_rejects_non_improving_layout():
+    config = DynamicConfig()
+    config.craft_global_pool_size = 2
+    config.craft_pool_min_hotness_delta = 0.0
+    config.craft_pool_min_improvement = 0.01
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([[
+        [0, 1, -1],
+        [2, 3, -1],
+    ]])
+    workload = torch.ones_like(current)
+
+    changed, _, updated = policy.rebalance_experts(current, workload)
+
+    assert not changed
+    assert torch.equal(torch.tensor(updated), current)
+
+
+def test_global_pool_returns_partial_assignment_when_capacity_cannot_help():
+    policy = PoolBalanceEplb(DynamicConfig())
+    home = [[[0], [1]]]
+    hotness = np.array([[100.0, 1.0]])
+
+    assignments = policy._desired_global_assignments(
+        home,
+        hotness,
+        pool_size=2,
+    )
+
+    assert sum(len(rank_items) for rank_items in assignments) < 4

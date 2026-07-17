@@ -81,6 +81,14 @@ class EplbUpdator:
         if self.craft_pool_plan:
             self.shared_dict["craft_expert_cost_metadata"] = self.adaptor.get_expert_cost_metadata()
 
+    def _planner_process_alive(self) -> bool:
+        if self.process is None or not hasattr(self.process, "is_alive"):
+            return True
+        try:
+            return self.process.is_alive() is not False
+        except (AssertionError, ValueError):
+            return False
+
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
         self.num_expert_load_gather = 10
@@ -199,13 +207,18 @@ class EplbUpdator:
             if self.full_rank_plan:
                 update_info_all = None
                 if self.rank_id == self.plan_src_rank:
-                    try:
-                        update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
-                    except Empty:
+                    if not self._planner_process_alive():
                         logger.error(
-                            "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
-                            self.plan_timeout_s,
+                            "CRAFT EPLB planner is not running; skipping this update cycle"
                         )
+                    else:
+                        try:
+                            update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
+                        except Empty:
+                            logger.error(
+                                "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
+                                self.plan_timeout_s,
+                            )
                 self.update_info_all = self._broadcast_update_info(update_info_all)
                 if self.update_info_all is None:
                     self.update_info_all = []

@@ -222,6 +222,27 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         mock_broadcast.assert_called_once_with(None)
         self.assertEqual(self.updator.update_info_all, [])
 
+    def test_dead_planner_skips_without_waiting_for_queue_timeout(self):
+        self.updator.rank_id = 0
+        self.updator.plan_src_rank = 0
+        self.updator.cur_iterations = (
+            self.updator.expert_heat_collection_interval
+            + self.updator.algorithm_execution_interval
+            - 1
+        )
+        self.updator.process.is_alive.return_value = False
+
+        with patch.object(
+            self.updator,
+            "_broadcast_update_info",
+            return_value=None,
+        ) as mock_broadcast:
+            self.updator.forward_before()
+
+        self.eplb_process.block_update_q.get.assert_not_called()
+        mock_broadcast.assert_called_once_with(None)
+        self.assertEqual(self.updator.update_info_all, [])
+
     def test_full_rank_plan_only_wakes_source_worker(self):
         self.updator.rank_id = 1
         self.updator.plan_src_rank = 0

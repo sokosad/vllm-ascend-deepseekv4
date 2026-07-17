@@ -120,10 +120,12 @@ from vllm_ascend.models.layer.attention.layer import DSAAttention
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
+from vllm_ascend.eplb.core.eplb_utils import get_configured_craft_global_pool_size
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -2706,6 +2708,14 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
+            global_craft_pool = (
+                get_configured_craft_global_pool_size(
+                    get_ascend_config().eplb_config
+                )
+                > 0
+            )
+            if global_craft_pool:
+                AscendFusedMoE.begin_model_build()
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             if self.dynamic_eplb:
                 model_register(self.model)
@@ -2713,6 +2723,8 @@ class NPUModelRunner(GPUModelRunner):
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
+                if global_craft_pool:
+                    AscendFusedMoE.begin_model_build()
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
                 if self.use_aux_hidden_state_outputs:

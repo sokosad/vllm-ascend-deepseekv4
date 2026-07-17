@@ -345,7 +345,9 @@ class PoolBalanceEplb(EplbPolicy):
         preferred_assignments=None,
     ):
         num_layers, num_experts = hotness.shape
-        num_ranks = len(home[0])
+        num_ranks = len(home[0]) if home else 0
+        if num_ranks == 0:
+            return []
         total_slots = pool_size * num_ranks
         candidates = self._global_candidates(hotness, total_slots)
         assignments: list[list[tuple[int, int]]] = [[] for _ in range(num_ranks)]
@@ -438,7 +440,7 @@ class PoolBalanceEplb(EplbPolicy):
 
         for _ in range(total_slots):
             choice = best_choice(candidates)
-            if choice is None or choice[0][0] < 0:
+            if choice is None or choice[0][0] <= 0:
                 preferred_items = [
                     item
                     for rank_items in preferred
@@ -450,13 +452,10 @@ class PoolBalanceEplb(EplbPolicy):
                     choice is None or preferred_choice[0] > choice[0]
                 ):
                     choice = preferred_choice
-            if choice is None or choice[0][0] < 0:
+            if choice is None or choice[0][0] <= 0:
                 choice = cold_choice()
-            if choice is None:
-                raise ValueError(
-                    "CRAFT global pool cannot fill every rank slot without duplicating "
-                    "a home expert."
-                )
+            if choice is None or choice[0][0] <= 0:
+                break
             _, layer_id, expert_id, rank_id, new_loads = choice
             assignments[rank_id].append((layer_id, expert_id))
             copy_counts[layer_id, expert_id] += 1
@@ -562,7 +561,6 @@ class PoolBalanceEplb(EplbPolicy):
             preferred_assignments=preferred_assignments,
         )
         new_table = self._place_global_assignments(old_table, desired, pool_start, pool_size)
-        old_pool_active = bool(np.any(old_table[:, :, pool_start:] >= 0))
         old_imbalance = self._global_imbalance(old_table, hotness)
         new_imbalance = self._global_imbalance(new_table, hotness)
         relative_improvement = (
@@ -574,11 +572,7 @@ class PoolBalanceEplb(EplbPolicy):
         changed_layers = int(
             np.count_nonzero(np.any(old_table != new_table, axis=(1, 2)))
         )
-        accepted = not (
-            old_pool_active
-            and self.min_improvement > 0
-            and relative_improvement < self.min_improvement
-        )
+        accepted = relative_improvement >= self.min_improvement
         logger.info(
             "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
             "current=%.4f proposed=%.4f improvement=%.4f accepted=%s",
@@ -590,9 +584,8 @@ class PoolBalanceEplb(EplbPolicy):
             relative_improvement,
             accepted,
         )
-        if old_pool_active and self.min_improvement > 0:
-            if relative_improvement < self.min_improvement:
-                return False, None, current_expert_table.tolist()
+        if not accepted:
+            return False, None, current_expert_table.tolist()
         changed = not np.array_equal(old_table, new_table)
         return changed, None, new_table.tolist()
 

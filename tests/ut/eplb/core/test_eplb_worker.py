@@ -1,9 +1,10 @@
 import unittest
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
 
-from vllm_ascend.eplb.core.eplb_worker import EplbWorker
+from vllm_ascend.eplb.core.eplb_worker import EplbProcess, EplbWorker
 
 
 def test_pack_update_info_returns_full_rank_plan():
@@ -63,7 +64,7 @@ def test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle():
     assert packed[1] == {"noop": True, "layer_id": 1}
 
 
-def test_global_pool_migration_always_uses_home_rank_source():
+def test_global_pool_migration_uses_stable_current_owner():
     worker = EplbWorker.__new__(EplbWorker)
     worker.craft_global_pool_size = 3
     current = torch.tensor([[
@@ -83,6 +84,25 @@ def test_global_pool_migration_always_uses_home_rank_source():
 
     assert send == {2: [(1, 4)]}
     assert recv == {1: [(2, 4)]}
+
+
+def test_global_pool_migration_supports_non_linear_home_placement():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.craft_global_pool_size = 3
+    current = torch.tensor([[
+        [-1, -1, -1, -1, 0, -1],
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, -1, -1],
+    ]])
+    updated = current.clone()
+    updated[0, 1, 4] = 1
+
+    send, recv, _, _ = next(
+        worker.compose_expert_update_info_greedy(updated, current)
+    )
+
+    assert send == {0: [(1, 4)]}
+    assert recv == {1: [(0, 4)]}
 
 
 def test_policy2_pack_update_info_keeps_rank_local_plan():
@@ -129,10 +149,11 @@ def test_policy4_placement_validation_accepts_padded_pool_slots():
     assert torch.equal(new_placement, old_placement)
 
 
-def test_global_pool_validation_rejects_unowned_slot():
+def test_global_pool_validation_accepts_unowned_slot():
     worker = EplbWorker.__new__(EplbWorker)
     worker.policy_type = 4
     worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
     old_placement = torch.tensor([
         [[0, 1, 2], [2, 3, -1]],
         [[0, 1, -1], [2, 3, 0]],
@@ -142,7 +163,56 @@ def test_global_pool_validation_rejects_unowned_slot():
 
     worker.check_expert_placement(old_placement, new_placement)
 
+    assert new_placement[1, 1, 2].item() == -1
+
+
+def test_global_pool_validation_rejects_multiply_owned_slot():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor([
+        [[0, 1, 2], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, 0]],
+    ])
+    new_placement = old_placement.clone()
+    new_placement[1, 0, 2] = 3
+
+    worker.check_expert_placement(old_placement, new_placement)
+
     assert torch.equal(new_placement, old_placement)
+
+
+def test_eplb_process_publishes_noop_and_continues_after_planner_error():
+    process = EplbProcess.__new__(EplbProcess)
+    process.policy_type = 4
+    process.worker = MagicMock()
+    process.worker.do_update.side_effect = [ValueError("bad plan"), "next-plan"]
+    planner_q = MagicMock()
+    planner_q.get.side_effect = [1, 1, KeyboardInterrupt()]
+    block_update_q = MagicMock()
+
+    try:
+        process.worker_process(planner_q, block_update_q)
+    except KeyboardInterrupt:
+        pass
+
+    assert block_update_q.put.call_args_list[0].args[0] is None
+    assert block_update_q.put.call_args_list[1].args[0] == "next-plan"
+
+
+def test_policy2_planner_keeps_original_exit_on_error_behavior():
+    process = EplbProcess.__new__(EplbProcess)
+    process.policy_type = 2
+    process.worker = MagicMock()
+    process.worker.do_update.side_effect = ValueError("bad plan")
+    planner_q = MagicMock()
+    block_update_q = MagicMock()
+
+    process.worker_process(planner_q, block_update_q)
+
+    planner_q.get.assert_called_once()
+    block_update_q.put.assert_not_called()
 
 
 def test_compute_imbalance_handles_padded_layer_table():
@@ -231,11 +301,15 @@ def load_tests(loader_obj, tests, pattern):
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
     suite.addTest(unittest.FunctionTestCase(test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle))
-    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_always_uses_home_rank_source))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_uses_stable_current_owner))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_supports_non_linear_home_placement))
     suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
     suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
-    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_rejects_unowned_slot))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_accepts_unowned_slot))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_rejects_multiply_owned_slot))
+    suite.addTest(unittest.FunctionTestCase(test_eplb_process_publishes_noop_and_continues_after_planner_error))
+    suite.addTest(unittest.FunctionTestCase(test_policy2_planner_keeps_original_exit_on_error_behavior))
     suite.addTest(unittest.FunctionTestCase(test_compute_imbalance_handles_padded_layer_table))
     suite.addTest(unittest.FunctionTestCase(test_craft_pool_utilization_reports_active_pool_slots))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_rejects_slow_payback))

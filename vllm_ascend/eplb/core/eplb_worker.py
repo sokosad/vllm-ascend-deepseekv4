@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from multiprocessing import Process, Queue
+from queue import Full
 from typing import Any
 
 import numpy as np
@@ -111,6 +112,9 @@ class EplbWorker:
                         num_logical_experts // num_ranks
                         + self.craft_global_pool_size // num_ranks
                     )
+                    self.num_local_experts_main = (
+                        num_logical_experts // num_ranks
+                    )
             else:
                 raise ValueError("Failed to get expert_maps from shared_dict.")
 
@@ -158,16 +162,35 @@ class EplbWorker:
                 not torch.equal(new_expert_maps[layer_id], self.old_expert_maps[layer_id])
                 for layer_id in range(new_expert_maps.shape[0])
             ]
+        if getattr(self, "craft_global_pool_size", 0) > 0:
+            update_info = self.compose_expert_update_info_greedy(
+                new_expert_maps,
+                self.old_expert_maps,
+            )
+            # Validate every migration source before publishing the new map.
+            update_info = list(update_info)
+            packed_update_info = self.pack_update_info(
+                update_info,
+                changed_layers=changed_layers,
+            )
+            if changed_layers is None or any(changed_layers):
+                self.update_expert_map(new_expert_maps)
+            self.old_expert_maps = new_expert_maps
+            logger.debug("EPLB Process compute complete")
+            return packed_update_info
+
         if changed_layers is None or any(changed_layers):
             self.update_expert_map(new_expert_maps)
-
-        update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
+        update_info = self.compose_expert_update_info_greedy(
+            new_expert_maps,
+            self.old_expert_maps,
+        )
         self.old_expert_maps = new_expert_maps
         logger.debug("EPLB Process compute complete")
-
-        packed_update_info = self.pack_update_info(update_info, changed_layers=changed_layers)
-
-        return packed_update_info
+        return self.pack_update_info(
+            update_info,
+            changed_layers=changed_layers,
+        )
 
     @staticmethod
     def _craft_pool_utilization(deployment, load_info):
@@ -358,13 +381,14 @@ class EplbWorker:
                     break
 
         if getattr(self, "craft_global_pool_size", 0) > 0:
-            valid = new_placement[new_placement >= 0]
-            num_logical_experts = int(valid.max().item()) + 1 if valid.numel() else 0
-            pool_start = num_logical_experts // num_ranks if num_ranks else 0
+            pool_start = getattr(self, "num_local_experts_main", None)
+            if pool_start is None:
+                pool_size = self.craft_global_pool_size // num_ranks
+                pool_start = new_placement.shape[2] - pool_size
             pool_owners = torch.sum(new_placement[:, :, pool_start:] >= 0, dim=0)
-            if torch.any(pool_owners != 1):
+            if torch.any(pool_owners > 1):
                 logger.error(
-                    "Every CRAFT global pool slot must be assigned to exactly one layer"
+                    "A CRAFT global pool slot cannot be assigned to multiple layers"
                 )
                 new_placement.copy_(old_placement)
 
@@ -435,10 +459,23 @@ class EplbWorker:
                     expert_recv_info_this_layer[dst_rank_id] = []
 
                 if getattr(self, "craft_global_pool_size", 0) > 0:
-                    num_logical_experts = current_expert_maps_this_layer.shape[1]
-                    main_experts_per_rank = num_logical_experts // current_expert_maps_this_layer.shape[0]
-                    src_rank_id = expert_id // main_experts_per_rank
-                    candidate_src_rank_indices = torch.tensor([src_rank_id])
+                    current_owners = torch.where(
+                        current_expert_maps_this_layer[:, expert_id] >= 0
+                    )[0]
+                    stable_owners = current_owners[
+                        updated_expert_maps_this_layer[current_owners, expert_id]
+                        >= 0
+                    ]
+                    candidate_src_rank_indices = (
+                        stable_owners
+                        if stable_owners.numel() > 0
+                        else current_owners
+                    )
+                    if candidate_src_rank_indices.numel() == 0:
+                        raise ValueError(
+                            "Cannot migrate a CRAFT global pool expert without "
+                            f"a current owner: expert_id={expert_id}."
+                        )
                 elif not torch.isin(torch.tensor(expert_id), experts_to_send).any():
                     # if expert_id are not sent out from any npu, it will be copied from one npu holding this expert
                     candidate_src_rank_indices = torch.where(current_expert_maps_this_layer[:, expert_id] != -1)[0]
@@ -662,6 +699,15 @@ class EplbProcess:
         # Create EplbWorker instance
         self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d, eplb_config)
 
+    @staticmethod
+    def _publish_update(block_update_q, packed_update_info):
+        while True:
+            try:
+                block_update_q.put(packed_update_info, timeout=1.0)
+                return
+            except Full:
+                continue
+
     def worker_process(self, planner_q, block_update_q):
         """
         Subprocess entry: bind to specified NPU, loop waiting for planner_q to wake up,
@@ -674,21 +720,24 @@ class EplbProcess:
         while True:
             try:
                 planner_q.get()
-
+            except (EOFError, OSError):
+                logger.warning("EPLB planner queue closed; stopping subprocess")
+                break
+            try:
                 packed_update_info = self.worker.do_update()
-
-                while True:
-                    if not block_update_q.empty():
-                        continue
-                    block_update_q.put(packed_update_info)
-                    break
-
             except Exception as e:
+                if self.policy_type != 4:
+                    logger.warning(
+                        f"[EPLB subprocess exiting due to error: {e}]",
+                        exc_info=True,
+                    )
+                    break
                 logger.warning(
-                    f"[EPLB subprocess exiting due to error: {e}]",
+                    f"[EPLB subprocess update failed; publishing no-op: {e}]",
                     exc_info=True,
                 )
-                break
+                packed_update_info = None
+            self._publish_update(block_update_q, packed_update_info)
 
     def _launch_process(self):
         """

@@ -47,7 +47,9 @@ from vllm_ascend.eplb.core.eplb_utils import (
     get_craft_global_pool_size_per_rank,
     init_eplb_config,
 )
-from vllm_ascend.eplb.global_expert_pool import clear_global_craft_expert_pools
+from vllm_ascend.eplb.global_expert_pool import (
+    begin_global_craft_expert_pool_model,
+)
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import (
     build_force_load_balance_routing,
@@ -380,6 +382,11 @@ class AscendFusedMoE(FusedMoE):
     gate_stream: torch.npu.Stream | None = None
     force_load_balance_ids_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
+    @classmethod
+    def begin_model_build(cls) -> int:
+        cls.moe_counter = -1
+        return begin_global_craft_expert_pool_model()
+
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         # CRAFT keeps a logical-id map while vLLM's redundant-expert weight
         # mapping also emits synthetic physical ids after the logical range.
@@ -449,8 +456,6 @@ class AscendFusedMoE(FusedMoE):
             quant_scheme, "supports_global_craft_pool", False
         ):
             raise ValueError("craft_global_pool_size currently supports only W8A8 dynamic MoE weights.")
-        if self.craft_global_pool_enabled and self.moe_instance_id == 0:
-            clear_global_craft_expert_pools()
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
         self.global_expert_map, self._expert_map, self.log2phy, self.global_redundant_expert_num = init_eplb_config(
             eplb_config, self.moe_instance_id, self.moe_config
