@@ -322,6 +322,7 @@ class PoolBalanceEplb(EplbPolicy):
         layer_id,
         expert_id,
         rank_id,
+        old_max=None,
     ):
         copies = int(copy_counts[layer_id, expert_id])
         expert_hotness = float(hotness[layer_id, expert_id])
@@ -331,7 +332,9 @@ class PoolBalanceEplb(EplbPolicy):
         for host_rank in hosts[layer_id][expert_id]:
             new_loads[host_rank] -= decrease
         new_loads[rank_id] += expert_hotness / (copies + 1)
-        return float(old_loads.max() - new_loads.max()), new_loads
+        if old_max is None:
+            old_max = old_loads.max()
+        return float(old_max - new_loads.max()), new_loads
 
     def _desired_global_assignments(
         self,
@@ -357,6 +360,7 @@ class PoolBalanceEplb(EplbPolicy):
                     rank_loads[layer_id, rank_id] += hotness[layer_id, expert_id]
 
         preferred = preferred_assignments or [[] for _ in range(num_ranks)]
+        layer_max_loads = rank_loads.max(axis=1)
 
         def eligible(layer_id, expert_id, rank_id):
             return (
@@ -379,6 +383,7 @@ class PoolBalanceEplb(EplbPolicy):
                         layer_id,
                         expert_id,
                         rank_id,
+                        old_max=layer_max_loads[layer_id],
                     )
                     key = (
                         gain,
@@ -413,6 +418,7 @@ class PoolBalanceEplb(EplbPolicy):
             copy_counts[layer_id, expert_id] += 1
             hosts[layer_id][expert_id].append(rank_id)
             rank_loads[layer_id] = new_loads
+            layer_max_loads[layer_id] = new_loads.max()
         return assignments
 
     @staticmethod
