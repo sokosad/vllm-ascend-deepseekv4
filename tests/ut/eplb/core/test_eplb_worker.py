@@ -1,3 +1,4 @@
+import logging
 import unittest
 from unittest.mock import MagicMock
 
@@ -252,6 +253,43 @@ def test_craft_pool_utilization_reports_active_pool_slots():
     assert stats["pool_token_share"] == 12.0 / 212.0
     assert stats["zero_hit_layers"] == 0
     assert stats["top_layers"] == [(1, 7, 1), (0, 5, 1)]
+    assert stats["slot_tokens"] == [
+        (0, 0, 0, 4, 5),
+        (0, 1, 0, 1, 0),
+        (1, 0, 0, 2, 0),
+        (1, 1, 0, 0, 7),
+    ]
+
+
+def test_log_craft_pool_utilization_reports_every_slot(caplog):
+    caplog.set_level(logging.INFO)
+    worker = EplbWorker.__new__(EplbWorker)
+    deployment = torch.tensor(
+        [
+            [[0, 1, 4], [2, 3, 1]],
+            [[0, 1, 2], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    load_info = torch.tensor(
+        [
+            [[10, 20, 5], [30, 40, 0]],
+            [[10, 20, 0], [30, 40, 7]],
+        ],
+        dtype=torch.int64,
+    )
+
+    worker._log_craft_pool_utilization(deployment, load_info)
+
+    token_lines = [
+        record.message
+        for record in caplog.records
+        if "[CRAFT-SLOT-TOKENS]" in record.message
+    ]
+    assert token_lines == [
+        "[CRAFT-SLOT-TOKENS] rank=0 slots=0:0:4:5,1:0:2:0",
+        "[CRAFT-SLOT-TOKENS] rank=1 slots=0:0:1:0,1:0:0:7",
+    ]
 
 
 def test_craft_migration_cost_gate_rejects_slow_payback():

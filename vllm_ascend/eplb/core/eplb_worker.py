@@ -226,6 +226,16 @@ class EplbWorker:
         total_tokens = float(np.where(valid, load_info, 0).sum())
         pool_tokens = float(pool_load.sum())
         top_layers = np.argsort(-layer_tokens)[: min(5, len(layer_tokens))]
+        slot_tokens = [
+            (
+                int(layer_id),
+                int(rank_id),
+                int(pool_offset),
+                int(deployment[layer_id, rank_id, pool_start + pool_offset]),
+                int(load_info[layer_id, rank_id, pool_start + pool_offset]),
+            )
+            for layer_id, rank_id, pool_offset in np.argwhere(pool_valid)
+        ]
         return {
             "total_slots": total_slots,
             "active_slots": int(active.sum()),
@@ -237,6 +247,7 @@ class EplbWorker:
                 (int(layer_id), int(layer_tokens[layer_id]), int(layer_active[layer_id]))
                 for layer_id in top_layers
             ],
+            "slot_tokens": slot_tokens,
         }
 
     def _log_craft_pool_utilization(self, deployment, load_info):
@@ -258,6 +269,17 @@ class EplbWorker:
             stats["zero_hit_layers"],
             top_layers,
         )
+        slots_by_rank: dict[int, list[str]] = {}
+        for layer_id, rank_id, pool_offset, expert_id, tokens in stats["slot_tokens"]:
+            slots_by_rank.setdefault(rank_id, []).append(
+                f"{layer_id}:{pool_offset}:{expert_id}:{tokens}"
+            )
+        for rank_id, slots in sorted(slots_by_rank.items()):
+            logger.info(
+                "[CRAFT-SLOT-TOKENS] rank=%d slots=%s",
+                rank_id,
+                ",".join(slots),
+            )
 
     @staticmethod
     def _rank_loads(deployment, hotness):
