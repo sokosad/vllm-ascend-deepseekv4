@@ -255,7 +255,7 @@ class TestAscendConfig(unittest.TestCase):
                     0,
                     local_slots=2,
                 ),
-                torch.tensor([0, 5]),
+                torch.tensor([0, 1]),
             )
         )
         self.assertTrue(
@@ -266,5 +266,15 @@ class TestAscendConfig(unittest.TestCase):
                     local_slots=2,
                 ),
                 torch.tensor([2, 1]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                generate_craft_rank_route_map(
+                    three_rank_placement,
+                    2,
+                    local_slots=2,
+                ),
+                torch.tensor([4, 5]),
             )
         )

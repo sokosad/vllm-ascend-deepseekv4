@@ -320,14 +320,32 @@ def generate_craft_rank_route_map(
     source_rank: int,
     local_slots: int | None = None,
 ):
-    """Select one CRAFT replica per logical expert for a source EP rank."""
+    """Select a local CRAFT replica when possible, then shard the remainder."""
+    if not torch.is_tensor(global_expert_map):
+        global_expert_map = torch.stack(global_expert_map)
+    if local_slots is None:
+        local_slots = int(torch.max(global_expert_map).item()) + 1
     candidates = generate_pool_log2phy_map(
         global_expert_map,
         local_slots=local_slots,
     )
     replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int64)
     logical_ids = torch.arange(candidates.shape[0], dtype=torch.int64)
-    replica_selector = (int(source_rank) + logical_ids) % replica_counts
+    fair_selector = (int(source_rank) + logical_ids) % replica_counts
+    candidate_ranks = torch.div(
+        torch.clamp(candidates, min=0),
+        int(local_slots),
+        rounding_mode="floor",
+    )
+    local_candidates = (candidates >= 0) & (
+        candidate_ranks == int(source_rank)
+    )
+    local_selector = torch.argmax(local_candidates.to(torch.int64), dim=-1)
+    replica_selector = torch.where(
+        torch.any(local_candidates, dim=-1),
+        local_selector,
+        fair_selector,
+    )
     return candidates[logical_ids, replica_selector]
 
 
