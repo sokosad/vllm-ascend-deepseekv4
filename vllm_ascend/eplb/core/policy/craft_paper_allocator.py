@@ -52,6 +52,7 @@ def _logical_copy_counts(
     expert_loads: np.ndarray,
     num_replicas: int,
     num_ranks: int,
+    candidate_mask: np.ndarray,
 ) -> np.ndarray:
     copy_counts = np.ones(expert_loads.size, dtype=np.int64)
     for _ in range(num_replicas):
@@ -62,11 +63,91 @@ def _logical_copy_counts(
             where=copy_counts > 0,
         )
         per_copy[copy_counts >= num_ranks] = -np.inf
+        per_copy[~candidate_mask] = -np.inf
         expert_id = int(np.argmax(per_copy))
         if not np.isfinite(per_copy[expert_id]):
-            raise ValueError("CRAFT cannot place more than one expert copy per rank.")
+            raise ValueError(
+                "CRAFT candidate experts cannot satisfy the replica budget "
+                "without placing duplicate copies on one rank."
+            )
         copy_counts[expert_id] += 1
     return copy_counts
+
+
+def _assign_copy_with_relocation(
+    expert_id: int,
+    per_copy_loads: np.ndarray,
+    assignments: list[list[int]],
+    assigned_experts: list[set[int]],
+    rank_loads: np.ndarray,
+    rank_capacities: np.ndarray,
+    visited_experts: set[int],
+    visited_ranks: set[int],
+) -> bool:
+    if expert_id in visited_experts:
+        return False
+    visited_experts.add(expert_id)
+
+    candidate_ranks = [
+        rank_id
+        for rank_id in range(rank_capacities.size)
+        if rank_id not in visited_ranks
+        and expert_id not in assigned_experts[rank_id]
+    ]
+    free_ranks = [
+        rank_id
+        for rank_id in candidate_ranks
+        if len(assignments[rank_id]) < rank_capacities[rank_id]
+    ]
+    free_ranks.sort(
+        key=lambda rank_id: (
+            rank_loads[rank_id],
+            len(assignments[rank_id]) / max(1, int(rank_capacities[rank_id])),
+            rank_id,
+        )
+    )
+    if free_ranks:
+        rank_id = free_ranks[0]
+        assignments[rank_id].append(expert_id)
+        assigned_experts[rank_id].add(expert_id)
+        rank_loads[rank_id] += per_copy_loads[expert_id]
+        return True
+
+    full_ranks = sorted(
+        candidate_ranks,
+        key=lambda rank_id: (rank_loads[rank_id], rank_id),
+    )
+    for rank_id in full_ranks:
+        visited_ranks.add(rank_id)
+        occupants = sorted(
+            assignments[rank_id],
+            key=lambda occupant: (per_copy_loads[occupant], occupant),
+        )
+        for displaced_expert in occupants:
+            if displaced_expert in visited_experts:
+                continue
+            occupant_index = assignments[rank_id].index(displaced_expert)
+            assignments[rank_id].pop(occupant_index)
+            assigned_experts[rank_id].remove(displaced_expert)
+            rank_loads[rank_id] -= per_copy_loads[displaced_expert]
+            if _assign_copy_with_relocation(
+                displaced_expert,
+                per_copy_loads,
+                assignments,
+                assigned_experts,
+                rank_loads,
+                rank_capacities,
+                visited_experts,
+                visited_ranks,
+            ):
+                assignments[rank_id].insert(occupant_index, expert_id)
+                assigned_experts[rank_id].add(expert_id)
+                rank_loads[rank_id] += per_copy_loads[expert_id]
+                return True
+            assignments[rank_id].insert(occupant_index, displaced_expert)
+            assigned_experts[rank_id].add(displaced_expert)
+            rank_loads[rank_id] += per_copy_loads[displaced_expert]
+    return False
 
 
 def _place_fixed_home_replicas(
@@ -207,9 +288,20 @@ def place_layer_experts(
             candidate_mask,
         )
 
-    copy_counts = _logical_copy_counts(expert_loads, num_replicas, num_ranks)
+    copy_counts = _logical_copy_counts(
+        expert_loads,
+        num_replicas,
+        num_ranks,
+        candidate_mask,
+    )
+    per_copy_loads = np.divide(
+        expert_loads,
+        copy_counts,
+        out=np.zeros_like(expert_loads, dtype=np.float64),
+        where=copy_counts > 0,
+    )
     physical_experts = [
-        (expert_id, float(expert_loads[expert_id]) / int(copy_counts[expert_id]), copy_id)
+        (expert_id, float(per_copy_loads[expert_id]), copy_id)
         for expert_id in range(expert_loads.size)
         for copy_id in range(int(copy_counts[expert_id]))
     ]
@@ -219,28 +311,20 @@ def place_layer_experts(
     assigned_experts = [set() for _ in range(num_ranks)]
     rank_loads = np.zeros(num_ranks, dtype=np.float64)
     for expert_id, per_copy_load, _ in physical_experts:
-        candidates = [
-            rank_id
-            for rank_id in range(num_ranks)
-            if len(assignments[rank_id]) < rank_capacities[rank_id]
-            and expert_id not in assigned_experts[rank_id]
-        ]
-        if not candidates:
+        if not _assign_copy_with_relocation(
+            expert_id,
+            per_copy_loads,
+            assignments,
+            assigned_experts,
+            rank_loads,
+            rank_capacities,
+            set(),
+            set(),
+        ):
             raise ValueError(
                 "CRAFT placement cannot keep replicas of one logical expert "
-                "on distinct ranks."
+                "on distinct ranks for the requested capacities."
             )
-        rank_id = min(
-            candidates,
-            key=lambda candidate: (
-                rank_loads[candidate],
-                len(assignments[candidate]) / max(1, int(rank_capacities[candidate])),
-                candidate,
-            ),
-        )
-        assignments[rank_id].append(expert_id)
-        assigned_experts[rank_id].add(expert_id)
-        rank_loads[rank_id] += per_copy_load
 
     return assignments, rank_loads
 
@@ -331,6 +415,14 @@ def allocate_replica_budget(
     total_replicas: int,
 ) -> np.ndarray:
     benefits = np.asarray(benefits, dtype=np.float64)
+    if benefits.ndim != 2:
+        raise ValueError("CRAFT benefits must have shape [layers, options].")
+    if not options or 0 not in options:
+        raise ValueError("CRAFT replica options must include zero.")
+    if any(option < 0 for option in options):
+        raise ValueError("CRAFT replica options must be non-negative.")
+    if total_replicas < 0:
+        raise ValueError("CRAFT total replicas must be non-negative.")
     num_layers = benefits.shape[0]
     if benefits.shape[1] != len(options):
         raise ValueError("CRAFT benefit columns must match replica options.")
@@ -417,7 +509,8 @@ def plan_craft_replication(
     max_replicas = hotness.shape[0] * options[-1]
     if total_replicas > max_replicas:
         raise ValueError(
-            f"CRAFT replica budget {total_replicas} exceeds maximum {max_replicas}."
+            f"CRAFT replica budget {total_replicas} exceeds maximum {max_replicas}; "
+            "the allocator supports at most one replica per rank per layer."
         )
     if home_placements is not None and len(home_placements) != hotness.shape[0]:
         raise ValueError("CRAFT home placement must have one entry per layer.")

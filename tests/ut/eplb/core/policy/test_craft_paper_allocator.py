@@ -1,7 +1,9 @@
 import numpy as np
 
 from vllm_ascend.eplb.core.policy.craft_paper_allocator import (
+    allocate_replica_budget,
     interleaved_replica_capacities,
+    place_layer_experts,
     plan_craft_replication,
 )
 
@@ -125,3 +127,47 @@ def test_top_m_adds_rank_feasibility_candidates():
         assert rank_experts[:4] == home[0][rank_id]
         assert len(rank_experts) == 5
         assert len(rank_experts) == len(set(rank_experts))
+
+
+def test_no_home_candidate_mask_controls_replication():
+    assignments, _ = place_layer_experts(
+        np.asarray([100.0, 10.0, 1.0, 1.0]),
+        num_replicas=1,
+        rank_capacities=np.asarray([3, 2]),
+        candidate_mask=np.asarray([False, True, False, False]),
+    )
+
+    counts = np.bincount(
+        [expert_id for rank in assignments for expert_id in rank],
+        minlength=4,
+    )
+    assert counts.tolist() == [1, 2, 1, 1]
+
+
+def test_no_home_placement_relocates_to_reach_feasible_solution():
+    assignments, _ = place_layer_experts(
+        np.asarray([1.001, 2.182, 0.772, 0.986, 0.286, 0.993]),
+        num_replicas=2,
+        rank_capacities=np.asarray([3, 3, 2]),
+    )
+
+    assert [len(rank) for rank in assignments] == [3, 3, 2]
+    assert all(len(rank) == len(set(rank)) for rank in assignments)
+    counts = np.bincount(
+        [expert_id for rank in assignments for expert_id in rank],
+        minlength=6,
+    )
+    assert counts.tolist() == [1, 3, 1, 1, 1, 1]
+
+
+def test_budget_options_must_include_zero():
+    try:
+        allocate_replica_budget(
+            np.asarray([[1.0]], dtype=np.float64),
+            options=[1],
+            total_replicas=0,
+        )
+    except ValueError as error:
+        assert "include zero" in str(error)
+    else:
+        raise AssertionError("missing zero option must be rejected")
