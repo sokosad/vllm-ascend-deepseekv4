@@ -392,9 +392,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w1_scale_bias_pool=w1_scale_bias_pool,
                 w2_scale_bias_pool=w2_scale_bias_pool,
                 compact_craft_pool=compact_craft_pool,
-                expert_token_nums=(
-                    layer.craft_expert_token_nums if compact_craft_pool else None
-                ),
+                expert_token_nums=getattr(layer, "craft_expert_token_nums", None),
                 swiglu_limit=layer.swiglu_limit,
             )
         )

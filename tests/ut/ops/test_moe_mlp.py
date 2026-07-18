@@ -245,6 +245,41 @@ class TestW8A8PolicyIsolation(unittest.TestCase):
         mock_force.assert_called_once()
         mock_select.assert_not_called()
 
+    def test_policy4_cold_layer_uses_layer_local_fused_token_buffer(self):
+        method = self._method()
+        layer = self._base_layer()
+        layer.local_num_experts_pool = 0
+        layer.craft_pool_enabled = True
+        layer.w13_weight_list = [torch.empty(16, 8) for _ in range(2)]
+        layer.w2_weight_list = [torch.empty(8, 8) for _ in range(2)]
+        layer.fused_w1_scale_list = [torch.ones(16) for _ in range(2)]
+        layer.fused_w2_scale_list = [torch.ones(8) for _ in range(2)]
+        layer.craft_expert_token_nums = torch.zeros((1, 2), dtype=torch.int32)
+        router_ids = torch.tensor([[7, 6], [5, 4], [3, 2], [1, 0]])
+        router_weights = torch.full((4, 2), 0.5)
+
+        with (
+            patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FUSED_MC2": "1"}),
+            patch(
+                "vllm_ascend.quantization.methods.w8a8_dynamic.select_experts",
+                return_value=(router_weights, router_ids),
+            ),
+            patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX") as extra_ctx,
+        ):
+            extra_ctx.moe_comm_type = MoECommType.FUSED_MC2
+            extra_ctx.moe_comm_method.fused_experts.return_value = torch.empty(4, 8)
+            method.apply(
+                layer=layer,
+                x=torch.empty(4, 8),
+                router_logits=torch.empty(4, 8),
+                top_k=2,
+                renormalize=True,
+                global_num_experts=8,
+            )
+
+        request = extra_ctx.moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertIs(request.expert_token_nums, layer.craft_expert_token_nums)
+
 
 class TestUnifiedApplyMlpRequest(unittest.TestCase):
     def test_request_unquant_path(self):
