@@ -148,14 +148,15 @@ class EplbWorker:
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
-        if (
-            self.policy_type == 4
-            and getattr(self, "craft_global_pool_size", 0) == 0
-            and hotness is not None
-        ):
-            new_placement = self._apply_craft_migration_cost_gate(
-                old_placement, new_placement, hotness
-            )
+        if self.policy_type == 4 and hotness is not None:
+            if getattr(self, "craft_global_pool_size", 0) > 0:
+                new_placement = self._apply_global_craft_migration_cost_gate(
+                    old_placement, new_placement, hotness
+                )
+            else:
+                new_placement = self._apply_craft_migration_cost_gate(
+                    old_placement, new_placement, hotness
+                )
         new_expert_maps = self.local2global(new_placement)
         changed_layers = None
         if self.policy_type == 4:
@@ -353,6 +354,97 @@ class EplbWorker:
         return torch.as_tensor(
             new_table, dtype=new_placement.dtype, device=new_placement.device
         )
+
+    def _apply_global_craft_migration_cost_gate(
+        self, old_placement, new_placement, hotness
+    ):
+        metadata = self.shared_dict.get("craft_expert_cost_metadata", None)
+        if not metadata:
+            logger.warning_once(
+                "CRAFT expert cost metadata is unavailable; global migration "
+                "payback gating is disabled."
+            )
+            return new_placement
+
+        old_table = np.asarray(old_placement)
+        new_table = np.asarray(new_placement)
+        if np.array_equal(old_table, new_table):
+            return new_placement
+
+        pool_start = getattr(self, "num_local_experts_main", None)
+        if pool_start is None:
+            num_ranks = int(old_table.shape[1])
+            pool_size = self.craft_global_pool_size // num_ranks
+            pool_start = old_table.shape[2] - pool_size
+
+        migration_bytes = 0
+        changed_pool_slots = 0
+        for rank_id in range(old_table.shape[1]):
+            for slot_id in range(pool_start, old_table.shape[2]):
+                old_owners = np.flatnonzero(old_table[:, rank_id, slot_id] >= 0)
+                new_owners = np.flatnonzero(new_table[:, rank_id, slot_id] >= 0)
+                old_item = (
+                    (
+                        int(old_owners[0]),
+                        int(old_table[old_owners[0], rank_id, slot_id]),
+                    )
+                    if old_owners.size
+                    else None
+                )
+                new_item = (
+                    (
+                        int(new_owners[0]),
+                        int(new_table[new_owners[0], rank_id, slot_id]),
+                    )
+                    if new_owners.size
+                    else None
+                )
+                if old_item == new_item:
+                    continue
+                changed_pool_slots += 1
+                if new_item is not None and new_item[0] < len(metadata):
+                    migration_bytes += int(
+                        metadata[new_item[0]].get("transfer_bytes", 0)
+                    )
+
+        saved_compute_bytes_per_step = 0.0
+        load_delta = 0.0
+        for layer_id in range(min(len(metadata), old_table.shape[0])):
+            compute_bytes = int(metadata[layer_id].get("compute_bytes", 0))
+            if compute_bytes <= 0:
+                continue
+            old_load = self._rank_loads(old_table[layer_id], hotness[layer_id])
+            new_load = self._rank_loads(new_table[layer_id], hotness[layer_id])
+            layer_load_delta = float(old_load.max() - new_load.max())
+            load_delta += layer_load_delta
+            saved_compute_bytes_per_step += (
+                layer_load_delta
+                * compute_bytes
+                / self.expert_heat_collection_interval
+            )
+
+        if saved_compute_bytes_per_step <= 0:
+            payback_steps = float("inf")
+        else:
+            payback_steps = (
+                migration_bytes
+                * self.craft_migration_cost_ratio
+                / saved_compute_bytes_per_step
+            )
+        accepted = payback_steps <= self.craft_max_payback_steps
+        logger.info(
+            "[CRAFT-GLOBAL-COST] changed_pool_slots=%d migration_mb=%.2f "
+            "load_delta=%.3f saved_compute_mb_per_step=%.3f "
+            "payback_steps=%.1f limit=%d accepted=%s",
+            changed_pool_slots,
+            migration_bytes / 1e6,
+            load_delta,
+            saved_compute_bytes_per_step / 1e6,
+            payback_steps,
+            self.craft_max_payback_steps,
+            accepted,
+        )
+        return new_placement if accepted else old_placement
 
     def check_expert_placement(self, old_placement, new_placement):
         if self.policy_type != 4:

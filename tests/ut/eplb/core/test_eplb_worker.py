@@ -334,6 +334,101 @@ def test_craft_migration_cost_gate_accepts_fast_payback():
     assert torch.equal(gated, new_placement)
 
 
+def test_global_craft_migration_cost_gate_rejects_slow_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, -1]]], dtype=torch.long
+    )
+    new_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, 0]]], dtype=torch.long
+    )
+    hotness = np.asarray([[10.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, old_placement)
+
+
+def test_global_craft_migration_cost_gate_accepts_fast_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, -1]]], dtype=torch.long
+    )
+    new_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, 0]]], dtype=torch.long
+    )
+    hotness = np.asarray([[100.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, new_placement)
+
+
+def test_global_craft_migration_cost_gate_accounts_for_regressed_layers():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 1},
+            {"transfer_bytes": 100, "compute_bytes": 10},
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 100
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [
+            [[0, 1, -1], [2, 3, -1]],
+            [[0, 1, -1], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    new_placement = torch.tensor(
+        [
+            [[0, 1, -1], [2, 3, 0]],
+            [[0, 1, -1], [2, 3, -1]],
+        ],
+        dtype=torch.long,
+    )
+    hotness = np.asarray(
+        [
+            [100.0, 0.0, 0.0, 0.0],
+            [100.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, old_placement)
+
+
 def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
@@ -352,4 +447,19 @@ def load_tests(loader_obj, tests, pattern):
     suite.addTest(unittest.FunctionTestCase(test_craft_pool_utilization_reports_active_pool_slots))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_rejects_slow_payback))
     suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_accepts_fast_payback))
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_rejects_slow_payback
+        )
+    )
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_accepts_fast_payback
+        )
+    )
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_accounts_for_regressed_layers
+        )
+    )
     return suite
