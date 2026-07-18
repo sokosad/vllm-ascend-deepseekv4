@@ -236,6 +236,7 @@ def _place_fixed_home_replicas(
     )
     home_experts = np.asarray(flattened_home, dtype=np.int64)
     home_ranks = np.repeat(np.arange(num_ranks, dtype=np.int64), home_sizes)
+    assigned_sizes = home_sizes.copy()
     rank_loads[:] = np.bincount(
         home_ranks,
         weights=expert_loads[home_experts],
@@ -260,13 +261,7 @@ def _place_fixed_home_replicas(
             - (old_per_copy - new_per_copy)[:, None] * owner_mask[expert_ids]
         )
 
-        rank_has_capacity = np.asarray(
-            [
-                len(assignments[rank_id]) < rank_capacities[rank_id]
-                for rank_id in range(num_ranks)
-            ],
-            dtype=bool,
-        )
+        rank_has_capacity = assigned_sizes < rank_capacities
         valid = (
             rank_has_capacity[:, None]
             & ~owner_mask[expert_ids].T
@@ -311,6 +306,7 @@ def _place_fixed_home_replicas(
         rank_loads = reduced_loads[candidate_id].copy()
         rank_loads[rank_id] += new_per_copy[candidate_id]
         assignments[rank_id].append(expert_id)
+        assigned_sizes[rank_id] += 1
         owner_mask[expert_id, rank_id] = True
         copy_counts[expert_id] += 1
 
