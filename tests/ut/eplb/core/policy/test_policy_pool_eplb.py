@@ -110,6 +110,34 @@ def test_global_pool_assigns_each_active_slot_to_at_most_one_layer():
     assert updated[1, 1, 2].item() == 0
 
 
+def test_global_pool_rebalance_cooldown_starts_after_layout_change():
+    config = DynamicConfig()
+    config.craft_global_pool_size = 2
+    config.craft_pool_min_hotness_delta = 0.0
+    config.craft_global_rebalance_cooldown = 2
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([
+        [[0, 1, -1], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, -1]],
+    ])
+    workload = torch.tensor([
+        [[10, 1, 0], [9, 1, 0]],
+        [[100, 1, 0], [2, 1, 0]],
+    ])
+
+    changed, _, updated = policy.rebalance_experts(current, workload)
+    assert changed
+    assert policy._global_rebalance_cooldown_remaining == 2
+
+    changed, _, cooled = policy.rebalance_experts(
+        torch.tensor(updated),
+        workload.flip(0),
+    )
+    assert not changed
+    assert torch.equal(torch.tensor(cooled), torch.tensor(updated))
+    assert policy._global_rebalance_cooldown_remaining == 1
+
+
 def test_global_pool_hotness_gate_ignores_cold_layer_noise():
     config = DynamicConfig()
     config.craft_pool_top_m = 2

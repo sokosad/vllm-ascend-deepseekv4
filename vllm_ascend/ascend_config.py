@@ -400,6 +400,7 @@ class EplbConfig:
         "craft_pool_top_m_factor": 4,
         "craft_pool_min_hotness_delta": 0.05,
         "craft_pool_min_improvement": 0.01,
+        "craft_global_rebalance_cooldown": 0,
         "craft_pool_max_payback_steps": 0,
         "craft_pool_migration_cost_ratio": 1.0,
         "metro_routing": False,
@@ -432,6 +433,7 @@ class EplbConfig:
             "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
             "craft_pool_min_improvement": (("CRAFT_POOL_MIN_IMPROVEMENT",), float),
+            "craft_global_rebalance_cooldown": (("CRAFT_GLOBAL_REBALANCE_COOLDOWN",), int),
             "craft_pool_max_payback_steps": (("CRAFT_POOL_MAX_PAYBACK_STEPS",), int),
             "craft_pool_migration_cost_ratio": (("CRAFT_POOL_MIGRATION_COST_RATIO",), float),
             "metro_routing": (("VLLM_ASCEND_METRO_ROUTING", "METRO_ROUTING"), self._coerce_bool),
@@ -478,6 +480,7 @@ class EplbConfig:
             "num_redundant_experts",
             "craft_pool_size",
             "craft_global_pool_size",
+            "craft_global_rebalance_cooldown",
             "craft_pool_max_payback_steps",
         ]:
             if not isinstance(self.config[key], int):
@@ -506,6 +509,10 @@ class EplbConfig:
         logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
         logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")
         logger.info(f"The CRAFT pool min improvement is {self.config['craft_pool_min_improvement']}")
+        logger.info(
+            "The CRAFT global rebalance cooldown is "
+            f"{self.config['craft_global_rebalance_cooldown']}"
+        )
         logger.info(f"The CRAFT pool max payback steps is {self.config['craft_pool_max_payback_steps']}")
         logger.info(f"The CRAFT pool migration cost ratio is {self.config['craft_pool_migration_cost_ratio']}")
         logger.info(f"METRO routing is {self.config['metro_routing']}")

@@ -56,6 +56,16 @@ class PoolBalanceEplb(EplbPolicy):
                 0,
             ),
         )
+        self.global_rebalance_cooldown = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_global_rebalance_cooldown",
+                "CRAFT_GLOBAL_REBALANCE_COOLDOWN",
+                0,
+            ),
+        )
+        self._global_rebalance_cooldown_remaining = 0
         self._last_layer_hotness: dict[int, np.ndarray] = {}
         self._last_global_hotness: np.ndarray | None = None
 
@@ -275,6 +285,16 @@ class PoolBalanceEplb(EplbPolicy):
         if delta < self.min_hotness_delta:
             return False
         self._last_global_hotness = normalized.copy()
+        return True
+
+    def _global_rebalance_is_cooling_down(self) -> bool:
+        if self._global_rebalance_cooldown_remaining <= 0:
+            return False
+        self._global_rebalance_cooldown_remaining -= 1
+        logger.info(
+            "[CRAFT-GLOBAL-COOLDOWN] skipped=true remaining=%d",
+            self._global_rebalance_cooldown_remaining,
+        )
         return True
 
     def _global_candidates(self, hotness: np.ndarray, total_slots: int) -> list[tuple[int, int]]:
@@ -603,6 +623,8 @@ class PoolBalanceEplb(EplbPolicy):
                 f"configured={self.global_pool_total_size}, table={pool_size * num_ranks}."
             )
         hotness = self._expert_hotness(current_expert_table, expert_workload)
+        if self._global_rebalance_is_cooling_down():
+            return False, None, current_expert_table.tolist()
         if not self._global_hotness_changed(hotness, pool_size * num_ranks):
             return False, None, current_expert_table.tolist()
         home = [
@@ -675,6 +697,10 @@ class PoolBalanceEplb(EplbPolicy):
         if not accepted:
             return False, None, current_expert_table.tolist()
         changed = not np.array_equal(old_table, new_table)
+        if changed:
+            self._global_rebalance_cooldown_remaining = (
+                self.global_rebalance_cooldown
+            )
         return changed, None, new_table.tolist()
 
     def rebalance_experts(self, current_expert_table, expert_workload):

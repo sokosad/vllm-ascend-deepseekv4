@@ -37,6 +37,7 @@ CRAFT_POOL_POLICY_CONFIG_FIELDS = (
     "craft_pool_top_m_factor",
     "craft_pool_min_hotness_delta",
     "craft_pool_min_improvement",
+    "craft_global_rebalance_cooldown",
 )
 
 
