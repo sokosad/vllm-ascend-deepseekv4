@@ -189,10 +189,19 @@ def _place_fixed_home_replicas(
         (expert_loads.size, num_ranks),
         dtype=bool,
     )
-    for rank_id, rank in enumerate(assignments):
-        rank_loads[rank_id] = float(np.sum(expert_loads[rank]))
-        for expert_id in rank:
-            owner_mask[expert_id, rank_id] = True
+    home_sizes = np.fromiter(
+        (len(rank) for rank in assignments),
+        dtype=np.int64,
+        count=num_ranks,
+    )
+    home_experts = np.asarray(flattened_home, dtype=np.int64)
+    home_ranks = np.repeat(np.arange(num_ranks, dtype=np.int64), home_sizes)
+    rank_loads[:] = np.bincount(
+        home_ranks,
+        weights=expert_loads[home_experts],
+        minlength=num_ranks,
+    )
+    owner_mask[home_experts, home_ranks] = True
     copy_counts = np.ones(expert_loads.size, dtype=np.int64)
     expert_ids = np.flatnonzero(candidate_mask)
     candidate_count = expert_ids.size
