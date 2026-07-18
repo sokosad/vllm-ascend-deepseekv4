@@ -40,6 +40,7 @@ def test_pool_policy_reads_craft_pool_config():
     config.craft_pool_top_m_factor = 2
     config.craft_pool_min_hotness_delta = 0.25
     config.craft_pool_min_improvement = 0.1
+    config.craft_layer_rebalance_cooldown = 3
 
     policy = PoolBalanceEplb(config)
 
@@ -47,6 +48,7 @@ def test_pool_policy_reads_craft_pool_config():
     assert policy.candidate_factor == 2
     assert policy.min_hotness_delta == 0.25
     assert policy.min_improvement == 0.1
+    assert policy.layer_rebalance_cooldown == 3
 
 
 def test_pool_policy_accumulates_small_hotness_changes_before_recompute():
@@ -84,6 +86,36 @@ def test_pool_policy_skips_migration_when_improvement_is_too_small():
 
     assert not changed
     assert torch.equal(torch.tensor(updated), current)
+
+
+def test_layer_pool_rebalance_cooldown_starts_after_layout_change():
+    config = DynamicConfig()
+    config.craft_pool_min_hotness_delta = 0.0
+    config.craft_pool_min_improvement = 0.0
+    config.craft_layer_rebalance_cooldown = 2
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([[
+        [0, 1, 2],
+        [2, 3, 0],
+    ]])
+    workload = torch.tensor([[
+        [1, 100, 1],
+        [1, 1, 1],
+    ]])
+
+    changed, _, updated = policy.rebalance_experts(current, workload)
+
+    assert changed
+    assert policy._layer_rebalance_cooldown_remaining[0] == 2
+
+    changed, _, cooled = policy.rebalance_experts(
+        torch.tensor(updated),
+        workload.flip(1),
+    )
+
+    assert not changed
+    assert torch.equal(torch.tensor(cooled), torch.tensor(updated))
+    assert policy._layer_rebalance_cooldown_remaining[0] == 1
 
 
 def test_global_pool_assigns_each_active_slot_to_at_most_one_layer():

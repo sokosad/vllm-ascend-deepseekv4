@@ -401,6 +401,7 @@ class EplbConfig:
         "craft_pool_min_hotness_delta": 0.05,
         "craft_pool_min_improvement": 0.01,
         "craft_global_rebalance_cooldown": 0,
+        "craft_layer_rebalance_cooldown": 0,
         "craft_pool_max_payback_steps": 0,
         "craft_pool_migration_cost_ratio": 1.0,
         "craft_rank_sharded_routing": False,
@@ -435,6 +436,7 @@ class EplbConfig:
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
             "craft_pool_min_improvement": (("CRAFT_POOL_MIN_IMPROVEMENT",), float),
             "craft_global_rebalance_cooldown": (("CRAFT_GLOBAL_REBALANCE_COOLDOWN",), int),
+            "craft_layer_rebalance_cooldown": (("CRAFT_LAYER_REBALANCE_COOLDOWN",), int),
             "craft_pool_max_payback_steps": (("CRAFT_POOL_MAX_PAYBACK_STEPS",), int),
             "craft_pool_migration_cost_ratio": (("CRAFT_POOL_MIGRATION_COST_RATIO",), float),
             "craft_rank_sharded_routing": (
@@ -489,6 +491,7 @@ class EplbConfig:
             "craft_pool_size",
             "craft_global_pool_size",
             "craft_global_rebalance_cooldown",
+            "craft_layer_rebalance_cooldown",
             "craft_pool_max_payback_steps",
         ]:
             if not isinstance(self.config[key], int):
@@ -522,6 +525,10 @@ class EplbConfig:
         logger.info(
             "The CRAFT global rebalance cooldown is "
             f"{self.config['craft_global_rebalance_cooldown']}"
+        )
+        logger.info(
+            "The CRAFT layer rebalance cooldown is "
+            f"{self.config['craft_layer_rebalance_cooldown']}"
         )
         logger.info(f"The CRAFT pool max payback steps is {self.config['craft_pool_max_payback_steps']}")
         logger.info(f"The CRAFT pool migration cost ratio is {self.config['craft_pool_migration_cost_ratio']}")

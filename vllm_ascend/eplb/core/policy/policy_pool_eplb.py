@@ -65,7 +65,17 @@ class PoolBalanceEplb(EplbPolicy):
                 0,
             ),
         )
+        self.layer_rebalance_cooldown = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_layer_rebalance_cooldown",
+                "CRAFT_LAYER_REBALANCE_COOLDOWN",
+                0,
+            ),
+        )
         self._global_rebalance_cooldown_remaining = 0
+        self._layer_rebalance_cooldown_remaining: dict[int, int] = {}
         self._last_layer_hotness: dict[int, np.ndarray] = {}
         self._last_global_hotness: np.ndarray | None = None
 
@@ -143,6 +153,13 @@ class PoolBalanceEplb(EplbPolicy):
             return True
         self._last_layer_hotness[layer_id] = normalized_hotness.copy()
         return False
+
+    def _layer_cooldown_active(self, layer_id: int) -> bool:
+        remaining = self._layer_rebalance_cooldown_remaining.get(layer_id, 0)
+        if remaining <= 0:
+            return False
+        self._layer_rebalance_cooldown_remaining[layer_id] = remaining - 1
+        return True
 
     def _desired_pool_sets(self, home, hotness, pool_size):
         num_ranks = len(home)
@@ -722,6 +739,8 @@ class PoolBalanceEplb(EplbPolicy):
             if pool_size <= 0:
                 continue
             layer_hotness = hotness[layer_id]
+            if self._layer_cooldown_active(layer_id):
+                continue
             if self._should_skip_layer(layer_id, layer_hotness):
                 continue
             home = [
@@ -746,6 +765,13 @@ class PoolBalanceEplb(EplbPolicy):
                     desired_pool[rank_id],
                     pool_start,
                     local_slots,
+                )
+            if not np.array_equal(
+                old_table[layer_id],
+                new_table[layer_id],
+            ):
+                self._layer_rebalance_cooldown_remaining[layer_id] = (
+                    self.layer_rebalance_cooldown
                 )
 
         changed = not np.array_equal(old_table, new_table)

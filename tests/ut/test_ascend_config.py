@@ -98,6 +98,7 @@ class TestAscendConfig(TestBase):
                 "craft_pool_top_m_factor": 2,
                 "craft_pool_min_hotness_delta": 0.2,
                 "craft_pool_min_improvement": 0.15,
+                "craft_layer_rebalance_cooldown": 4,
                 "craft_pool_max_payback_steps": 300,
                 "craft_pool_migration_cost_ratio": 2.0,
                 "craft_rank_sharded_routing": True,
@@ -111,6 +112,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.eplb_config.craft_pool_top_m_factor, 2)
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_hotness_delta, 0.2)
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.15)
+        self.assertEqual(ascend_config.eplb_config.craft_layer_rebalance_cooldown, 4)
         self.assertEqual(ascend_config.eplb_config.craft_pool_max_payback_steps, 300)
         self.assertEqual(ascend_config.eplb_config.craft_pool_migration_cost_ratio, 2.0)
         self.assertTrue(ascend_config.eplb_config.craft_rank_sharded_routing)
@@ -136,6 +138,7 @@ class TestAscendConfig(TestBase):
             "CRAFT_POOL_TOP_M_FACTOR": "3",
             "CRAFT_POOL_MIN_HOTNESS_DELTA": "0.25",
             "CRAFT_POOL_MIN_IMPROVEMENT": "0.2",
+            "CRAFT_LAYER_REBALANCE_COOLDOWN": "5",
             "CRAFT_POOL_MAX_PAYBACK_STEPS": "240",
             "CRAFT_POOL_MIGRATION_COST_RATIO": "1.5",
             "CRAFT_RANK_SHARDED_ROUTING": "true",
@@ -152,6 +155,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.eplb_config.craft_pool_top_m_factor, 3)
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_hotness_delta, 0.25)
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.2)
+        self.assertEqual(ascend_config.eplb_config.craft_layer_rebalance_cooldown, 5)
         self.assertEqual(ascend_config.eplb_config.craft_pool_max_payback_steps, 240)
         self.assertEqual(ascend_config.eplb_config.craft_pool_migration_cost_ratio, 1.5)
         self.assertTrue(ascend_config.eplb_config.craft_rank_sharded_routing)
