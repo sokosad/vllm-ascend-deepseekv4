@@ -331,16 +331,23 @@ def generate_craft_rank_route_map(
     )
     replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int64)
     logical_ids = torch.arange(candidates.shape[0], dtype=torch.int64)
-    fair_selector = (int(source_rank) + logical_ids) % replica_counts
     candidate_ranks = torch.div(
         torch.clamp(candidates, min=0),
         int(local_slots),
         rounding_mode="floor",
     )
-    local_candidates = (candidates >= 0) & (
-        candidate_ranks == int(source_rank)
-    )
+    valid_candidates = candidates >= 0
+    local_candidates = valid_candidates & (candidate_ranks == int(source_rank))
     local_selector = torch.argmax(local_candidates.to(torch.int64), dim=-1)
+    # Exclude source ranks already pinned to local replicas before distributing
+    # the remaining ranks, otherwise local preference can skew replica load.
+    local_ranks_before = torch.sum(
+        valid_candidates & (candidate_ranks < int(source_rank)),
+        dim=-1,
+        dtype=torch.int64,
+    )
+    remaining_rank = int(source_rank) - local_ranks_before
+    fair_selector = (remaining_rank + logical_ids) % replica_counts
     replica_selector = torch.where(
         torch.any(local_candidates, dim=-1),
         local_selector,

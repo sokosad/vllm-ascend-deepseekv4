@@ -265,7 +265,7 @@ class TestAscendConfig(unittest.TestCase):
                     1,
                     local_slots=2,
                 ),
-                torch.tensor([2, 1]),
+                torch.tensor([2, 5]),
             )
         )
         self.assertTrue(
@@ -278,3 +278,28 @@ class TestAscendConfig(unittest.TestCase):
                 torch.tensor([4, 5]),
             )
         )
+
+    def test_rank_route_balances_non_local_sources_after_local_preference(self):
+        same_parity_replicas = torch.tensor([
+            [0],
+            [-1],
+            [0],
+            [-1],
+        ])
+        routes = torch.stack(
+            [
+                generate_craft_rank_route_map(
+                    same_parity_replicas,
+                    rank_id,
+                    local_slots=1,
+                )
+                for rank_id in range(4)
+            ]
+        )
+
+        physical_ids, source_counts = torch.unique(
+            routes[:, 0],
+            return_counts=True,
+        )
+        self.assertTrue(torch.equal(physical_ids, torch.tensor([0, 2])))
+        self.assertTrue(torch.equal(source_counts, torch.tensor([2, 2])))
