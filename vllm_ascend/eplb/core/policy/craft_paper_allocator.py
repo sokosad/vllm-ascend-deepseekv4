@@ -39,12 +39,18 @@ def _replica_candidate_mask(
     if home_assignments is None:
         return candidate_mask
 
-    all_experts = np.arange(expert_loads.size)
-    for rank in home_assignments:
-        eligible = ~np.isin(all_experts, rank)
-        if np.any(eligible):
-            masked_loads = np.where(eligible, expert_loads, -np.inf)
-            candidate_mask[int(np.argmax(masked_loads))] = True
+    owner_by_expert = np.empty(expert_loads.size, dtype=np.int64)
+    for rank_id, rank in enumerate(home_assignments):
+        owner_by_expert[np.asarray(rank, dtype=np.int64)] = rank_id
+    hottest_expert = int(np.argmax(expert_loads))
+    candidate_mask[hottest_expert] = True
+    hottest_owner = owner_by_expert[hottest_expert]
+    outside_hottest_owner = np.flatnonzero(owner_by_expert != hottest_owner)
+    if outside_hottest_owner.size:
+        outside_loads = expert_loads[outside_hottest_owner]
+        candidate_mask[
+            int(outside_hottest_owner[int(np.argmax(outside_loads))])
+        ] = True
     return candidate_mask
 
 
