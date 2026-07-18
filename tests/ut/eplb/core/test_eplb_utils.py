@@ -167,6 +167,8 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(int((expert_map1 >= 0).sum().item()), 5)
         self.assertIsNotNone(log2phy0)
         self.assertIsNotNone(log2phy1)
+        self.assertEqual(log2phy0.dim(), 1)
+        self.assertEqual(log2phy1.dim(), 2)
 
     def test_init_eplb_config_uses_logical_experts_for_craft_pool(self):
         eplb_config = EplbConfig({"craft_pool_size": 1, "num_redundant_experts": 2})

@@ -218,7 +218,12 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
     if eplb_enable:
-        if pool_mode:
+        layer_uses_pool_route = (
+            craft_pool_size > 0
+            or global_pool_size > 0
+            or expert_file_has_pool_mode(expert_map_path)
+        )
+        if layer_uses_pool_route:
             local_slots = n_experts // ep_size + global_pool_size if global_pool_size > 0 else None
             log2phy = generate_craft_route_map(global_expert_map, local_slots=local_slots).npu()
         elif metro_routing:
