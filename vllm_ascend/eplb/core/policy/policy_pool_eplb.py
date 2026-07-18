@@ -1,5 +1,6 @@
 # Copyright Huawei Technologies Co., Ltd. 2023-2024. All rights reserved.
 import os
+import time
 
 import numpy as np
 import torch
@@ -628,6 +629,7 @@ class PoolBalanceEplb(EplbPolicy):
                     )
                 ),
             )
+        planner_started = time.perf_counter()
         layer_replicas, extra_capacities, placements = plan_craft_replication(
             hotness,
             pool_size * num_ranks,
@@ -635,6 +637,7 @@ class PoolBalanceEplb(EplbPolicy):
             home_placements=home,
             candidate_top_m=planner_top_m,
         )
+        planner_ms = (time.perf_counter() - planner_started) * 1_000.0
         new_table = self._place_global_craft_plan(
             old_table,
             placements,
@@ -657,7 +660,7 @@ class PoolBalanceEplb(EplbPolicy):
         logger.info(
             "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
             "current=%.4f proposed=%.4f improvement=%.4f accepted=%s "
-            "layer_replicas=%s",
+            "planner_top_m=%d planner_ms=%.3f layer_replicas=%s",
             pool_size * num_ranks,
             changed_slots,
             changed_layers,
@@ -665,6 +668,8 @@ class PoolBalanceEplb(EplbPolicy):
             new_imbalance,
             relative_improvement,
             accepted,
+            planner_top_m,
+            planner_ms,
             ",".join(str(int(value)) for value in layer_replicas),
         )
         if not accepted:
