@@ -210,11 +210,6 @@ def _place_fixed_home_replicas(
             rank_loads[None, :]
             - (old_per_copy - new_per_copy)[:, None] * owner_mask[expert_ids]
         )
-        candidate_loads = np.broadcast_to(
-            reduced_loads[None, :, :],
-            (num_ranks, candidate_count, num_ranks),
-        ).copy()
-        candidate_loads[rank_ids, :, rank_ids] += new_per_copy[None, :]
 
         rank_has_capacity = np.asarray(
             [
@@ -230,8 +225,22 @@ def _place_fixed_home_replicas(
         )
         if not np.any(valid):
             raise ValueError("CRAFT cannot place a fixed-home replica.")
-        max_loads = np.max(candidate_loads, axis=2)
-        std_loads = np.std(candidate_loads, axis=2)
+        target_loads = reduced_loads.T + new_per_copy[None, :]
+        max_loads = np.maximum(
+            np.max(reduced_loads, axis=1)[None, :],
+            target_loads,
+        )
+        load_sums = np.sum(reduced_loads, axis=1) + new_per_copy
+        load_square_sums = (
+            np.sum(reduced_loads * reduced_loads, axis=1)[None, :]
+            + 2.0 * reduced_loads.T * new_per_copy[None, :]
+            + new_per_copy[None, :] * new_per_copy[None, :]
+        )
+        variances = (
+            load_square_sums / num_ranks
+            - (load_sums[None, :] / num_ranks) ** 2
+        )
+        std_loads = np.sqrt(np.maximum(variances, 0.0))
         max_loads[~valid] = np.inf
         std_loads[~valid] = np.inf
         order = np.lexsort(
@@ -250,7 +259,8 @@ def _place_fixed_home_replicas(
         rank_id = int(rank_id)
         candidate_id = int(candidate_id)
         expert_id = int(expert_ids[candidate_id])
-        rank_loads = candidate_loads[rank_id, candidate_id]
+        rank_loads = reduced_loads[candidate_id].copy()
+        rank_loads[rank_id] += new_per_copy[candidate_id]
         assignments[rank_id].append(expert_id)
         owner_mask[expert_id, rank_id] = True
         copy_counts[expert_id] += 1
