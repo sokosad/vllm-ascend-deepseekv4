@@ -170,6 +170,9 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         or global_pool_size > 0
         or expert_file_has_pool_mode(expert_map_path)
     )
+    craft_rank_sharded_routing = _coerce_bool(
+        getattr(eplb_config, "craft_rank_sharded_routing", False)
+    )
     metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
     eplb_enable = (
         eplb_config.dynamic_eplb
@@ -225,7 +228,17 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         )
         if layer_uses_pool_route:
             local_slots = n_experts // ep_size + global_pool_size if global_pool_size > 0 else None
-            log2phy = generate_craft_route_map(global_expert_map, local_slots=local_slots).npu()
+            if craft_rank_sharded_routing:
+                log2phy = generate_craft_rank_route_map(
+                    global_expert_map,
+                    moe_config.ep_rank,
+                    local_slots=local_slots,
+                ).npu()
+            else:
+                log2phy = generate_craft_route_map(
+                    global_expert_map,
+                    local_slots=local_slots,
+                ).npu()
         elif metro_routing:
             log2phy = generate_pool_log2phy_map(global_expert_map).npu()
         else:
@@ -300,6 +313,22 @@ def generate_craft_route_map(global_expert_map, local_slots: int | None = None):
     replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int32)
     encoded_counts = -(replica_counts + 1).unsqueeze(-1)
     return torch.cat((candidates, encoded_counts), dim=-1)
+
+
+def generate_craft_rank_route_map(
+    global_expert_map,
+    source_rank: int,
+    local_slots: int | None = None,
+):
+    """Select one CRAFT replica per logical expert for a source EP rank."""
+    candidates = generate_pool_log2phy_map(
+        global_expert_map,
+        local_slots=local_slots,
+    )
+    replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int64)
+    logical_ids = torch.arange(candidates.shape[0], dtype=torch.int64)
+    replica_selector = (int(source_rank) + logical_ids) % replica_counts
+    return candidates[logical_ids, replica_selector]
 
 
 def generate_local_physical_expert_mask(local_num_experts, ep_size, ep_rank):

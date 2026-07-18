@@ -403,6 +403,7 @@ class EplbConfig:
         "craft_global_rebalance_cooldown": 0,
         "craft_pool_max_payback_steps": 0,
         "craft_pool_migration_cost_ratio": 1.0,
+        "craft_rank_sharded_routing": False,
         "metro_routing": False,
     }
 
@@ -436,6 +437,10 @@ class EplbConfig:
             "craft_global_rebalance_cooldown": (("CRAFT_GLOBAL_REBALANCE_COOLDOWN",), int),
             "craft_pool_max_payback_steps": (("CRAFT_POOL_MAX_PAYBACK_STEPS",), int),
             "craft_pool_migration_cost_ratio": (("CRAFT_POOL_MIGRATION_COST_RATIO",), float),
+            "craft_rank_sharded_routing": (
+                ("VLLM_ASCEND_CRAFT_RANK_SHARDED_ROUTING", "CRAFT_RANK_SHARDED_ROUTING"),
+                self._coerce_bool,
+            ),
             "metro_routing": (("VLLM_ASCEND_METRO_ROUTING", "METRO_ROUTING"), self._coerce_bool),
         }
         for key, (env_names, coerce) in env_defaults.items():
@@ -461,6 +466,9 @@ class EplbConfig:
         return bool(value)
 
     def _validate_config(self):
+        self.config["craft_rank_sharded_routing"] = self._coerce_bool(
+            self.config["craft_rank_sharded_routing"]
+        )
         self.config["metro_routing"] = self._coerce_bool(self.config["metro_routing"])
         if self.expert_map_path is not None:
             logger.info(f"The expert_map is {self.config['dynamic_eplb']}")
@@ -491,6 +499,8 @@ class EplbConfig:
             raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
         if not isinstance(self.config["metro_routing"], bool):
             raise TypeError("metro_routing must be a boolean")
+        if not isinstance(self.config["craft_rank_sharded_routing"], bool):
+            raise TypeError("craft_rank_sharded_routing must be a boolean")
         self._validate_craft_pool_layer_sizes()
         self._validate_craft_global_pool_size()
         self._validate_craft_pool_policy_knobs()
@@ -515,6 +525,7 @@ class EplbConfig:
         )
         logger.info(f"The CRAFT pool max payback steps is {self.config['craft_pool_max_payback_steps']}")
         logger.info(f"The CRAFT pool migration cost ratio is {self.config['craft_pool_migration_cost_ratio']}")
+        logger.info(f"CRAFT rank-sharded routing is {self.config['craft_rank_sharded_routing']}")
         logger.info(f"METRO routing is {self.config['metro_routing']}")
 
     def _validate_craft_pool_layer_sizes(self):

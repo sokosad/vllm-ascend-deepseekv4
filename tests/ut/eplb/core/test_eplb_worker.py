@@ -50,6 +50,28 @@ def test_policy4_pack_update_info_marks_unchanged_layer_as_noop():
     assert packed == [{"noop": True, "layer_id": 0}]
 
 
+def test_policy4_rank_sharded_route_packs_distinct_maps():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.full_rank_plan = True
+    worker.craft_rank_sharded_routing = True
+    worker.num_local_experts = 3
+    new_expert_map = torch.tensor(
+        [
+            [0, 1, 2, -1],
+            [0, -1, -1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    packed = worker.pack_update_info([({}, {}, new_expert_map, 0)])
+
+    assert packed[0]["log2phy_all"] == [
+        [0, 1, 2, 4],
+        [3, 1, 2, 4],
+    ]
+
+
 def test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle():
     worker = EplbWorker.__new__(EplbWorker)
     worker.policy_type = 4
@@ -433,6 +455,7 @@ def load_tests(loader_obj, tests, pattern):
     suite = unittest.TestSuite()
     suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
     suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_rank_sharded_route_packs_distinct_maps))
     suite.addTest(unittest.FunctionTestCase(test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle))
     suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_uses_stable_current_owner))
     suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_supports_non_linear_home_placement))

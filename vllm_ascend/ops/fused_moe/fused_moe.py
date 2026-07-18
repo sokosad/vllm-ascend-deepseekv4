@@ -39,6 +39,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (
     expert_file_pool_metadata,
+    generate_craft_rank_route_map,
     generate_craft_route_map,
     generate_local_physical_expert_mask,
     generate_pool_log2phy_map,
@@ -456,6 +457,9 @@ class AscendFusedMoE(FusedMoE):
             quant_scheme, "supports_global_craft_pool", False
         ):
             raise ValueError("craft_global_pool_size currently supports only W8A8 dynamic MoE weights.")
+        self.craft_rank_sharded_routing = _coerce_bool(
+            getattr(eplb_config, "craft_rank_sharded_routing", False)
+        )
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
         self.global_expert_map, self._expert_map, self.log2phy, self.global_redundant_expert_num = init_eplb_config(
             eplb_config, self.moe_instance_id, self.moe_config
@@ -510,10 +514,20 @@ class AscendFusedMoE(FusedMoE):
                     f"pool={self.local_num_experts_pool}.")
             self.global_num_experts = num_experts
             self.global_redundant_expert_num = 0
-            self.log2phy = generate_craft_route_map(
-                self.global_expert_map,
-                local_slots=self.local_num_experts_main + self.local_num_experts_pool,
-            ).npu()
+            local_slots = (
+                self.local_num_experts_main + self.local_num_experts_pool
+            )
+            if self.craft_rank_sharded_routing:
+                self.log2phy = generate_craft_rank_route_map(
+                    self.global_expert_map,
+                    self.ep_rank,
+                    local_slots=local_slots,
+                ).npu()
+            else:
+                self.log2phy = generate_craft_route_map(
+                    self.global_expert_map,
+                    local_slots=local_slots,
+                ).npu()
             self.local_num_experts = self.local_num_experts_main + self.local_num_experts_pool
             self.dispatch_expert_map = generate_local_physical_expert_mask(
                 self.local_num_experts,

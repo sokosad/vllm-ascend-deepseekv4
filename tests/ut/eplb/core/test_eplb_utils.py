@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoE
 
 from vllm_ascend.ascend_config import EplbConfig, init_ascend_config
 from vllm_ascend.eplb.core.eplb_utils import (
+    generate_craft_rank_route_map,
     generate_craft_route_map,
     generate_pool_log2phy_map,
     get_craft_global_pool_size_per_rank,
@@ -141,6 +142,27 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(log2phy.shape, torch.Size([8, 3]))
         self.assertEqual(log2phy[4, 0].item(), 6)
 
+    def test_global_craft_pool_rank_sharded_route_uses_physical_stride(self):
+        self.vllm_config.additional_config = {
+            "refresh": True,
+            "eplb_config": {
+                "dynamic_eplb": True,
+                "eplb_policy_type": 4,
+                "craft_global_pool_size": 4,
+                "craft_rank_sharded_routing": True,
+            },
+        }
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        _, _, log2phy, _ = init_eplb_config(
+            eplb_config,
+            0,
+            self.moe_config,
+        )
+
+        self.assertEqual(log2phy.shape, torch.Size([8]))
+        self.assertEqual(log2phy[4].item(), 6)
+
     def test_global_craft_pool_requires_ep_divisibility(self):
         eplb_config = EplbConfig({
             "dynamic_eplb": True,
@@ -207,3 +229,42 @@ class TestAscendConfig(unittest.TestCase):
         self.assertEqual(craft_route.shape, torch.Size([4, 3]))
         self.assertTrue(torch.equal(craft_route[:, :-1], second_log2phy))
         self.assertTrue(torch.equal(craft_route[:, -1], torch.tensor([-3, -2, -2, -2])))
+
+        rank0_route = generate_craft_rank_route_map(
+            second_placement,
+            0,
+            local_slots=3,
+        )
+        rank1_route = generate_craft_rank_route_map(
+            second_placement,
+            1,
+            local_slots=3,
+        )
+        self.assertTrue(torch.equal(rank0_route, torch.tensor([0, 1, 2, 4])))
+        self.assertTrue(torch.equal(rank1_route, torch.tensor([3, 1, 2, 4])))
+
+        three_rank_placement = torch.tensor([
+            [0, 1],
+            [0, -1],
+            [0, 1],
+        ])
+        self.assertTrue(
+            torch.equal(
+                generate_craft_rank_route_map(
+                    three_rank_placement,
+                    0,
+                    local_slots=2,
+                ),
+                torch.tensor([0, 5]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                generate_craft_rank_route_map(
+                    three_rank_placement,
+                    1,
+                    local_slots=2,
+                ),
+                torch.tensor([2, 1]),
+            )
+        )

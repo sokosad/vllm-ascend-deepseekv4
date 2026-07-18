@@ -100,6 +100,7 @@ class TestAscendConfig(TestBase):
                 "craft_pool_min_improvement": 0.15,
                 "craft_pool_max_payback_steps": 300,
                 "craft_pool_migration_cost_ratio": 2.0,
+                "craft_rank_sharded_routing": True,
             },
             "refresh": True,
         }
@@ -112,6 +113,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.15)
         self.assertEqual(ascend_config.eplb_config.craft_pool_max_payback_steps, 300)
         self.assertEqual(ascend_config.eplb_config.craft_pool_migration_cost_ratio, 2.0)
+        self.assertTrue(ascend_config.eplb_config.craft_rank_sharded_routing)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
@@ -136,6 +138,7 @@ class TestAscendConfig(TestBase):
             "CRAFT_POOL_MIN_IMPROVEMENT": "0.2",
             "CRAFT_POOL_MAX_PAYBACK_STEPS": "240",
             "CRAFT_POOL_MIGRATION_COST_RATIO": "1.5",
+            "CRAFT_RANK_SHARDED_ROUTING": "true",
         },
     )
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
@@ -151,6 +154,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.eplb_config.craft_pool_min_improvement, 0.2)
         self.assertEqual(ascend_config.eplb_config.craft_pool_max_payback_steps, 240)
         self.assertEqual(ascend_config.eplb_config.craft_pool_migration_cost_ratio, 1.5)
+        self.assertTrue(ascend_config.eplb_config.craft_rank_sharded_routing)
 
     @_clean_up_ascend_config
     @patch.dict("os.environ", {"VLLM_ASCEND_METRO_ROUTING": "true"})

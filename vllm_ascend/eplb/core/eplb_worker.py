@@ -24,6 +24,7 @@ import torch.distributed as dist
 from vllm.logger import logger
 
 from vllm_ascend.eplb.core.eplb_utils import (
+    generate_craft_rank_route_map,
     generate_craft_route_map,
     generate_log2phy_map,
     generate_pool_log2phy_map,
@@ -59,6 +60,9 @@ class EplbWorker:
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
         self.metro_routing = _coerce_bool(getattr(eplb_config, "metro_routing", False))
+        self.craft_rank_sharded_routing = _coerce_bool(
+            getattr(eplb_config, "craft_rank_sharded_routing", False)
+        )
         self.craft_global_pool_size = max(
             0, int(getattr(eplb_config, "craft_global_pool_size", 0) or 0)
         )
@@ -714,11 +718,21 @@ class EplbWorker:
                 continue
             num_ranks = int(new_expert_map.shape[0])
             if self.policy_type == 4:
-                shared_log2phy_map = generate_craft_route_map(
-                    new_expert_map,
-                    local_slots=getattr(self, "num_local_experts", None),
-                ).numpy().tolist()
-                log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
+                if getattr(self, "craft_rank_sharded_routing", False):
+                    log2phy_all = [
+                        generate_craft_rank_route_map(
+                            new_expert_map,
+                            rank_id,
+                            local_slots=getattr(self, "num_local_experts", None),
+                        ).numpy().tolist()
+                        for rank_id in range(num_ranks)
+                    ]
+                else:
+                    shared_log2phy_map = generate_craft_route_map(
+                        new_expert_map,
+                        local_slots=getattr(self, "num_local_experts", None),
+                    ).numpy().tolist()
+                    log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
             elif self.full_rank_plan:
                 shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()
                 log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]

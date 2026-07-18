@@ -24,7 +24,10 @@ from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.quantization.methods.base import QuantType
-from vllm_ascend.eplb.core.eplb_utils import generate_craft_route_map
+from vllm_ascend.eplb.core.eplb_utils import (
+    generate_craft_rank_route_map,
+    generate_craft_route_map,
+)
 
 
 class VllmEplbAdaptor:
@@ -294,10 +297,20 @@ class VllmEplbAdaptor:
             main_only_expert_map[
                 main_only_expert_map >= experts.local_num_experts_main
             ] = -1
-            main_only_route = generate_craft_route_map(
-                main_only_expert_map,
-                local_slots=experts.local_num_experts,
+            current_route = getattr(self, "log2phy_map_per_layer", {}).get(
+                layer_id
             )
+            if current_route is not None and current_route.dim() == 1:
+                main_only_route = generate_craft_rank_route_map(
+                    main_only_expert_map,
+                    getattr(experts, "ep_rank", self.rank_id),
+                    local_slots=experts.local_num_experts,
+                )
+            else:
+                main_only_route = generate_craft_route_map(
+                    main_only_expert_map,
+                    local_slots=experts.local_num_experts,
+                )
             self.do_update_log2phy_map(layer_id, main_only_route)
 
     def get_global_expert_map(self):
