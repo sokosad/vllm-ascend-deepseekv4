@@ -321,17 +321,22 @@ def place_layer_experts(
     candidate_mask: np.ndarray | None = None,
     *,
     home_assignments_validated: bool = False,
+    inputs_validated: bool = False,
 ) -> tuple[list[list[int]], np.ndarray]:
-    expert_loads = np.asarray(expert_loads, dtype=np.float64)
-    rank_capacities = np.asarray(rank_capacities, dtype=np.int64)
+    if not inputs_validated:
+        expert_loads = np.asarray(expert_loads, dtype=np.float64)
+        rank_capacities = np.asarray(rank_capacities, dtype=np.int64)
     num_ranks = rank_capacities.size
-    if expert_loads.ndim != 1 or rank_capacities.ndim != 1:
-        raise ValueError("CRAFT layer placement expects one-dimensional inputs.")
-    if int(rank_capacities.sum()) != expert_loads.size + num_replicas:
-        raise ValueError("CRAFT rank capacities do not match the physical expert count.")
+    if not inputs_validated:
+        if expert_loads.ndim != 1 or rank_capacities.ndim != 1:
+            raise ValueError("CRAFT layer placement expects one-dimensional inputs.")
+        if int(rank_capacities.sum()) != expert_loads.size + num_replicas:
+            raise ValueError(
+                "CRAFT rank capacities do not match the physical expert count."
+            )
     if candidate_mask is None:
         candidate_mask = np.ones(expert_loads.size, dtype=bool)
-    else:
+    elif not inputs_validated:
         candidate_mask = np.asarray(candidate_mask, dtype=bool)
         if candidate_mask.shape != expert_loads.shape:
             raise ValueError("CRAFT candidate mask must match the expert load shape.")
@@ -471,6 +476,7 @@ def estimate_replication_benefits(
                 home_assignments=home,
                 candidate_mask=candidate_mask,
                 home_assignments_validated=home_placements_validated,
+                inputs_validated=True,
             )
             benefits[layer_id, option_id] = max(
                 0.0,
@@ -618,6 +624,7 @@ def _place_craft_layers(
             home_assignments=home,
             candidate_mask=candidate_masks[layer_id],
             home_assignments_validated=home is not None,
+            inputs_validated=True,
         )
         placements.append(assignments)
     return placements
