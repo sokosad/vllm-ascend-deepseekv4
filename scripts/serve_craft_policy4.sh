@@ -7,6 +7,8 @@ DP=${DP:-2}
 TP=${TP:-4}
 POOL_SIZE=${POOL_SIZE:-1}
 GLOBAL_POOL_SIZE=${GLOBAL_POOL_SIZE:-0}
+CRAFT_POOL_LAYER_SIZES=${CRAFT_POOL_LAYER_SIZES:-}
+CRAFT_POOL_TOP_M=${CRAFT_POOL_TOP_M:-0}
 HEAT=${HEAT:-60}
 ALGO=${ALGO:-10}
 CRAFT_MIN_HOTNESS_DELTA=${CRAFT_MIN_HOTNESS_DELTA:-0.05}
@@ -27,7 +29,14 @@ fi
 
 EP_SIZE=$((DP * TP))
 NUM_REDUNDANT=$((POOL_SIZE * EP_SIZE))
-if (( GLOBAL_POOL_SIZE > 0 )); then
+if [[ -n "$CRAFT_POOL_LAYER_SIZES" ]]; then
+  if (( POOL_SIZE > 0 || GLOBAL_POOL_SIZE > 0 )); then
+    echo "CRAFT_POOL_LAYER_SIZES conflicts with POOL_SIZE and GLOBAL_POOL_SIZE; set both to 0." >&2
+    exit 2
+  fi
+  POOL_CONFIG='"craft_pool_layer_sizes":'"$CRAFT_POOL_LAYER_SIZES"
+  NUM_REDUNDANT=0
+elif (( GLOBAL_POOL_SIZE > 0 )); then
   if (( POOL_SIZE > 0 )); then
     echo "GLOBAL_POOL_SIZE conflicts with POOL_SIZE; set POOL_SIZE=0 for the global pool." >&2
     exit 2
@@ -62,10 +71,11 @@ ADDITIONAL_CONFIG=$(printf '%s' \
   '"eplb_config":{"dynamic_eplb":true,"eplb_policy_type":4,' \
   "$POOL_CONFIG," \
   '"expert_heat_collection_interval":'"$HEAT"',"algorithm_execution_interval":'"$ALGO"',' \
+  '"craft_pool_top_m":'"$CRAFT_POOL_TOP_M"',' \
   '"craft_pool_min_hotness_delta":'"$CRAFT_MIN_HOTNESS_DELTA"',' \
   '"craft_pool_min_improvement":'"$CRAFT_MIN_IMPROVEMENT"'}}')
 
-echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE global_pool_size=$GLOBAL_POOL_SIZE heat=$HEAT algo=$ALGO min_hotness_delta=$CRAFT_MIN_HOTNESS_DELTA min_improvement=$CRAFT_MIN_IMPROVEMENT fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
+echo "[CRAFT] cards=$CARDS ep=$EP_SIZE pool_size=$POOL_SIZE global_pool_size=$GLOBAL_POOL_SIZE layer_pool_sizes=${CRAFT_POOL_LAYER_SIZES:-none} top_m=$CRAFT_POOL_TOP_M heat=$HEAT algo=$ALGO min_hotness_delta=$CRAFT_MIN_HOTNESS_DELTA min_improvement=$CRAFT_MIN_IMPROVEMENT fused_mc2=$FUSED_MC2 flashcomm1=$FLASHCOMM1 graph_mode=$GRAPH_MODE"
 echo "[CRAFT] additional_config=$ADDITIONAL_CONFIG"
 
 exec vllm serve "$MODEL_PATH" \
