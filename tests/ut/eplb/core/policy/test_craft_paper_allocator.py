@@ -171,3 +171,51 @@ def test_budget_options_must_include_zero():
         assert "include zero" in str(error)
     else:
         raise AssertionError("missing zero option must be rejected")
+
+
+def test_fixed_home_capacity_interleaving_uses_rank_loads():
+    base_loads = np.asarray(
+        [
+            [0.778, 2.637, 1.900, 29.470],
+            [44.447, 9.914, 51.579, 6.977],
+            [51.914, 30.188, 2.448, 1.482],
+            [8.690, 8.392, 19.724, 2.010],
+        ],
+        dtype=np.float64,
+    )
+    hotness = np.zeros((4, 16), dtype=np.float64)
+    home = []
+    for layer_id in range(4):
+        layer_home = []
+        for rank_id in range(4):
+            rank = list(range(rank_id * 4, (rank_id + 1) * 4))
+            layer_home.append(rank)
+            hotness[layer_id, rank[0]] = base_loads[layer_id, rank_id]
+        home.append(layer_home)
+
+    layer_replicas, extra_capacities, _ = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=4,
+        home_placements=home,
+    )
+    slot_only_capacities = interleaved_replica_capacities(
+        layer_replicas,
+        num_ranks=4,
+    )
+
+    def plan_score(capacities):
+        score = 0.0
+        for layer_id in range(4):
+            _, rank_loads = place_layer_experts(
+                hotness[layer_id],
+                num_replicas=int(layer_replicas[layer_id]),
+                rank_capacities=np.full(4, 4) + capacities[layer_id],
+                home_assignments=home[layer_id],
+            )
+            score += rank_loads.mean() / rank_loads.max()
+        return score
+
+    assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+    assert extra_capacities.tolist() != slot_only_capacities.tolist()
+    assert plan_score(extra_capacities) > plan_score(slot_only_capacities)

@@ -398,6 +398,22 @@ def _balancedness(rank_loads: np.ndarray) -> float:
     return float(np.mean(rank_loads)) / max_load
 
 
+def _home_rank_loads(
+    hotness: np.ndarray,
+    home_placements: list[list[list[int]]],
+) -> np.ndarray:
+    return np.asarray(
+        [
+            [
+                float(np.sum(hotness[layer_id, rank]))
+                for rank in home_placements[layer_id]
+            ]
+            for layer_id in range(hotness.shape[0])
+        ],
+        dtype=np.float64,
+    )
+
+
 def estimate_replication_benefits(
     hotness: np.ndarray,
     options: list[int],
@@ -406,23 +422,14 @@ def estimate_replication_benefits(
     candidate_masks: np.ndarray | None = None,
     *,
     home_placements_validated: bool = False,
+    home_rank_loads: np.ndarray | None = None,
 ) -> np.ndarray:
     hotness = np.asarray(hotness, dtype=np.float64)
     num_layers, num_experts = hotness.shape
     benefits = np.zeros((num_layers, len(options)), dtype=np.float64)
     baseline = np.zeros(num_layers, dtype=np.float64)
-    home_rank_loads = None
-    if home_placements is not None:
-        home_rank_loads = np.asarray(
-            [
-                [
-                    float(np.sum(hotness[layer_id, rank]))
-                    for rank in home_placements[layer_id]
-                ]
-                for layer_id in range(num_layers)
-            ],
-            dtype=np.float64,
-        )
+    if home_placements is not None and home_rank_loads is None:
+        home_rank_loads = _home_rank_loads(hotness, home_placements)
 
     for layer_id in range(num_layers):
         home = None if home_placements is None else home_placements[layer_id]
@@ -530,8 +537,15 @@ def allocate_replica_budget(
 def interleaved_replica_capacities(
     layer_replicas: np.ndarray,
     num_ranks: int,
+    rank_base_loads: np.ndarray | None = None,
 ) -> np.ndarray:
     layer_replicas = np.asarray(layer_replicas, dtype=np.int64)
+    if rank_base_loads is not None:
+        rank_base_loads = np.asarray(rank_base_loads, dtype=np.float64)
+        if rank_base_loads.shape != (layer_replicas.size, num_ranks):
+            raise ValueError(
+                "CRAFT rank base loads must have shape [layers, ranks]."
+            )
     assignment = np.repeat(
         (layer_replicas // num_ranks)[:, None],
         num_ranks,
@@ -542,6 +556,18 @@ def interleaved_replica_capacities(
     for layer_id, remainder in enumerate(layer_replicas % num_ranks):
         remainder = int(remainder)
         if remainder == 0:
+            continue
+        if rank_base_loads is not None:
+            rank_ids = np.arange(num_ranks, dtype=np.int64)
+            selected = np.lexsort(
+                (
+                    rank_ids,
+                    rank_base_loads[layer_id],
+                    rank_totals,
+                )
+            )[:remainder]
+            assignment[layer_id, selected] += 1
+            rank_totals[selected] += 1
             continue
         sorted_totals = np.sort(rank_totals)
         cutoff = sorted_totals[remainder - 1]
@@ -587,6 +613,11 @@ def plan_craft_replication(
             hotness.shape[1],
             num_ranks,
         )
+    home_loads = (
+        None
+        if home_placements is None
+        else _home_rank_loads(hotness, home_placements)
+    )
     candidate_masks = np.asarray(
         [
             _replica_candidate_mask(
@@ -605,9 +636,14 @@ def plan_craft_replication(
         home_placements=home_placements,
         candidate_masks=candidate_masks,
         home_placements_validated=home_placements is not None,
+        home_rank_loads=home_loads,
     )
     layer_replicas = allocate_replica_budget(benefits, options, total_replicas)
-    extra_capacities = interleaved_replica_capacities(layer_replicas, num_ranks)
+    extra_capacities = interleaved_replica_capacities(
+        layer_replicas,
+        num_ranks,
+        rank_base_loads=home_loads,
+    )
     main_capacity = hotness.shape[1] // num_ranks
 
     placements: list[list[list[int]]] = []
