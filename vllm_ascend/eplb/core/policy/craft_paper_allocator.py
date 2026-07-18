@@ -590,11 +590,23 @@ def _place_craft_layers(
     extra_capacities: np.ndarray,
     home_placements: list[list[list[int]]] | None,
     candidate_masks: np.ndarray,
+    reuse_placements: list[list[list[int]]] | None = None,
+    reuse_capacities: np.ndarray | None = None,
 ) -> list[list[list[int]]]:
     num_ranks = extra_capacities.shape[1]
     main_capacity = hotness.shape[1] // num_ranks
     placements = []
     for layer_id in range(hotness.shape[0]):
+        if (
+            reuse_placements is not None
+            and reuse_capacities is not None
+            and np.array_equal(
+                extra_capacities[layer_id],
+                reuse_capacities[layer_id],
+            )
+        ):
+            placements.append(reuse_placements[layer_id])
+            continue
         home = None if home_placements is None else home_placements[layer_id]
         if home is None:
             rank_capacities = main_capacity + extra_capacities[layer_id]
@@ -727,6 +739,8 @@ def plan_craft_replication(
             slot_only_capacities,
             home_placements,
             candidate_masks,
+            reuse_placements=placements,
+            reuse_capacities=extra_capacities,
         )
         slot_only_imbalance = _placement_imbalance(
             hotness,
