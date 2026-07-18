@@ -441,17 +441,18 @@ def allocate_replica_budget(
     choices = np.full((num_layers + 1, total_replicas + 1), -1, dtype=np.int64)
     dp[0, 0] = 0.0
     for layer_id in range(1, num_layers + 1):
-        for capacity in range(total_replicas + 1):
-            for option_id, num_replicas in enumerate(options):
-                if num_replicas > capacity:
-                    continue
-                previous = dp[layer_id - 1, capacity - num_replicas]
-                if not np.isfinite(previous):
-                    continue
-                candidate = previous + benefits[layer_id - 1, option_id]
-                if candidate > dp[layer_id, capacity] + 1e-12:
-                    dp[layer_id, capacity] = candidate
-                    choices[layer_id, capacity] = option_id
+        previous = dp[layer_id - 1]
+        for option_id, num_replicas in enumerate(options):
+            if num_replicas > total_replicas:
+                continue
+            candidates = (
+                previous[: total_replicas + 1 - num_replicas]
+                + benefits[layer_id - 1, option_id]
+            )
+            current = dp[layer_id, num_replicas:]
+            improved = candidates > current + 1e-12
+            current[improved] = candidates[improved]
+            choices[layer_id, num_replicas:][improved] = option_id
 
     capacity = total_replicas
     if not np.isfinite(dp[num_layers, capacity]):
