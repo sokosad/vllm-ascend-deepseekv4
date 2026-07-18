@@ -411,6 +411,18 @@ def estimate_replication_benefits(
     num_layers, num_experts = hotness.shape
     benefits = np.zeros((num_layers, len(options)), dtype=np.float64)
     baseline = np.zeros(num_layers, dtype=np.float64)
+    home_rank_loads = None
+    if home_placements is not None:
+        home_rank_loads = np.asarray(
+            [
+                [
+                    float(np.sum(hotness[layer_id, rank]))
+                    for rank in home_placements[layer_id]
+                ]
+                for layer_id in range(num_layers)
+            ],
+            dtype=np.float64,
+        )
 
     for layer_id in range(num_layers):
         home = None if home_placements is None else home_placements[layer_id]
@@ -421,13 +433,8 @@ def estimate_replication_benefits(
                 _balanced_capacities(num_experts, num_ranks),
             )
         else:
-            rank_loads = np.asarray(
-                [
-                    float(np.sum(hotness[layer_id, rank]))
-                    for rank in home
-                ],
-                dtype=np.float64,
-            )
+            assert home_rank_loads is not None
+            rank_loads = home_rank_loads[layer_id]
         baseline[layer_id] = _balancedness(rank_loads)
 
     for option_id, num_replicas in enumerate(options):
@@ -444,13 +451,8 @@ def estimate_replication_benefits(
                     num_ranks,
                 )
             else:
-                base_loads = np.asarray(
-                    [
-                        float(np.sum(hotness[layer_id, rank]))
-                        for rank in home
-                    ],
-                    dtype=np.float64,
-                )
+                assert home_rank_loads is not None
+                base_loads = home_rank_loads[layer_id]
                 extra_capacities = np.zeros(num_ranks, dtype=np.int64)
                 extra_capacities[
                     np.argsort(base_loads, kind="stable")[:num_replicas]
