@@ -552,30 +552,45 @@ class PoolBalanceEplb(EplbPolicy):
 
     @staticmethod
     def _global_imbalance(table, hotness):
-        weighted_ratio = 0.0
-        total_weight = 0.0
-        for layer_id in range(table.shape[0]):
-            valid = table[layer_id] >= 0
-            counts = np.bincount(
-                table[layer_id][valid],
-                minlength=hotness.shape[1],
-            )
-            per_copy = np.divide(
-                hotness[layer_id],
-                counts,
-                out=np.zeros_like(hotness[layer_id], dtype=np.float64),
-                where=counts > 0,
-            )
-            rank_loads = np.asarray(
-                [per_copy[rank[rank >= 0]].sum() for rank in table[layer_id]],
-                dtype=np.float64,
-            )
-            mean_load = float(rank_loads.mean())
-            layer_weight = float(np.sum(hotness[layer_id]))
-            if mean_load > 0 and layer_weight > 0:
-                weighted_ratio += float(rank_loads.max()) / mean_load * layer_weight
-                total_weight += layer_weight
-        return weighted_ratio / total_weight if total_weight > 0 else 0.0
+        table = np.asarray(table)
+        hotness = np.asarray(hotness, dtype=np.float64)
+        valid = table >= 0
+        layer_ids = np.broadcast_to(
+            np.arange(table.shape[0], dtype=np.int64)[:, None, None],
+            table.shape,
+        )
+        rank_ids = np.broadcast_to(
+            np.arange(table.shape[1], dtype=np.int64)[None, :, None],
+            table.shape,
+        )
+        counts = np.zeros(hotness.shape, dtype=np.int64)
+        np.add.at(
+            counts,
+            (layer_ids[valid], table[valid]),
+            1,
+        )
+        per_copy = np.divide(
+            hotness,
+            counts,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=counts > 0,
+        )
+        rank_loads = np.zeros(table.shape[:2], dtype=np.float64)
+        np.add.at(
+            rank_loads,
+            (layer_ids[valid], rank_ids[valid]),
+            per_copy[layer_ids[valid], table[valid]],
+        )
+        mean_loads = np.mean(rank_loads, axis=1)
+        layer_weights = np.sum(hotness, axis=1)
+        active = (mean_loads > 0) & (layer_weights > 0)
+        if not np.any(active):
+            return 0.0
+        ratios = np.max(rank_loads[active], axis=1) / mean_loads[active]
+        return float(
+            np.sum(ratios * layer_weights[active])
+            / np.sum(layer_weights[active])
+        )
 
     def _rebalance_global_pool(self, current_expert_table, expert_workload, pool_start):
         old_table = current_expert_table.detach().cpu().numpy()
