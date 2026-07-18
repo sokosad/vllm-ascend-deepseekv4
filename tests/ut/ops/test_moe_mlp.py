@@ -16,6 +16,7 @@ from vllm_ascend.ops.fused_moe.fused_moe import (
     _craft_graph_buffer,
     _is_craft_pool_graph_capturing,
     _is_craft_pool_graph_mode,
+    _needs_craft_pool_route,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
@@ -62,6 +63,36 @@ class TestCumsumGroupList(unittest.TestCase):
 
 
 class TestCraftPoolSplitHelpers(unittest.TestCase):
+    def test_layerwise_cold_layer_preserves_home_only_route(self):
+        self.assertFalse(
+            _needs_craft_pool_route(
+                pool_map_enabled=False,
+                local_pool_size=0,
+                global_pool_enabled=False,
+            )
+        )
+        self.assertTrue(
+            _needs_craft_pool_route(
+                pool_map_enabled=False,
+                local_pool_size=1,
+                global_pool_enabled=False,
+            )
+        )
+        self.assertTrue(
+            _needs_craft_pool_route(
+                pool_map_enabled=True,
+                local_pool_size=0,
+                global_pool_enabled=False,
+            )
+        )
+        self.assertTrue(
+            _needs_craft_pool_route(
+                pool_map_enabled=False,
+                local_pool_size=0,
+                global_pool_enabled=True,
+            )
+        )
+
     def test_pool_weight_mapping_ignores_synthetic_physical_ids(self):
         layer = object.__new__(AscendFusedMoE)
         torch.nn.Module.__init__(layer)

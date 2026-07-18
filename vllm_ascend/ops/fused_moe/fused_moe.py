@@ -96,6 +96,15 @@ def _coerce_bool(value) -> bool:
     return bool(value)
 
 
+def _needs_craft_pool_route(
+    pool_map_enabled: bool,
+    local_pool_size: int,
+    global_pool_enabled: bool,
+) -> bool:
+    """Return whether this layer has physical pool replicas to route to."""
+    return pool_map_enabled or local_pool_size > 0 or global_pool_enabled
+
+
 def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
     if not bool(getattr(layer, "craft_pool_enabled", False)):
         return False
@@ -517,17 +526,22 @@ class AscendFusedMoE(FusedMoE):
             local_slots = (
                 self.local_num_experts_main + self.local_num_experts_pool
             )
-            if self.craft_rank_sharded_routing:
-                self.log2phy = generate_craft_rank_route_map(
-                    self.global_expert_map,
-                    self.ep_rank,
-                    local_slots=local_slots,
-                ).npu()
-            else:
-                self.log2phy = generate_craft_route_map(
-                    self.global_expert_map,
-                    local_slots=local_slots,
-                ).npu()
+            if _needs_craft_pool_route(
+                pool_map_enabled,
+                self.local_num_experts_pool,
+                self.craft_global_pool_enabled,
+            ):
+                if self.craft_rank_sharded_routing:
+                    self.log2phy = generate_craft_rank_route_map(
+                        self.global_expert_map,
+                        self.ep_rank,
+                        local_slots=local_slots,
+                    ).npu()
+                else:
+                    self.log2phy = generate_craft_route_map(
+                        self.global_expert_map,
+                        local_slots=local_slots,
+                    ).npu()
             self.local_num_experts = self.local_num_experts_main + self.local_num_experts_pool
             self.dispatch_expert_map = generate_local_physical_expert_mask(
                 self.local_num_experts,
