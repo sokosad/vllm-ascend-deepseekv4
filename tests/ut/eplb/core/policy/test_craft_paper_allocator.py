@@ -219,3 +219,28 @@ def test_fixed_home_capacity_interleaving_uses_rank_loads():
     assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
     assert extra_capacities.tolist() != slot_only_capacities.tolist()
     assert plan_score(extra_capacities) > plan_score(slot_only_capacities)
+
+
+def test_load_aware_interleaving_rejects_realized_regression():
+    rng = np.random.default_rng(7)
+    hotness = rng.lognormal(0, 2, (4, 16))
+    home = [
+        [
+            list(range(rank_id * 4, (rank_id + 1) * 4))
+            for rank_id in range(4)
+        ]
+        for _ in range(4)
+    ]
+
+    layer_replicas, extra_capacities, _ = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=4,
+        home_placements=home,
+    )
+
+    assert layer_replicas.tolist() == [2, 0, 2, 4]
+    assert np.array_equal(
+        extra_capacities,
+        interleaved_replica_capacities(layer_replicas, num_ranks=4),
+    )

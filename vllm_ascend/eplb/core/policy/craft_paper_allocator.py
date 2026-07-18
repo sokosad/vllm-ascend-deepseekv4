@@ -584,6 +584,71 @@ def interleaved_replica_capacities(
     return assignment
 
 
+def _place_craft_layers(
+    hotness: np.ndarray,
+    layer_replicas: np.ndarray,
+    extra_capacities: np.ndarray,
+    home_placements: list[list[list[int]]] | None,
+    candidate_masks: np.ndarray,
+) -> list[list[list[int]]]:
+    num_ranks = extra_capacities.shape[1]
+    main_capacity = hotness.shape[1] // num_ranks
+    placements = []
+    for layer_id in range(hotness.shape[0]):
+        home = None if home_placements is None else home_placements[layer_id]
+        if home is None:
+            rank_capacities = main_capacity + extra_capacities[layer_id]
+        else:
+            rank_capacities = np.asarray(
+                [len(rank) for rank in home],
+                dtype=np.int64,
+            ) + extra_capacities[layer_id]
+        assignments, _ = place_layer_experts(
+            hotness[layer_id],
+            int(layer_replicas[layer_id]),
+            rank_capacities,
+            home_assignments=home,
+            candidate_mask=candidate_masks[layer_id],
+            home_assignments_validated=home is not None,
+        )
+        placements.append(assignments)
+    return placements
+
+
+def _placement_imbalance(
+    hotness: np.ndarray,
+    placements: list[list[list[int]]],
+) -> float:
+    weighted_ratio = 0.0
+    total_weight = 0.0
+    num_experts = hotness.shape[1]
+    for layer_id, rank_assignments in enumerate(placements):
+        counts = np.bincount(
+            [
+                expert_id
+                for rank in rank_assignments
+                for expert_id in rank
+            ],
+            minlength=num_experts,
+        )
+        per_copy = np.divide(
+            hotness[layer_id],
+            counts,
+            out=np.zeros(num_experts, dtype=np.float64),
+            where=counts > 0,
+        )
+        rank_loads = np.asarray(
+            [float(np.sum(per_copy[rank])) for rank in rank_assignments],
+            dtype=np.float64,
+        )
+        mean_load = float(np.mean(rank_loads))
+        layer_weight = float(np.sum(hotness[layer_id]))
+        if mean_load > 0 and layer_weight > 0:
+            weighted_ratio += float(np.max(rank_loads)) / mean_load * layer_weight
+            total_weight += layer_weight
+    return weighted_ratio / total_weight if total_weight > 0 else 0.0
+
+
 def plan_craft_replication(
     hotness: np.ndarray,
     total_replicas: int,
@@ -639,30 +704,41 @@ def plan_craft_replication(
         home_rank_loads=home_loads,
     )
     layer_replicas = allocate_replica_budget(benefits, options, total_replicas)
+    slot_only_capacities = interleaved_replica_capacities(
+        layer_replicas,
+        num_ranks,
+    )
     extra_capacities = interleaved_replica_capacities(
         layer_replicas,
         num_ranks,
         rank_base_loads=home_loads,
     )
-    main_capacity = hotness.shape[1] // num_ranks
-
-    placements: list[list[list[int]]] = []
-    for layer_id in range(hotness.shape[0]):
-        home = None if home_placements is None else home_placements[layer_id]
-        if home is None:
-            rank_capacities = main_capacity + extra_capacities[layer_id]
-        else:
-            rank_capacities = np.asarray(
-                [len(rank) for rank in home],
-                dtype=np.int64,
-            ) + extra_capacities[layer_id]
-        assignments, _ = place_layer_experts(
-            hotness[layer_id],
-            int(layer_replicas[layer_id]),
-            rank_capacities,
-            home_assignments=home,
-            candidate_mask=candidate_masks[layer_id],
-            home_assignments_validated=home is not None,
+    placements = _place_craft_layers(
+        hotness,
+        layer_replicas,
+        extra_capacities,
+        home_placements,
+        candidate_masks,
+    )
+    if not np.array_equal(extra_capacities, slot_only_capacities):
+        slot_only_placements = _place_craft_layers(
+            hotness,
+            layer_replicas,
+            slot_only_capacities,
+            home_placements,
+            candidate_masks,
         )
-        placements.append(assignments)
+        slot_only_imbalance = _placement_imbalance(
+            hotness,
+            slot_only_placements,
+        )
+        load_aware_imbalance = _placement_imbalance(hotness, placements)
+        relative_improvement = (
+            (slot_only_imbalance - load_aware_imbalance) / slot_only_imbalance
+            if slot_only_imbalance > 0
+            else 0.0
+        )
+        if relative_improvement < 1e-3:
+            extra_capacities = slot_only_capacities
+            placements = slot_only_placements
     return layer_replicas, extra_capacities, placements
