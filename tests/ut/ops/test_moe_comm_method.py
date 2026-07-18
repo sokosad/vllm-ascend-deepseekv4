@@ -137,6 +137,7 @@ class TestMoECommMethod(TestBase):
             dtype=torch.int32,
         )
         self.assertTrue(torch.equal(routed, expected))
+        self.assertEqual(routed.dtype, topk_ids.dtype)
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(

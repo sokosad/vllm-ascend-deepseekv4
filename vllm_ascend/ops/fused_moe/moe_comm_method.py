@@ -81,7 +81,7 @@ def _apply_log2phy(
         return log2phy[topk_ids]
 
     if compact_craft_pool:
-        logical_ids = topk_ids.to(torch.int64)
+        logical_ids = topk_ids
         candidate_map = log2phy[:, :-1]
         # generate_craft_route_map rejects logical experts without a replica,
         # so compact counts are already positive and need no runtime clamp.
@@ -95,7 +95,11 @@ def _apply_log2phy(
     if metro_routing:
         replica_selector = logical_ids % replica_counts
     else:
-        token_selector = torch.arange(topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64)
+        token_selector = torch.arange(
+            topk_ids.shape[0],
+            device=topk_ids.device,
+            dtype=logical_ids.dtype,
+        )
         while token_selector.dim() < topk_ids.dim():
             token_selector = token_selector.unsqueeze(-1)
         replica_selector = (token_selector + logical_ids) % replica_counts
