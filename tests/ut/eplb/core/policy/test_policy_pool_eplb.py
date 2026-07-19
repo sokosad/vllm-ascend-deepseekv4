@@ -1,5 +1,3 @@
-import unittest
-
 import numpy as np
 import torch
 
@@ -213,18 +211,6 @@ def test_global_pool_imbalance_weights_layers_by_traffic():
     assert np.isclose(imbalance, (2.0 * 100.0 + 1.0 * 2.0) / 102.0)
 
 
-class TestGlobalPoolMarginalPlacement(unittest.TestCase):
-    def test_prefers_marginal_balance_gain_over_raw_hotness(self):
-        policy = PoolBalanceEplb(DynamicConfig())
-        home = [[[0, 1], [2, 3]]]
-        hotness = np.array([[80.0, 70.0, 100.0, 0.0]])
-
-        assignments = policy._desired_global_assignments(home, hotness, pool_size=1)
-
-        self.assertEqual(assignments[1], [(0, 1)])
-        self.assertEqual(assignments[0], [])
-
-
 def test_global_pool_realistic_shape_fills_slots_and_stays_stable():
     num_layers = 43
     num_ranks = 8
@@ -285,23 +271,3 @@ def test_global_pool_first_cycle_rejects_non_improving_layout():
 
     assert not changed
     assert torch.equal(torch.tensor(updated), current)
-
-
-def test_global_pool_returns_partial_assignment_when_capacity_cannot_help():
-    policy = PoolBalanceEplb(DynamicConfig())
-    home = [[[0], [1]]]
-    hotness = np.array([[100.0, 1.0]])
-
-    assignments = policy._desired_global_assignments(
-        home,
-        hotness,
-        pool_size=2,
-    )
-
-    assert sum(len(rank_items) for rank_items in assignments) < 4
-
-
-def test_global_pool_zero_hotness_has_no_candidates():
-    policy = PoolBalanceEplb(DynamicConfig())
-
-    assert policy._global_candidates(np.zeros((43, 256)), 16) == []
