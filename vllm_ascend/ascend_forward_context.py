@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -10,6 +11,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.eplb.core.eplb_utils import expert_file_has_pool_mode
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -85,6 +87,8 @@ def set_ascend_forward_context(
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
+        forward_context.graph_capture_forward = False
+        forward_context.graph_buffer_warmup = False
 
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
@@ -203,6 +207,22 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _craft_hccl_supports_fused_prefill() -> bool:
+    """Use fused prefill only with the HCCL size validated for large batches."""
+    try:
+        return int(os.getenv("HCCL_BUFFSIZE", "200")) >= 4096
+    except ValueError:
+        return False
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -229,7 +249,67 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     """
     if not is_moe_model(vllm_config):
         return None
+    eplb_config = getattr(vllm_config.parallel_config, "eplb_config", None)
+    additional_config = vllm_config.additional_config or {}
+    ascend_eplb_config = additional_config.get("eplb_config", {})
+    expert_map_path = getattr(eplb_config, "expert_map_path", None)
+    eplb_policy_type = ascend_eplb_config.get(
+        "eplb_policy_type",
+        getattr(eplb_config, "eplb_policy_type", None),
+    )
+    craft_pool_size = ascend_eplb_config.get(
+        "craft_pool_size",
+        getattr(eplb_config, "craft_pool_size", envs_ascend.VLLM_ASCEND_CRAFT_POOL_SIZE),
+    )
+    craft_pool_size = int(craft_pool_size or 0)
+    craft_global_pool_size = int(
+        ascend_eplb_config.get(
+            "craft_global_pool_size",
+            getattr(eplb_config, "craft_global_pool_size", 0),
+        )
+        or 0
+    )
+    craft_pool_layer_sizes = ascend_eplb_config.get(
+        "craft_pool_layer_sizes",
+        getattr(eplb_config, "craft_pool_layer_sizes", None),
+    )
+    if craft_pool_layer_sizes is not None:
+        values = (
+            craft_pool_layer_sizes.values()
+            if isinstance(craft_pool_layer_sizes, dict)
+            else craft_pool_layer_sizes
+        )
+        craft_pool_size = max((int(size or 0) for size in values), default=0)
+    metro_routing = ascend_eplb_config.get(
+        "metro_routing",
+        getattr(eplb_config, "metro_routing", envs_ascend.VLLM_ASCEND_METRO_ROUTING),
+    )
+    expert_map_pool_mode = expert_file_has_pool_mode(expert_map_path)
+    craft_pool_mode = (
+        eplb_policy_type == 4
+        or craft_pool_size > 0
+        or _as_bool(metro_routing)
+        or expert_map_pool_mode
+    )
+    policy4_fused_pool = (
+        eplb_policy_type == 4
+        and (craft_pool_size > 0 or craft_global_pool_size > 0 or expert_map_pool_mode)
+        and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+    )
+    if craft_pool_mode and not policy4_fused_pool:
+        return MoECommType.ALLGATHER
     mc2_tokens_capacity = get_mc2_tokens_capacity()
+    if (
+        policy4_fused_pool
+        and num_tokens > mc2_tokens_capacity
+        and not _craft_hccl_supports_fused_prefill()
+    ):
+        # DispatchFFNCombine's HCCL workspace grows with the token count and is
+        # intended for the bounded decode path. With the default small HCCL
+        # buffer, keep Policy4 prefill/profile on its compact-pool AllGather path.
+        # A validated large HCCL buffer can use the same fused prefill path as
+        # Policy2, avoiding AllGather's additional profile activation peak.
+        return MoECommType.ALLGATHER
     soc_version = get_ascend_device_type()
     quant_type = getattr(
         vllm_config.model_config.hf_text_config,
@@ -290,6 +370,8 @@ class _ExtraForwardContextProxy:
 
     extra_attrs = (
         "capturing",
+        "graph_capture_forward",
+        "graph_buffer_warmup",
         "moe_comm_type",
         "moe_comm_method",
         "mmrs_fusion",

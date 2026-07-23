@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Optional
 from collections.abc import Callable
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,56 @@ from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import get_weight_prefetch_method
+
+
+_TID2EID_CACHE: dict[tuple[int, tuple[int, ...], str, int | None, int], torch.Tensor] = {}
+
+
+def _dynamo_is_compiling() -> bool:
+    try:
+        dynamo = getattr(torch, "_dynamo", None)
+        return bool(dynamo is not None and dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+def _prepare_hash_input_ids(input_ids: torch.Tensor, expected_tokens: int) -> torch.Tensor:
+    input_ids = input_ids.reshape(-1).to(torch.int64)
+    if input_ids.shape[0] < expected_tokens:
+        pad = input_ids.new_zeros(expected_tokens - input_ids.shape[0])
+        input_ids = torch.cat((input_ids, pad), dim=0)
+    elif input_ids.shape[0] > expected_tokens:
+        input_ids = input_ids[:expected_tokens]
+    input_ids = torch.where(input_ids == -1, input_ids.new_zeros(()), input_ids)
+    return input_ids.contiguous()
+
+
+def _prepare_hash_tid2eid(
+    tid2eid: torch.Tensor,
+    expert_count: int,
+) -> torch.Tensor:
+    key = (
+        tid2eid.data_ptr(),
+        tuple(tid2eid.shape),
+        tid2eid.device.type,
+        tid2eid.device.index,
+        expert_count,
+    )
+    cached = _TID2EID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    tid2eid_i32 = tid2eid.to(torch.int32)
+    if expert_count <= 0 or _dynamo_is_compiling():
+        return tid2eid_i32
+
+    min_id = int(tid2eid_i32.min().item()) if tid2eid_i32.numel() else 0
+    max_id = int(tid2eid_i32.max().item()) if tid2eid_i32.numel() else -1
+    if min_id < 0 or max_id >= expert_count:
+        tid2eid_i32 = torch.clamp(tid2eid_i32, min=0, max=expert_count - 1)
+    tid2eid_i32 = tid2eid_i32.contiguous()
+    _TID2EID_CACHE[key] = tid2eid_i32
+    return tid2eid_i32
 
 
 def select_experts(
@@ -113,6 +163,35 @@ def select_experts(
             tid2eid=None,
             input_ids=None,
         )
+    return topk_weights, topk_ids
+
+
+def build_force_load_balance_routing(
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    log2phy: torch.Tensor | None = None,
+    weight_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if log2phy is not None:
+        force_topk_ids = layer.force_load_balance_routed_topk_ids
+    else:
+        force_topk_ids = layer.force_load_balance_topk_ids
+
+    num_tokens = hidden_states.shape[0]
+    topk_ids = force_topk_ids[:num_tokens]
+    if topk_ids.shape[-1] != top_k:
+        topk_ids = topk_ids[:, :top_k]
+
+    dtype = weight_dtype if weight_dtype is not None else hidden_states.dtype
+    if not torch.empty((), dtype=dtype).is_floating_point():
+        dtype = torch.float32
+    topk_weights = torch.full(
+        topk_ids.shape,
+        1.0 / top_k,
+        device=hidden_states.device,
+        dtype=dtype,
+    )
     return topk_weights, topk_ids
 
 
@@ -234,8 +313,8 @@ def _select_experts_with_fusion_ops(
         if tid2eid is not None:
             forward_context = get_forward_context()
             input_ids = forward_context.input_ids.to(torch.int64)
-            # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
-            tid2eid_ones = tid2eid.to(torch.int32)
+            expert_count = int(global_num_experts if global_num_experts > 0 else router_logits.shape[-1])
+            tid2eid_ones = _prepare_hash_tid2eid(tid2eid, expert_count)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:
                 prepare_finalize = forward_context.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(
@@ -251,7 +330,7 @@ def _select_experts_with_fusion_ops(
                 splitted_input = split_tensor_along_first_dim(
                     input_ids, num_partitions=tp_size)
                 input_ids = splitted_input[tp_rank].contiguous()
-            input_ids = torch.where(input_ids == -1, 0, input_ids)
+            input_ids = _prepare_hash_input_ids(input_ids, int(router_logits.shape[0]))
         else:
             input_ids = None
             tid2eid_ones = None
@@ -287,7 +366,6 @@ def _select_experts_with_fusion_ops(
         eps=1e-20,
         bias_opt=e_score_correction_bias,
     )
-
     return topk_weights, topk_ids
 
 

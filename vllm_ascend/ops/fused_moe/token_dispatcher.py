@@ -344,7 +344,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
-            global_num_experts = len(expert_map) + global_redundant_expert_num
+            global_num_experts = len(expert_map)
+            if global_num_experts < self.num_experts:
+                global_num_experts += global_redundant_expert_num
             mask = expert_map[topk_ids] != -1
             topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
@@ -353,17 +355,31 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
-        sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = DeviceOperator.npu_moe_init_routing(
-            hidden_states,
-            topk_ids,
-            scale=pertoken_scale,
-            active_num=num_tokens * self.top_k,
-            expert_num=global_num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_expert_range=[first_expert_idx, last_expert_idx],
-            quant_mode=1 if with_quant and pertoken_scale is None else -1,
-        )
+        init_routing_kwargs = {
+            "scale": pertoken_scale,
+            "active_num": num_tokens * self.top_k,
+            "expert_num": global_num_experts,
+            "expert_tokens_num_type": 1,
+            "expert_tokens_num_flag": True,
+            "active_expert_range": [first_expert_idx, last_expert_idx],
+            "quant_mode": 1 if with_quant and pertoken_scale is None else -1,
+        }
+        if (
+            token_dispatch_input.routing.log2phy is not None
+            and token_dispatch_input.routing.log2phy.dim() == 2
+            and hasattr(torch_npu, "npu_moe_init_routing_v2")
+        ):
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids,
+                **init_routing_kwargs,
+            )
+        else:
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = DeviceOperator.npu_moe_init_routing(
+                hidden_states,
+                topk_ids,
+                **init_routing_kwargs,
+            )
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1  # `count` mode
 

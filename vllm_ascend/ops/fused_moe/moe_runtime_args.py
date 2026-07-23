@@ -144,6 +144,16 @@ def build_fused_experts_input(
     w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    w1_pool: torch.Tensor | list[torch.Tensor] | None = None,
+    w2_pool: torch.Tensor | list[torch.Tensor] | None = None,
+    w1_scale_pool: list[torch.Tensor] | torch.Tensor | None = None,
+    w2_scale_pool: list[torch.Tensor] | torch.Tensor | None = None,
+    w1_scale_bias_pool: list[torch.Tensor] | torch.Tensor | None = None,
+    w2_scale_bias_pool: list[torch.Tensor] | torch.Tensor | None = None,
+    w1_offset_pool: torch.Tensor | None = None,
+    w2_offset_pool: torch.Tensor | None = None,
+    compact_craft_pool: bool = False,
+    expert_token_nums: torch.Tensor | None = None,
     swiglu_limit: int = 0,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
@@ -161,6 +171,14 @@ def build_fused_experts_input(
             w2_scale_bias=w2_scale_bias,
             w1_offset=w1_offset,
             w2_offset=w2_offset,
+            w1_pool=w1_pool,
+            w2_pool=w2_pool,
+            w1_scale_pool=w1_scale_pool,
+            w2_scale_pool=w2_scale_pool,
+            w1_scale_bias_pool=w1_scale_bias_pool,
+            w2_scale_bias_pool=w2_scale_bias_pool,
+            w1_offset_pool=w1_offset_pool,
+            w2_offset_pool=w2_offset_pool,
         ),
         routing=MoERoutingParams(
             expert_map=expert_map,
@@ -173,6 +191,8 @@ def build_fused_experts_input(
         activation=activation,
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
+        compact_craft_pool=compact_craft_pool,
+        expert_token_nums=expert_token_nums,
         quant=MoEQuantParams(
             quant_type=quant_type,
             comm_quant_mode=comm_quant_mode,
@@ -208,6 +228,7 @@ def build_mlp_compute_input(
     fused_experts_input: MoEFusedExpertsInput,
     token_dispatch_output: MoETokenDispatchOutput[TMoECombineMetadata],
     use_fusion_ops: bool,
+    disable_triton_activation: bool = False,
 ) -> MoEMlpComputeInput:
     if fused_experts_input.quant.is_mxfp and fused_experts_input.quant.mxfp is None:
         raise ValueError("fused_experts_input.quant.mxfp is required when quant_type is QuantType.MXFP8.")
@@ -224,7 +245,9 @@ def build_mlp_compute_input(
         activation=fused_experts_input.activation,
         need_trans=fused_experts_input.need_trans,
         dynamic_eplb=fused_experts_input.dynamic_eplb,
+        compact_craft_pool=fused_experts_input.compact_craft_pool,
         swiglu_limit=fused_experts_input.swiglu_limit,
+        disable_triton_activation=disable_triton_activation,
     )
 
 

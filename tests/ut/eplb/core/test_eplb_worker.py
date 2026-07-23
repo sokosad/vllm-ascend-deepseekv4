@@ -1,0 +1,512 @@
+import logging
+import unittest
+from unittest.mock import MagicMock
+
+import numpy as np
+import torch
+
+from vllm_ascend.eplb.core.eplb_worker import EplbProcess, EplbWorker
+
+
+def test_pack_update_info_returns_full_rank_plan():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.metro_routing = False
+    worker.full_rank_plan = True
+
+    send_info = {0: [(1, 2)]}
+    recv_info = {1: [(0, 2)]}
+    new_expert_map = torch.tensor(
+        [
+            [0, 1, -1],
+            [0, -1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    packed = worker.pack_update_info([(send_info, recv_info, new_expert_map, 3)])
+
+    assert len(packed) == 1
+    record = packed[0]
+    assert record["send_all"] == [[(1, 2)], []]
+    assert record["recv_all"] == [[], [(0, 2)]]
+    assert record["maps_all"] == [[0, 1, -1], [0, -1, 1]]
+    assert record["layer_id"] == 3
+    assert len(record["log2phy_all"]) == 2
+    assert record["log2phy_all"][0] == record["log2phy_all"][1]
+
+
+def test_policy4_pack_update_info_marks_unchanged_layer_as_noop():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.metro_routing = False
+    worker.full_rank_plan = True
+
+    new_expert_map = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+    packed = worker.pack_update_info(
+        [({}, {}, new_expert_map, 0)], changed_layers=[False]
+    )
+
+    assert packed == [{"noop": True, "layer_id": 0}]
+
+
+def test_policy4_rank_sharded_route_packs_distinct_maps():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.full_rank_plan = True
+    worker.craft_rank_sharded_routing = True
+    worker.num_local_experts = 3
+    new_expert_map = torch.tensor(
+        [
+            [0, 1, 2, -1],
+            [0, -1, -1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    packed = worker.pack_update_info([({}, {}, new_expert_map, 0)])
+
+    assert packed[0]["log2phy_all"] == [
+        [0, 1, 2, 4],
+        [3, 1, 2, 4],
+    ]
+
+
+def test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.full_rank_plan = True
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts = 3
+    expert_map = torch.tensor([[0, 1, -1, -1], [-1, -1, 0, 1]])
+    records = [({}, {}, expert_map, 0), ({}, {}, expert_map, 1)]
+
+    packed = worker.pack_update_info(records, changed_layers=[True, False])
+
+    assert "noop" not in packed[0]
+    assert packed[1] == {"noop": True, "layer_id": 1}
+
+
+def test_global_pool_migration_uses_stable_current_owner():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.craft_global_pool_size = 3
+    current = torch.tensor([[
+        [-1, -1, -1, -1, 2, -1],
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, 0, 1],
+    ]])
+    updated = torch.tensor([[
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, 2, -1],
+        [-1, -1, -1, -1, 0, 1],
+    ]])
+
+    send, recv, _, _ = next(
+        worker.compose_expert_update_info_greedy(updated, current)
+    )
+
+    assert send == {2: [(1, 4)]}
+    assert recv == {1: [(2, 4)]}
+
+
+def test_global_pool_migration_supports_non_linear_home_placement():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.craft_global_pool_size = 3
+    current = torch.tensor([[
+        [-1, -1, -1, -1, 0, -1],
+        [-1, -1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, -1, -1],
+    ]])
+    updated = current.clone()
+    updated[0, 1, 4] = 1
+
+    send, recv, _, _ = next(
+        worker.compose_expert_update_info_greedy(updated, current)
+    )
+
+    assert send == {0: [(1, 4)]}
+    assert recv == {1: [(0, 4)]}
+
+
+def test_policy2_pack_update_info_keeps_rank_local_plan():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 2
+    worker.rank_id = 1
+    worker.metro_routing = False
+    worker.full_rank_plan = False
+
+    send_info = {0: [(1, 2)]}
+    recv_info = {1: [(0, 2)]}
+    new_expert_map = torch.tensor(
+        [
+            [0, 1, -1],
+            [0, -1, 1],
+        ],
+        dtype=torch.long,
+    )
+
+    packed = worker.pack_update_info([(send_info, recv_info, new_expert_map, 3)])
+
+    assert packed == [([], [(0, 2)], [0, -1, 1], [2, 1, 3], 3)]
+
+
+def test_policy2_placement_validation_uses_legacy_path_without_pool_symbols():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 2
+    old_placement = torch.tensor([[[0, 1], [2, 3]]], dtype=torch.long)
+    new_placement = old_placement.clone()
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
+def test_policy4_placement_validation_accepts_padded_pool_slots():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    old_placement = torch.tensor([[[0, 1, 4], [2, 3, -1]]], dtype=torch.long)
+    new_placement = old_placement.clone()
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
+def test_global_pool_validation_accepts_unowned_slot():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor([
+        [[0, 1, 2], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, 0]],
+    ])
+    new_placement = old_placement.clone()
+    new_placement[1, 1, 2] = -1
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert new_placement[1, 1, 2].item() == -1
+
+
+def test_global_pool_validation_rejects_multiply_owned_slot():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.policy_type = 4
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor([
+        [[0, 1, 2], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, 0]],
+    ])
+    new_placement = old_placement.clone()
+    new_placement[1, 0, 2] = 3
+
+    worker.check_expert_placement(old_placement, new_placement)
+
+    assert torch.equal(new_placement, old_placement)
+
+
+def test_eplb_process_publishes_noop_and_continues_after_planner_error():
+    process = EplbProcess.__new__(EplbProcess)
+    process.policy_type = 4
+    process.worker = MagicMock()
+    process.worker.do_update.side_effect = [ValueError("bad plan"), "next-plan"]
+    planner_q = MagicMock()
+    planner_q.get.side_effect = [1, 1, KeyboardInterrupt()]
+    block_update_q = MagicMock()
+
+    try:
+        process.worker_process(planner_q, block_update_q)
+    except KeyboardInterrupt:
+        pass
+
+    assert block_update_q.put.call_args_list[0].args[0] is None
+    assert block_update_q.put.call_args_list[1].args[0] == "next-plan"
+
+
+def test_policy2_planner_keeps_original_exit_on_error_behavior():
+    process = EplbProcess.__new__(EplbProcess)
+    process.policy_type = 2
+    process.worker = MagicMock()
+    process.worker.do_update.side_effect = ValueError("bad plan")
+    planner_q = MagicMock()
+    block_update_q = MagicMock()
+
+    process.worker_process(planner_q, block_update_q)
+
+    planner_q.get.assert_called_once()
+    block_update_q.put.assert_not_called()
+
+
+def test_compute_imbalance_handles_padded_layer_table():
+    deployment = torch.tensor([[[0, 1, 4], [2, 3, -1]]], dtype=torch.long)
+    hotness = np.asarray([[10.0, 20.0, 30.0, 40.0, 50.0]])
+
+    mean_imbalance, max_imbalance = EplbWorker._compute_imbalance(deployment, hotness)
+
+    assert np.isfinite(mean_imbalance)
+    assert np.isfinite(max_imbalance)
+    assert mean_imbalance == max_imbalance
+
+
+def test_craft_pool_utilization_reports_active_pool_slots():
+    deployment = torch.tensor(
+        [
+            [[0, 1, 4], [2, 3, 1]],
+            [[0, 1, 2], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    load_info = torch.tensor(
+        [
+            [[10, 20, 5], [30, 40, 0]],
+            [[10, 20, 0], [30, 40, 7]],
+        ],
+        dtype=torch.int64,
+    )
+
+    stats = EplbWorker._craft_pool_utilization(deployment, load_info)
+
+    assert stats is not None
+    assert stats["total_slots"] == 4
+    assert stats["active_slots"] == 2
+    assert stats["active_ratio"] == 0.5
+    assert stats["pool_tokens"] == 12.0
+    assert stats["pool_token_share"] == 12.0 / 212.0
+    np.testing.assert_allclose(
+        stats["physical_layer_mean"],
+        ((70.0 / 52.5) + (77.0 / 53.5)) / 2
+    )
+    np.testing.assert_allclose(
+        stats["physical_layer_weighted"],
+        ((70.0 / 52.5) * 105 + (77.0 / 53.5) * 107) / 212
+    )
+    np.testing.assert_allclose(stats["physical_layer_max"], 77.0 / 53.5)
+    np.testing.assert_allclose(stats["physical_total_ratio"], 147.0 / 106.0)
+    assert stats["zero_hit_layers"] == 0
+    assert stats["top_layers"] == [(1, 7, 1), (0, 5, 1)]
+    assert stats["worst_layers"] == [
+        (1, 77.0 / 53.5, 107, 2, 1),
+        (0, 70.0 / 52.5, 105, 2, 1),
+    ]
+    assert stats["slot_tokens"] == [
+        (0, 0, 0, 4, 5),
+        (0, 1, 0, 1, 0),
+        (1, 0, 0, 2, 0),
+        (1, 1, 0, 0, 7),
+    ]
+
+
+def test_log_craft_pool_utilization_reports_every_slot(caplog):
+    caplog.set_level(logging.INFO)
+    worker = EplbWorker.__new__(EplbWorker)
+    deployment = torch.tensor(
+        [
+            [[0, 1, 4], [2, 3, 1]],
+            [[0, 1, 2], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    load_info = torch.tensor(
+        [
+            [[10, 20, 5], [30, 40, 0]],
+            [[10, 20, 0], [30, 40, 7]],
+        ],
+        dtype=torch.int64,
+    )
+
+    worker._log_craft_pool_utilization(deployment, load_info)
+
+    summary_lines = [
+        record.message
+        for record in caplog.records
+        if "[CRAFT-SLOT]" in record.message
+    ]
+    assert len(summary_lines) == 1
+    assert "physical_layer_weighted=1.3868" in summary_lines[0]
+    assert "physical_total=1.3868" in summary_lines[0]
+    assert "worst_layers=1:1.4393/107/2/1,0:1.3333/105/2/1" in summary_lines[0]
+
+    token_lines = [
+        record.message
+        for record in caplog.records
+        if "[CRAFT-SLOT-TOKENS]" in record.message
+    ]
+    assert token_lines == [
+        "[CRAFT-SLOT-TOKENS] rank=0 slots=0:0:4:5,1:0:2:0",
+        "[CRAFT-SLOT-TOKENS] rank=1 slots=0:0:1:0,1:0:0:7",
+    ]
+
+
+def test_craft_migration_cost_gate_rejects_slow_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    old_placement = torch.tensor([[[0, 1], [2, 3]]], dtype=torch.long)
+    new_placement = torch.tensor([[[0, 1], [2, 0]]], dtype=torch.long)
+    hotness = np.asarray([[10.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, old_placement)
+
+
+def test_craft_migration_cost_gate_accepts_fast_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    old_placement = torch.tensor([[[0, 1], [2, 3]]], dtype=torch.long)
+    new_placement = torch.tensor([[[0, 1], [2, 0]]], dtype=torch.long)
+    hotness = np.asarray([[100.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, new_placement)
+
+
+def test_global_craft_migration_cost_gate_rejects_slow_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, -1]]], dtype=torch.long
+    )
+    new_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, 0]]], dtype=torch.long
+    )
+    hotness = np.asarray([[10.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, old_placement)
+
+
+def test_global_craft_migration_cost_gate_accepts_fast_payback():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 100}
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 1
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, -1]]], dtype=torch.long
+    )
+    new_placement = torch.tensor(
+        [[[0, 1, -1], [2, 3, 0]]], dtype=torch.long
+    )
+    hotness = np.asarray([[100.0, 0.0, 0.0, 0.0]])
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, new_placement)
+
+
+def test_global_craft_migration_cost_gate_accounts_for_regressed_layers():
+    worker = EplbWorker.__new__(EplbWorker)
+    worker.shared_dict = {
+        "craft_expert_cost_metadata": [
+            {"transfer_bytes": 100, "compute_bytes": 1},
+            {"transfer_bytes": 100, "compute_bytes": 10},
+        ]
+    }
+    worker.expert_heat_collection_interval = 10
+    worker.craft_migration_cost_ratio = 1.0
+    worker.craft_max_payback_steps = 100
+    worker.craft_global_pool_size = 2
+    worker.num_local_experts_main = 2
+    old_placement = torch.tensor(
+        [
+            [[0, 1, -1], [2, 3, -1]],
+            [[0, 1, -1], [2, 3, 0]],
+        ],
+        dtype=torch.long,
+    )
+    new_placement = torch.tensor(
+        [
+            [[0, 1, -1], [2, 3, 0]],
+            [[0, 1, -1], [2, 3, -1]],
+        ],
+        dtype=torch.long,
+    )
+    hotness = np.asarray(
+        [
+            [100.0, 0.0, 0.0, 0.0],
+            [100.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    gated = worker._apply_global_craft_migration_cost_gate(
+        old_placement, new_placement, hotness
+    )
+
+    assert torch.equal(gated, old_placement)
+
+
+def load_tests(loader_obj, tests, pattern):
+    suite = unittest.TestSuite()
+    suite.addTest(unittest.FunctionTestCase(test_pack_update_info_returns_full_rank_plan))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_pack_update_info_marks_unchanged_layer_as_noop))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_rank_sharded_route_packs_distinct_maps))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_marks_unchanged_layer_as_noop_during_changed_cycle))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_uses_stable_current_owner))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_migration_supports_non_linear_home_placement))
+    suite.addTest(unittest.FunctionTestCase(test_policy2_pack_update_info_keeps_rank_local_plan))
+    suite.addTest(unittest.FunctionTestCase(test_policy2_placement_validation_uses_legacy_path_without_pool_symbols))
+    suite.addTest(unittest.FunctionTestCase(test_policy4_placement_validation_accepts_padded_pool_slots))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_accepts_unowned_slot))
+    suite.addTest(unittest.FunctionTestCase(test_global_pool_validation_rejects_multiply_owned_slot))
+    suite.addTest(unittest.FunctionTestCase(test_eplb_process_publishes_noop_and_continues_after_planner_error))
+    suite.addTest(unittest.FunctionTestCase(test_policy2_planner_keeps_original_exit_on_error_behavior))
+    suite.addTest(unittest.FunctionTestCase(test_compute_imbalance_handles_padded_layer_table))
+    suite.addTest(unittest.FunctionTestCase(test_craft_pool_utilization_reports_active_pool_slots))
+    suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_rejects_slow_payback))
+    suite.addTest(unittest.FunctionTestCase(test_craft_migration_cost_gate_accepts_fast_payback))
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_rejects_slow_payback
+        )
+    )
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_accepts_fast_payback
+        )
+    )
+    suite.addTest(
+        unittest.FunctionTestCase(
+            test_global_craft_migration_cost_gate_accounts_for_regressed_layers
+        )
+    )
+    return suite

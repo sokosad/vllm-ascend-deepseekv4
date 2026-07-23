@@ -372,9 +372,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             tid2eid=tid2eid,
         )
 
-        # this is a naive implementation for experts load balance so as
-        # to avoid accumulating too much tokens on a single rank.
-        # currently it is only activated when doing profile runs.
+        # Keep the existing profile-run behavior for non-CRAFT schemes.
         if enable_force_load_balance:
             topk_ids = layer.force_load_balance_routed_topk_ids[: topk_ids.shape[0]]
 

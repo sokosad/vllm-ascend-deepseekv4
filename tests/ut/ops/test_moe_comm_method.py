@@ -8,6 +8,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
     MC2CommImpl,
+    _apply_log2phy,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -36,6 +37,107 @@ class TestMoECommMethod(TestBase):
         self.moe_config.ep_size = 1
         self.moe_config.dp_group = MagicMock()
         self.moe_config.global_redundant_expert_num = 0
+
+    def test_apply_log2phy_spreads_replicas_by_token_by_default(self):
+        log2phy = torch.tensor(
+            [
+                [0, 4, -1],
+                [1, 5, -1],
+                [2, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        topk_ids = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 1],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+
+        routed = _apply_log2phy(log2phy, topk_ids)
+
+        expected = torch.tensor(
+            [
+                [0, 0],
+                [4, 1],
+                [5, 5],
+                [2, 4],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(routed, expected))
+
+    def test_apply_log2phy_metro_routing_keeps_expert_on_one_replica(self):
+        log2phy = torch.tensor(
+            [
+                [0, 4, -1],
+                [1, 5, -1],
+                [2, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        topk_ids = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 1],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+
+        routed = _apply_log2phy(log2phy, topk_ids, metro_routing=True)
+
+        expected = torch.tensor(
+            [
+                [0, 0],
+                [0, 5],
+                [5, 5],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(routed, expected))
+
+    def test_apply_log2phy_uses_precomputed_craft_replica_counts(self):
+        route_map = torch.tensor(
+            [
+                [0, 4, -1, -3],
+                [1, 5, -1, -3],
+                [2, -1, -1, -2],
+            ],
+            dtype=torch.int32,
+        )
+        topk_ids = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 1],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+
+        routed = _apply_log2phy(
+            route_map,
+            topk_ids,
+            compact_craft_pool=True,
+        )
+
+        expected = torch.tensor(
+            [
+                [0, 0],
+                [4, 1],
+                [5, 5],
+                [2, 4],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(routed, expected))
+        self.assertEqual(routed.dtype, topk_ids.dtype)
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(
