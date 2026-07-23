@@ -5,6 +5,7 @@ from vllm_ascend.eplb.core.policy.craft_paper_allocator import (
     interleaved_replica_capacities,
     place_layer_experts,
     plan_craft_replication,
+    replica_count_options,
 )
 
 
@@ -28,6 +29,62 @@ def test_replica_budget_follows_layer_skew():
             len(rank) == 4 + extra_capacities[layer_id, rank_id]
             for rank_id, rank in enumerate(ranks)
         )
+
+
+def test_fine_grained_options_include_every_layer_budget():
+    assert replica_count_options(8, fine_grained=True) == list(range(9))
+    assert replica_count_options(8) == [0, 1, 2, 4, 8]
+
+
+def test_fine_grained_plan_uses_non_power_of_two_layer_budget():
+    hotness = np.random.default_rng(2).lognormal(0, 2, (4, 16))
+
+    layer_replicas, extra_capacities, placements = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=4,
+        fine_grained=True,
+    )
+
+    assert layer_replicas.tolist() == [2, 3, 1, 2]
+    assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+    for layer_id, ranks in enumerate(placements):
+        assert sum(len(rank) for rank in ranks) == 16 + layer_replicas[layer_id]
+
+
+def test_active_layer_replica_floor_covers_every_active_layer():
+    hotness = np.ones((4, 16), dtype=np.float64)
+    hotness[3] = 0
+    hotness[0, 0] = 1_000
+
+    layer_replicas, extra_capacities, _ = plan_craft_replication(
+        hotness,
+        total_replicas=8,
+        num_ranks=4,
+        fine_grained=True,
+        min_replicas_per_active_layer=1,
+    )
+
+    assert np.all(layer_replicas[:3] >= 1)
+    assert int(layer_replicas.sum()) == 8
+    assert extra_capacities.sum(axis=0).tolist() == [2, 2, 2, 2]
+
+
+def test_active_layer_replica_floor_rejects_insufficient_budget():
+    hotness = np.ones((5, 16), dtype=np.float64)
+
+    try:
+        plan_craft_replication(
+            hotness,
+            total_replicas=4,
+            num_ranks=4,
+            fine_grained=True,
+            min_replicas_per_active_layer=1,
+        )
+    except ValueError as error:
+        assert "requires 5 replicas" in str(error)
+    else:
+        raise AssertionError("insufficient active-layer replica budget must fail")
 
 
 def test_interleaved_capacities_balance_every_rank():

@@ -273,8 +273,22 @@ def test_craft_pool_utilization_reports_active_pool_slots():
     assert stats["active_ratio"] == 0.5
     assert stats["pool_tokens"] == 12.0
     assert stats["pool_token_share"] == 12.0 / 212.0
+    np.testing.assert_allclose(
+        stats["physical_layer_mean"],
+        ((70.0 / 52.5) + (77.0 / 53.5)) / 2
+    )
+    np.testing.assert_allclose(
+        stats["physical_layer_weighted"],
+        ((70.0 / 52.5) * 105 + (77.0 / 53.5) * 107) / 212
+    )
+    np.testing.assert_allclose(stats["physical_layer_max"], 77.0 / 53.5)
+    np.testing.assert_allclose(stats["physical_total_ratio"], 147.0 / 106.0)
     assert stats["zero_hit_layers"] == 0
     assert stats["top_layers"] == [(1, 7, 1), (0, 5, 1)]
+    assert stats["worst_layers"] == [
+        (1, 77.0 / 53.5, 107, 2, 1),
+        (0, 70.0 / 52.5, 105, 2, 1),
+    ]
     assert stats["slot_tokens"] == [
         (0, 0, 0, 4, 5),
         (0, 1, 0, 1, 0),
@@ -302,6 +316,16 @@ def test_log_craft_pool_utilization_reports_every_slot(caplog):
     )
 
     worker._log_craft_pool_utilization(deployment, load_info)
+
+    summary_lines = [
+        record.message
+        for record in caplog.records
+        if "[CRAFT-SLOT]" in record.message
+    ]
+    assert len(summary_lines) == 1
+    assert "physical_layer_weighted=1.3868" in summary_lines[0]
+    assert "physical_total=1.3868" in summary_lines[0]
+    assert "worst_layers=1:1.4393/107/2/1,0:1.3333/105/2/1" in summary_lines[0]
 
     token_lines = [
         record.message

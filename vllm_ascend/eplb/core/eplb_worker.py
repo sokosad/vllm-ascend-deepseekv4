@@ -34,6 +34,7 @@ from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFac
 
 CRAFT_POOL_POLICY_CONFIG_FIELDS = (
     "craft_global_pool_size",
+    "craft_global_min_replicas_per_active_layer",
     "craft_pool_top_m",
     "craft_pool_top_m_factor",
     "craft_pool_min_hotness_delta",
@@ -230,9 +231,25 @@ class EplbWorker:
         active = pool_valid & (load_info[:, :, pool_start:] > 0)
         layer_tokens = pool_load.sum(axis=(1, 2))
         layer_active = active.sum(axis=(1, 2))
-        total_tokens = float(np.where(valid, load_info, 0).sum())
+        layer_slots = pool_valid.sum(axis=(1, 2))
+        physical_rank_loads = np.where(valid, load_info, 0).sum(axis=2)
+        physical_layer_totals = physical_rank_loads.sum(axis=1)
+        physical_layer_means = physical_rank_loads.mean(axis=1)
+        physical_layer_ratios = np.divide(
+            physical_rank_loads.max(axis=1),
+            physical_layer_means,
+            out=np.zeros_like(physical_layer_means, dtype=np.float64),
+            where=physical_layer_means > 0,
+        )
+        physical_active_layers = physical_layer_totals > 0
+        physical_total_rank_loads = physical_rank_loads.sum(axis=0)
+        physical_total_mean = float(physical_total_rank_loads.mean())
+        total_tokens = float(physical_layer_totals.sum())
         pool_tokens = float(pool_load.sum())
         top_layers = np.argsort(-layer_tokens)[: min(5, len(layer_tokens))]
+        worst_layers = np.argsort(-physical_layer_ratios)[
+            : min(5, len(physical_layer_ratios))
+        ]
         slot_tokens = [
             (
                 int(layer_id),
@@ -249,10 +266,38 @@ class EplbWorker:
             "active_ratio": float(active.sum()) / total_slots,
             "pool_tokens": pool_tokens,
             "pool_token_share": pool_tokens / total_tokens if total_tokens > 0 else 0.0,
+            "physical_layer_mean": float(
+                physical_layer_ratios[physical_active_layers].mean()
+            ) if physical_active_layers.any() else 0.0,
+            "physical_layer_weighted": float(
+                np.average(
+                    physical_layer_ratios[physical_active_layers],
+                    weights=physical_layer_totals[physical_active_layers],
+                )
+            ) if physical_active_layers.any() else 0.0,
+            "physical_layer_max": float(
+                physical_layer_ratios[physical_active_layers].max()
+            ) if physical_active_layers.any() else 0.0,
+            "physical_total_ratio": (
+                float(physical_total_rank_loads.max()) / physical_total_mean
+                if physical_total_mean > 0
+                else 0.0
+            ),
             "zero_hit_layers": int(np.count_nonzero(layer_active == 0)),
             "top_layers": [
                 (int(layer_id), int(layer_tokens[layer_id]), int(layer_active[layer_id]))
                 for layer_id in top_layers
+            ],
+            "worst_layers": [
+                (
+                    int(layer_id),
+                    float(physical_layer_ratios[layer_id]),
+                    int(physical_layer_totals[layer_id]),
+                    int(layer_slots[layer_id]),
+                    int(layer_active[layer_id]),
+                )
+                for layer_id in worst_layers
+                if physical_active_layers[layer_id]
             ],
             "slot_tokens": slot_tokens,
         }
@@ -265,16 +310,28 @@ class EplbWorker:
             f"{layer_id}:{tokens}/{active}"
             for layer_id, tokens, active in stats["top_layers"]
         )
+        worst_layers = ",".join(
+            f"{layer_id}:{ratio:.4f}/{tokens}/{slots}/{active}"
+            for layer_id, ratio, tokens, slots, active in stats["worst_layers"]
+        )
         logger.info(
             "[CRAFT-SLOT] active=%d/%d ratio=%.3f pool_tokens=%.0f "
-            "pool_share=%.4f zero_hit_layers=%d top_layers=%s",
+            "pool_share=%.4f physical_layer_mean=%.4f "
+            "physical_layer_weighted=%.4f physical_layer_max=%.4f "
+            "physical_total=%.4f zero_hit_layers=%d top_layers=%s "
+            "worst_layers=%s",
             stats["active_slots"],
             stats["total_slots"],
             stats["active_ratio"],
             stats["pool_tokens"],
             stats["pool_token_share"],
+            stats["physical_layer_mean"],
+            stats["physical_layer_weighted"],
+            stats["physical_layer_max"],
+            stats["physical_total_ratio"],
             stats["zero_hit_layers"],
             top_layers,
+            worst_layers,
         )
         slots_by_rank: dict[int, list[str]] = {}
         for layer_id, rank_id, pool_offset, expert_id, tokens in stats["slot_tokens"]:

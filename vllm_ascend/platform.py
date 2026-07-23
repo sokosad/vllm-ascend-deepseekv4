@@ -307,6 +307,9 @@ class NPUPlatform(Platform):
         cache_config = vllm_config.cache_config
         craft_pool_size = ascend_config.eplb_config.craft_pool_size
         craft_global_pool_size = ascend_config.eplb_config.craft_global_pool_size
+        craft_global_min_replicas_per_active_layer = (
+            ascend_config.eplb_config.craft_global_min_replicas_per_active_layer
+        )
         craft_pool_configured = cls._is_craft_pool_configured(ascend_config.eplb_config)
         if craft_global_pool_size > 0:
             ep_size = cls._get_configured_ep_size(parallel_config)
@@ -318,6 +321,11 @@ class NPUPlatform(Platform):
             parallel_eplb_config = getattr(parallel_config, "eplb_config", None)
             if parallel_eplb_config is not None:
                 setattr(parallel_eplb_config, "craft_global_pool_size", craft_global_pool_size)
+                setattr(
+                    parallel_eplb_config,
+                    "craft_global_min_replicas_per_active_layer",
+                    craft_global_min_replicas_per_active_layer,
+                )
         if craft_pool_size > 0:
             if vllm_config.additional_config is None:
                 vllm_config.additional_config = {}

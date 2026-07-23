@@ -6,9 +6,15 @@ from __future__ import annotations
 import numpy as np
 
 
-def replica_count_options(num_ranks: int) -> list[int]:
+def replica_count_options(
+    num_ranks: int,
+    *,
+    fine_grained: bool = False,
+) -> list[int]:
     if num_ranks <= 0:
         return [0]
+    if fine_grained:
+        return list(range(num_ranks + 1))
     options = [0]
     value = 1
     while value < num_ranks:
@@ -670,6 +676,9 @@ def plan_craft_replication(
     num_ranks: int,
     home_placements: list[list[list[int]]] | None = None,
     candidate_top_m: int = 0,
+    *,
+    fine_grained: bool = False,
+    min_replicas_per_active_layer: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[list[list[int]]]]:
     hotness = np.asarray(hotness, dtype=np.float64)
     if hotness.ndim != 2:
@@ -678,8 +687,17 @@ def plan_craft_replication(
         raise ValueError("CRAFT requires experts to be divisible by the rank count.")
     if total_replicas < 0 or total_replicas % num_ranks != 0:
         raise ValueError("CRAFT total replicas must be a non-negative rank multiple.")
+    if min_replicas_per_active_layer < 0:
+        raise ValueError("CRAFT minimum replicas per active layer must be non-negative.")
+    if min_replicas_per_active_layer > num_ranks:
+        raise ValueError(
+            "CRAFT minimum replicas per active layer cannot exceed the rank count."
+        )
 
-    options = replica_count_options(num_ranks)
+    options = replica_count_options(
+        num_ranks,
+        fine_grained=fine_grained,
+    )
     max_replicas = hotness.shape[0] * options[-1]
     if total_replicas > max_replicas:
         raise ValueError(
@@ -718,6 +736,18 @@ def plan_craft_replication(
         home_placements_validated=home_placements is not None,
         home_rank_loads=home_loads,
     )
+    if min_replicas_per_active_layer > 0:
+        active_layers = np.any(hotness > 0, axis=1)
+        required_replicas = int(np.count_nonzero(active_layers)) * (
+            min_replicas_per_active_layer
+        )
+        if required_replicas > total_replicas:
+            raise ValueError(
+                "CRAFT active-layer replica floor requires "
+                f"{required_replicas} replicas, but the budget is {total_replicas}."
+            )
+        below_floor = np.asarray(options) < min_replicas_per_active_layer
+        benefits[np.ix_(active_layers, below_floor)] = -np.inf
     layer_replicas = allocate_replica_budget(benefits, options, total_replicas)
     slot_only_capacities = interleaved_replica_capacities(
         layer_replicas,

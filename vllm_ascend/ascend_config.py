@@ -396,6 +396,7 @@ class EplbConfig:
         "craft_pool_size": 0,
         "craft_pool_layer_sizes": None,
         "craft_global_pool_size": 0,
+        "craft_global_min_replicas_per_active_layer": 0,
         "craft_pool_top_m": 0,
         "craft_pool_top_m_factor": 4,
         "craft_pool_min_hotness_delta": 0.05,
@@ -431,6 +432,10 @@ class EplbConfig:
         env_defaults = {
             "craft_pool_size": (("VLLM_ASCEND_CRAFT_POOL_SIZE",), int),
             "craft_global_pool_size": (("VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",), int),
+            "craft_global_min_replicas_per_active_layer": (
+                ("CRAFT_GLOBAL_MIN_REPLICAS_PER_ACTIVE_LAYER",),
+                int,
+            ),
             "craft_pool_top_m": (("CRAFT_POOL_TOP_M",), int),
             "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
@@ -490,6 +495,7 @@ class EplbConfig:
             "num_redundant_experts",
             "craft_pool_size",
             "craft_global_pool_size",
+            "craft_global_min_replicas_per_active_layer",
             "craft_global_rebalance_cooldown",
             "craft_layer_rebalance_cooldown",
             "craft_pool_max_payback_steps",
@@ -518,6 +524,10 @@ class EplbConfig:
         logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
         logger.info(f"The CRAFT pool layer sizes are {self.config['craft_pool_layer_sizes']}")
         logger.info(f"The CRAFT global pool size is {self.config['craft_global_pool_size']}")
+        logger.info(
+            "The CRAFT global minimum replicas per active layer is "
+            f"{self.config['craft_global_min_replicas_per_active_layer']}"
+        )
         logger.info(f"The CRAFT pool top-M candidate limit is {self.config['craft_pool_top_m']}")
         logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
         logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")
@@ -554,7 +564,15 @@ class EplbConfig:
 
     def _validate_craft_global_pool_size(self):
         global_pool_size = self.config["craft_global_pool_size"]
+        min_layer_replicas = self.config[
+            "craft_global_min_replicas_per_active_layer"
+        ]
         if global_pool_size <= 0:
+            if min_layer_replicas > 0:
+                raise ValueError(
+                    "craft_global_min_replicas_per_active_layer requires "
+                    "craft_global_pool_size > 0."
+                )
             return
         if self.config["craft_pool_size"] > 0:
             raise ValueError("craft_global_pool_size conflicts with craft_pool_size.")

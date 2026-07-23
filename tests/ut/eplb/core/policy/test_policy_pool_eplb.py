@@ -39,6 +39,7 @@ def test_pool_policy_reads_craft_pool_config():
     config.craft_pool_min_hotness_delta = 0.25
     config.craft_pool_min_improvement = 0.1
     config.craft_layer_rebalance_cooldown = 3
+    config.craft_global_min_replicas_per_active_layer = 1
 
     policy = PoolBalanceEplb(config)
 
@@ -47,6 +48,7 @@ def test_pool_policy_reads_craft_pool_config():
     assert policy.min_hotness_delta == 0.25
     assert policy.min_improvement == 0.1
     assert policy.layer_rebalance_cooldown == 3
+    assert policy.global_min_replicas_per_active_layer == 1
 
 
 def test_pool_policy_accumulates_small_hotness_changes_before_recompute():
@@ -140,6 +142,29 @@ def test_global_pool_assigns_each_active_slot_to_at_most_one_layer():
     assert updated[1, 1, 2].item() == 0
 
 
+def test_global_pool_active_layer_floor_covers_each_active_layer():
+    config = DynamicConfig()
+    config.craft_global_pool_size = 2
+    config.craft_global_min_replicas_per_active_layer = 1
+    config.craft_pool_min_hotness_delta = 0.0
+    config.craft_pool_min_improvement = 0.0
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([
+        [[0, 1, -1], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, -1]],
+    ])
+    workload = torch.tensor([
+        [[1_000, 1, 0], [1, 1, 0]],
+        [[10, 1, 0], [1, 1, 0]],
+    ])
+
+    changed, _, updated = policy.rebalance_experts(current, workload)
+    updated = torch.tensor(updated)
+
+    assert changed
+    assert torch.sum(updated[:, :, 2:] >= 0, dim=(1, 2)).tolist() == [1, 1]
+
+
 def test_global_pool_rebalance_cooldown_starts_after_layout_change():
     config = DynamicConfig()
     config.craft_global_pool_size = 2
@@ -166,6 +191,95 @@ def test_global_pool_rebalance_cooldown_starts_after_layout_change():
     assert not changed
     assert torch.equal(torch.tensor(cooled), torch.tensor(updated))
     assert policy._global_rebalance_cooldown_remaining == 1
+
+
+def test_global_pool_cooldown_breaks_after_confirmed_workload_shift():
+    config = DynamicConfig()
+    config.craft_global_pool_size = 2
+    config.craft_pool_min_hotness_delta = 0.05
+    config.craft_pool_min_improvement = 0.0
+    config.craft_global_rebalance_cooldown = 8
+    policy = PoolBalanceEplb(config)
+    current = torch.tensor([
+        [[0, 1, -1], [2, 3, -1]],
+        [[0, 1, -1], [2, 3, -1]],
+    ])
+    first_workload = torch.tensor([
+        [[100, 1, 0], [1, 1, 0]],
+        [[1, 1, 0], [1, 1, 0]],
+    ])
+
+    changed, _, updated = policy.rebalance_experts(current, first_workload)
+    assert changed
+    assert policy._global_rebalance_cooldown_remaining == 8
+
+    shifted_workload = torch.tensor([
+        [[1, 1, 0], [1, 1, 0]],
+        [[100, 1, 0], [1, 1, 0]],
+    ])
+    changed, _, once_cooled = policy.rebalance_experts(
+        torch.tensor(updated),
+        shifted_workload,
+    )
+    assert not changed
+    assert policy._global_rebalance_cooldown_remaining == 7
+
+    changed, _, shifted = policy.rebalance_experts(
+        torch.tensor(once_cooled),
+        shifted_workload,
+    )
+    assert changed
+    assert policy._global_rebalance_cooldown_remaining == 8
+    assert not torch.equal(torch.tensor(shifted), torch.tensor(updated))
+
+
+def test_global_pool_cooldown_ignores_sampling_volume_change():
+    policy = PoolBalanceEplb(DynamicConfig())
+    policy.min_hotness_delta = 0.05
+    policy._global_rebalance_cooldown_remaining = 8
+    policy._last_global_plan_hotness = policy._normalize_global_hotness(
+        np.array([[90.0, 10.0]])
+    )
+
+    assert policy._global_rebalance_is_cooling_down(
+        np.array([[9000.0, 1000.0]]),
+        total_slots=1,
+    )
+    assert policy._global_rebalance_cooldown_remaining == 7
+    assert policy._global_cooldown_shift_streak == 0
+
+
+def test_global_pool_cooldown_ignores_low_volume_tail_shift():
+    policy = PoolBalanceEplb(DynamicConfig())
+    policy.min_hotness_delta = 0.05
+    policy._global_rebalance_cooldown_remaining = 8
+    policy._last_global_plan_hotness = policy._normalize_global_hotness(
+        np.array([[90.0, 10.0]])
+    )
+    policy._last_global_plan_volume = 1000.0
+
+    low_volume_shift = np.array([[1.0, 99.0]])
+    assert policy._global_rebalance_is_cooling_down(
+        low_volume_shift,
+        total_slots=1,
+    )
+    assert policy._global_rebalance_is_cooling_down(
+        low_volume_shift,
+        total_slots=1,
+    )
+    assert policy._global_cooldown_shift_streak == 0
+    assert policy._global_rebalance_cooldown_remaining == 6
+
+    representative_shift = np.array([[10.0, 990.0]])
+    assert policy._global_rebalance_is_cooling_down(
+        representative_shift,
+        total_slots=1,
+    )
+    assert not policy._global_rebalance_is_cooling_down(
+        representative_shift,
+        total_slots=1,
+    )
+    assert policy._global_rebalance_cooldown_remaining == 0
 
 
 def test_global_pool_hotness_gate_ignores_cold_layer_noise():

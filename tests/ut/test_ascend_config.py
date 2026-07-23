@@ -204,9 +204,15 @@ class TestAscendConfig(TestBase):
             "dynamic_eplb": True,
             "eplb_policy_type": 4,
             "craft_global_pool_size": 16,
+            "craft_global_min_replicas_per_active_layer": 1,
         })
 
         self.assertEqual(config.craft_global_pool_size, 16)
+        self.assertEqual(config.craft_global_min_replicas_per_active_layer, 1)
+
+    def test_eplb_config_rejects_global_layer_floor_without_pool(self):
+        with self.assertRaisesRegex(ValueError, "requires craft_global_pool_size"):
+            EplbConfig({"craft_global_min_replicas_per_active_layer": 1})
 
     @patch.dict("os.environ", {"DYNAMIC_EPLB": "true"})
     def test_eplb_config_rejects_global_pool_conflicts(self):
