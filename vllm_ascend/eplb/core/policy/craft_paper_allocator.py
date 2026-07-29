@@ -6,29 +6,10 @@ from __future__ import annotations
 import numpy as np
 
 
-def replica_count_options(num_ranks: int) -> list[int]:
-    if num_ranks <= 0:
-        return [0]
-    options = [0]
-    value = 1
-    while value < num_ranks:
-        options.append(value)
-        value *= 2
-    options.append(num_ranks)
-    return options
-
-
-def _balanced_capacities(total_experts: int, num_ranks: int) -> np.ndarray:
-    base, remainder = divmod(total_experts, num_ranks)
-    capacities = np.full(num_ranks, base, dtype=np.int64)
-    capacities[:remainder] += 1
-    return capacities
-
-
 def _replica_candidate_mask(
     expert_loads: np.ndarray,
     top_m: int,
-    home_assignments: list[list[int]] | None,
+    home_assignments: list[list[int]],
 ) -> np.ndarray:
     if top_m <= 0 or top_m >= expert_loads.size:
         return np.ones(expert_loads.size, dtype=bool)
@@ -36,8 +17,6 @@ def _replica_candidate_mask(
     candidate_mask = np.zeros(expert_loads.size, dtype=bool)
     top_indices = np.argpartition(-expert_loads, top_m - 1)[:top_m]
     candidate_mask[top_indices] = True
-    if home_assignments is None:
-        return candidate_mask
 
     owner_by_expert = np.empty(expert_loads.size, dtype=np.int64)
     for rank_id, rank in enumerate(home_assignments):
@@ -84,127 +63,19 @@ def _normalize_home_placements(
     return normalized
 
 
-def _logical_copy_counts(
-    expert_loads: np.ndarray,
-    num_replicas: int,
-    num_ranks: int,
-    candidate_mask: np.ndarray,
-) -> np.ndarray:
-    copy_counts = np.ones(expert_loads.size, dtype=np.int64)
-    for _ in range(num_replicas):
-        per_copy = np.divide(
-            expert_loads,
-            copy_counts,
-            out=np.zeros_like(expert_loads, dtype=np.float64),
-            where=copy_counts > 0,
-        )
-        per_copy[copy_counts >= num_ranks] = -np.inf
-        per_copy[~candidate_mask] = -np.inf
-        expert_id = int(np.argmax(per_copy))
-        if not np.isfinite(per_copy[expert_id]):
-            raise ValueError(
-                "CRAFT candidate experts cannot satisfy the replica budget "
-                "without placing duplicate copies on one rank."
-            )
-        copy_counts[expert_id] += 1
-    return copy_counts
-
-
-def _assign_copy_with_relocation(
-    expert_id: int,
-    per_copy_loads: np.ndarray,
-    assignments: list[list[int]],
-    assigned_experts: list[set[int]],
-    rank_loads: np.ndarray,
-    rank_capacities: np.ndarray,
-    visited_experts: set[int],
-    visited_ranks: set[int],
-) -> bool:
-    if expert_id in visited_experts:
-        return False
-    visited_experts.add(expert_id)
-
-    candidate_ranks = [
-        rank_id
-        for rank_id in range(rank_capacities.size)
-        if rank_id not in visited_ranks
-        and expert_id not in assigned_experts[rank_id]
-    ]
-    free_ranks = [
-        rank_id
-        for rank_id in candidate_ranks
-        if len(assignments[rank_id]) < rank_capacities[rank_id]
-    ]
-    free_ranks.sort(
-        key=lambda rank_id: (
-            rank_loads[rank_id],
-            len(assignments[rank_id]) / max(1, int(rank_capacities[rank_id])),
-            rank_id,
-        )
-    )
-    if free_ranks:
-        rank_id = free_ranks[0]
-        assignments[rank_id].append(expert_id)
-        assigned_experts[rank_id].add(expert_id)
-        rank_loads[rank_id] += per_copy_loads[expert_id]
-        return True
-
-    full_ranks = sorted(
-        candidate_ranks,
-        key=lambda rank_id: (rank_loads[rank_id], rank_id),
-    )
-    for rank_id in full_ranks:
-        visited_ranks.add(rank_id)
-        occupants = sorted(
-            assignments[rank_id],
-            key=lambda occupant: (per_copy_loads[occupant], occupant),
-        )
-        for displaced_expert in occupants:
-            if displaced_expert in visited_experts:
-                continue
-            occupant_index = assignments[rank_id].index(displaced_expert)
-            assignments[rank_id].pop(occupant_index)
-            assigned_experts[rank_id].remove(displaced_expert)
-            rank_loads[rank_id] -= per_copy_loads[displaced_expert]
-            if _assign_copy_with_relocation(
-                displaced_expert,
-                per_copy_loads,
-                assignments,
-                assigned_experts,
-                rank_loads,
-                rank_capacities,
-                visited_experts,
-                visited_ranks,
-            ):
-                assignments[rank_id].insert(occupant_index, expert_id)
-                assigned_experts[rank_id].add(expert_id)
-                rank_loads[rank_id] += per_copy_loads[expert_id]
-                return True
-            assignments[rank_id].insert(occupant_index, displaced_expert)
-            assigned_experts[rank_id].add(displaced_expert)
-            rank_loads[rank_id] += per_copy_loads[displaced_expert]
-    return False
-
-
-def _place_fixed_home_replicas(
+def place_layer_experts(
     expert_loads: np.ndarray,
     num_replicas: int,
     rank_capacities: np.ndarray,
     home_assignments: list[list[int]],
     candidate_mask: np.ndarray,
-    home_assignments_validated: bool = False,
 ) -> tuple[list[list[int]], np.ndarray]:
     num_ranks = rank_capacities.size
-    if not home_assignments_validated and len(home_assignments) != num_ranks:
+    if len(home_assignments) != num_ranks:
         raise ValueError("CRAFT home placement must have one row per rank.")
-    if home_assignments_validated:
-        assignments = [rank.copy() for rank in home_assignments]
-    else:
-        assignments = [
-            [int(expert_id) for expert_id in rank] for rank in home_assignments
-        ]
+    assignments = [[int(expert_id) for expert_id in rank] for rank in home_assignments]
     flattened_home = [expert_id for rank in assignments for expert_id in rank]
-    if not home_assignments_validated and (
+    if (
         len(flattened_home) != expert_loads.size
         or sorted(flattened_home) != list(range(expert_loads.size))
     ):
@@ -313,85 +184,6 @@ def _place_fixed_home_replicas(
     return assignments, rank_loads
 
 
-def place_layer_experts(
-    expert_loads: np.ndarray,
-    num_replicas: int,
-    rank_capacities: np.ndarray,
-    home_assignments: list[list[int]] | None = None,
-    candidate_mask: np.ndarray | None = None,
-    *,
-    home_assignments_validated: bool = False,
-    inputs_validated: bool = False,
-) -> tuple[list[list[int]], np.ndarray]:
-    if not inputs_validated:
-        expert_loads = np.asarray(expert_loads, dtype=np.float64)
-        rank_capacities = np.asarray(rank_capacities, dtype=np.int64)
-    num_ranks = rank_capacities.size
-    if not inputs_validated:
-        if expert_loads.ndim != 1 or rank_capacities.ndim != 1:
-            raise ValueError("CRAFT layer placement expects one-dimensional inputs.")
-        if int(rank_capacities.sum()) != expert_loads.size + num_replicas:
-            raise ValueError(
-                "CRAFT rank capacities do not match the physical expert count."
-            )
-    if candidate_mask is None:
-        candidate_mask = np.ones(expert_loads.size, dtype=bool)
-    elif not inputs_validated:
-        candidate_mask = np.asarray(candidate_mask, dtype=bool)
-        if candidate_mask.shape != expert_loads.shape:
-            raise ValueError("CRAFT candidate mask must match the expert load shape.")
-
-    if home_assignments is not None:
-        return _place_fixed_home_replicas(
-            expert_loads,
-            num_replicas,
-            rank_capacities,
-            home_assignments,
-            candidate_mask,
-            home_assignments_validated,
-        )
-
-    copy_counts = _logical_copy_counts(
-        expert_loads,
-        num_replicas,
-        num_ranks,
-        candidate_mask,
-    )
-    per_copy_loads = np.divide(
-        expert_loads,
-        copy_counts,
-        out=np.zeros_like(expert_loads, dtype=np.float64),
-        where=copy_counts > 0,
-    )
-    physical_experts = [
-        (expert_id, float(per_copy_loads[expert_id]), copy_id)
-        for expert_id in range(expert_loads.size)
-        for copy_id in range(int(copy_counts[expert_id]))
-    ]
-    physical_experts.sort(key=lambda item: (-item[1], item[0], item[2]))
-
-    assignments: list[list[int]] = [[] for _ in range(num_ranks)]
-    assigned_experts = [set() for _ in range(num_ranks)]
-    rank_loads = np.zeros(num_ranks, dtype=np.float64)
-    for expert_id, per_copy_load, _ in physical_experts:
-        if not _assign_copy_with_relocation(
-            expert_id,
-            per_copy_loads,
-            assignments,
-            assigned_experts,
-            rank_loads,
-            rank_capacities,
-            set(),
-            set(),
-        ):
-            raise ValueError(
-                "CRAFT placement cannot keep replicas of one logical expert "
-                "on distinct ranks for the requested capacities."
-            )
-
-    return assignments, rank_loads
-
-
 def _balancedness(rank_loads: np.ndarray) -> float:
     max_load = float(np.max(rank_loads)) if rank_loads.size else 0.0
     if max_load <= 0:
@@ -418,69 +210,61 @@ def _home_rank_loads(
 def estimate_replication_benefits(
     hotness: np.ndarray,
     options: list[int],
-    num_ranks: int,
-    home_placements: list[list[list[int]]] | None = None,
-    candidate_masks: np.ndarray | None = None,
+    home_placements: list[list[list[int]]],
+    candidate_masks: np.ndarray,
+    objective: str = "balancedness",
     *,
-    home_placements_validated: bool = False,
-    home_rank_loads: np.ndarray | None = None,
+    home_rank_loads: np.ndarray,
 ) -> np.ndarray:
     hotness = np.asarray(hotness, dtype=np.float64)
-    num_layers, num_experts = hotness.shape
+    if objective not in ("balancedness", "critical_path"):
+        raise ValueError(
+            "CRAFT replica benefit objective must be balancedness or "
+            "critical_path."
+        )
+    num_layers = hotness.shape[0]
     benefits = np.zeros((num_layers, len(options)), dtype=np.float64)
     baseline = np.zeros(num_layers, dtype=np.float64)
-    if home_placements is not None and home_rank_loads is None:
-        home_rank_loads = _home_rank_loads(hotness, home_placements)
 
     for layer_id in range(num_layers):
-        home = None if home_placements is None else home_placements[layer_id]
-        if home is None:
-            _, rank_loads = place_layer_experts(
-                hotness[layer_id],
-                0,
-                _balanced_capacities(num_experts, num_ranks),
-            )
-        else:
-            assert home_rank_loads is not None
-            rank_loads = home_rank_loads[layer_id]
-        baseline[layer_id] = _balancedness(rank_loads)
+        rank_loads = home_rank_loads[layer_id]
+        baseline[layer_id] = (
+            float(np.max(rank_loads))
+            if objective == "critical_path"
+            else _balancedness(rank_loads)
+        )
 
     for option_id, num_replicas in enumerate(options):
         if num_replicas == 0:
             continue
         for layer_id in range(num_layers):
-            home = None if home_placements is None else home_placements[layer_id]
-            candidate_mask = (
-                None if candidate_masks is None else candidate_masks[layer_id]
-            )
-            if home is None:
-                capacities = _balanced_capacities(
-                    num_experts + num_replicas,
-                    num_ranks,
-                )
-            else:
-                assert home_rank_loads is not None
-                base_loads = home_rank_loads[layer_id]
-                extra_capacities = np.zeros(num_ranks, dtype=np.int64)
-                extra_capacities[
-                    np.argsort(base_loads, kind="stable")[:num_replicas]
-                ] = 1
-                capacities = np.asarray(
-                    [len(rank) for rank in home],
-                    dtype=np.int64,
-                ) + extra_capacities
+            home = home_placements[layer_id]
+            base_loads = home_rank_loads[layer_id]
+            extra_capacities = np.zeros(base_loads.size, dtype=np.int64)
+            extra_capacities[
+                np.argsort(base_loads, kind="stable")[:num_replicas]
+            ] = 1
+            capacities = np.asarray(
+                [len(rank) for rank in home],
+                dtype=np.int64,
+            ) + extra_capacities
             _, rank_loads = place_layer_experts(
                 hotness[layer_id],
                 num_replicas,
                 capacities,
-                home_assignments=home,
-                candidate_mask=candidate_mask,
-                home_assignments_validated=home_placements_validated,
-                inputs_validated=True,
+                home,
+                candidate_masks[layer_id],
+            )
+            score = (
+                float(np.max(rank_loads))
+                if objective == "critical_path"
+                else _balancedness(rank_loads)
             )
             benefits[layer_id, option_id] = max(
                 0.0,
-                _balancedness(rank_loads) - baseline[layer_id],
+                baseline[layer_id] - score
+                if objective == "critical_path"
+                else score - baseline[layer_id],
             )
     return benefits
 
@@ -590,13 +374,11 @@ def _place_craft_layers(
     hotness: np.ndarray,
     layer_replicas: np.ndarray,
     extra_capacities: np.ndarray,
-    home_placements: list[list[list[int]]] | None,
+    home_placements: list[list[list[int]]],
     candidate_masks: np.ndarray,
     reuse_placements: list[list[list[int]]] | None = None,
     reuse_capacities: np.ndarray | None = None,
 ) -> list[list[list[int]]]:
-    num_ranks = extra_capacities.shape[1]
-    main_capacity = hotness.shape[1] // num_ranks
     placements = []
     for layer_id in range(hotness.shape[0]):
         if (
@@ -609,22 +391,17 @@ def _place_craft_layers(
         ):
             placements.append(reuse_placements[layer_id])
             continue
-        home = None if home_placements is None else home_placements[layer_id]
-        if home is None:
-            rank_capacities = main_capacity + extra_capacities[layer_id]
-        else:
-            rank_capacities = np.asarray(
-                [len(rank) for rank in home],
-                dtype=np.int64,
-            ) + extra_capacities[layer_id]
+        home = home_placements[layer_id]
+        rank_capacities = np.asarray(
+            [len(rank) for rank in home],
+            dtype=np.int64,
+        ) + extra_capacities[layer_id]
         assignments, _ = place_layer_experts(
             hotness[layer_id],
             int(layer_replicas[layer_id]),
             rank_capacities,
-            home_assignments=home,
-            candidate_mask=candidate_masks[layer_id],
-            home_assignments_validated=home is not None,
-            inputs_validated=True,
+            home,
+            candidate_masks[layer_id],
         )
         placements.append(assignments)
     return placements
@@ -668,8 +445,10 @@ def plan_craft_replication(
     hotness: np.ndarray,
     total_replicas: int,
     num_ranks: int,
-    home_placements: list[list[list[int]]] | None = None,
+    home_placements: list[list[list[int]]],
     candidate_top_m: int = 0,
+    *,
+    benefit_objective: str = "balancedness",
 ) -> tuple[np.ndarray, np.ndarray, list[list[list[int]]]]:
     hotness = np.asarray(hotness, dtype=np.float64)
     if hotness.ndim != 2:
@@ -679,31 +458,26 @@ def plan_craft_replication(
     if total_replicas < 0 or total_replicas % num_ranks != 0:
         raise ValueError("CRAFT total replicas must be a non-negative rank multiple.")
 
-    options = replica_count_options(num_ranks)
+    options = list(range(num_ranks + 1))
     max_replicas = hotness.shape[0] * options[-1]
     if total_replicas > max_replicas:
         raise ValueError(
             f"CRAFT replica budget {total_replicas} exceeds maximum {max_replicas}; "
             "the allocator supports at most one replica per rank per layer."
         )
-    if home_placements is not None:
-        home_placements = _normalize_home_placements(
-            home_placements,
-            hotness.shape[0],
-            hotness.shape[1],
-            num_ranks,
-        )
-    home_loads = (
-        None
-        if home_placements is None
-        else _home_rank_loads(hotness, home_placements)
+    home_placements = _normalize_home_placements(
+        home_placements,
+        hotness.shape[0],
+        hotness.shape[1],
+        num_ranks,
     )
+    home_loads = _home_rank_loads(hotness, home_placements)
     candidate_masks = np.asarray(
         [
             _replica_candidate_mask(
                 hotness[layer_id],
                 candidate_top_m,
-                None if home_placements is None else home_placements[layer_id],
+                home_placements[layer_id],
             )
             for layer_id in range(hotness.shape[0])
         ],
@@ -712,10 +486,9 @@ def plan_craft_replication(
     benefits = estimate_replication_benefits(
         hotness,
         options,
-        num_ranks,
-        home_placements=home_placements,
-        candidate_masks=candidate_masks,
-        home_placements_validated=home_placements is not None,
+        home_placements,
+        candidate_masks,
+        objective=benefit_objective,
         home_rank_loads=home_loads,
     )
     layer_replicas = allocate_replica_budget(benefits, options, total_replicas)

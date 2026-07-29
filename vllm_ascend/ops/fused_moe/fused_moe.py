@@ -42,7 +42,6 @@ from vllm_ascend.eplb.core.eplb_utils import (
     generate_craft_rank_route_map,
     generate_craft_route_map,
     generate_local_physical_expert_mask,
-    generate_pool_log2phy_map,
     get_configured_craft_global_pool_size,
     get_configured_craft_pool_size,
     get_craft_global_pool_size_per_rank,

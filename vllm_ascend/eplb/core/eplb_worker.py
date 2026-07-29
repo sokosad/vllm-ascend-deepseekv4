@@ -27,13 +27,13 @@ from vllm_ascend.eplb.core.eplb_utils import (
     generate_craft_rank_route_map,
     generate_craft_route_map,
     generate_log2phy_map,
-    generate_pool_log2phy_map,
 )
 from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
 
 CRAFT_POOL_POLICY_CONFIG_FIELDS = (
     "craft_global_pool_size",
+    "craft_global_planner_objective",
     "craft_pool_top_m",
     "craft_pool_top_m_factor",
     "craft_pool_min_hotness_delta",
@@ -66,7 +66,6 @@ class EplbWorker:
         self.craft_global_pool_size = max(
             0, int(getattr(eplb_config, "craft_global_pool_size", 0) or 0)
         )
-        self.full_rank_plan = policy_type == 4
         self.expert_heat_collection_interval = max(
             1, int(getattr(eplb_config, "expert_heat_collection_interval", 1))
         )
@@ -130,8 +129,6 @@ class EplbWorker:
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        if self.policy_type == 4 and self.rank_id == 0:
-            self._log_craft_pool_utilization(old_placement, load_info)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         hotness = None
@@ -197,95 +194,6 @@ class EplbWorker:
             update_info,
             changed_layers=changed_layers,
         )
-
-    @staticmethod
-    def _craft_pool_utilization(deployment, load_info):
-        deployment = (
-            deployment.detach().cpu().numpy()
-            if torch.is_tensor(deployment)
-            else np.asarray(deployment)
-        )
-        load_info = (
-            load_info.detach().cpu().numpy()
-            if torch.is_tensor(load_info)
-            else np.asarray(load_info)
-        )
-        if deployment.ndim != 3 or load_info.shape != deployment.shape:
-            return None
-
-        valid = deployment >= 0
-        if not valid.any() or deployment.shape[1] <= 0:
-            return None
-        num_logical_experts = int(deployment[valid].max()) + 1
-        pool_start = num_logical_experts // deployment.shape[1]
-        if pool_start >= deployment.shape[2]:
-            return None
-
-        pool_valid = valid[:, :, pool_start:]
-        total_slots = int(pool_valid.sum())
-        if total_slots == 0:
-            return None
-        pool_load = np.where(pool_valid, load_info[:, :, pool_start:], 0)
-        active = pool_valid & (load_info[:, :, pool_start:] > 0)
-        layer_tokens = pool_load.sum(axis=(1, 2))
-        layer_active = active.sum(axis=(1, 2))
-        total_tokens = float(np.where(valid, load_info, 0).sum())
-        pool_tokens = float(pool_load.sum())
-        top_layers = np.argsort(-layer_tokens)[: min(5, len(layer_tokens))]
-        slot_tokens = [
-            (
-                int(layer_id),
-                int(rank_id),
-                int(pool_offset),
-                int(deployment[layer_id, rank_id, pool_start + pool_offset]),
-                int(load_info[layer_id, rank_id, pool_start + pool_offset]),
-            )
-            for layer_id, rank_id, pool_offset in np.argwhere(pool_valid)
-        ]
-        return {
-            "total_slots": total_slots,
-            "active_slots": int(active.sum()),
-            "active_ratio": float(active.sum()) / total_slots,
-            "pool_tokens": pool_tokens,
-            "pool_token_share": pool_tokens / total_tokens if total_tokens > 0 else 0.0,
-            "zero_hit_layers": int(np.count_nonzero(layer_active == 0)),
-            "top_layers": [
-                (int(layer_id), int(layer_tokens[layer_id]), int(layer_active[layer_id]))
-                for layer_id in top_layers
-            ],
-            "slot_tokens": slot_tokens,
-        }
-
-    def _log_craft_pool_utilization(self, deployment, load_info):
-        stats = self._craft_pool_utilization(deployment, load_info)
-        if stats is None:
-            return
-        top_layers = ",".join(
-            f"{layer_id}:{tokens}/{active}"
-            for layer_id, tokens, active in stats["top_layers"]
-        )
-        logger.info(
-            "[CRAFT-SLOT] active=%d/%d ratio=%.3f pool_tokens=%.0f "
-            "pool_share=%.4f zero_hit_layers=%d top_layers=%s",
-            stats["active_slots"],
-            stats["total_slots"],
-            stats["active_ratio"],
-            stats["pool_tokens"],
-            stats["pool_token_share"],
-            stats["zero_hit_layers"],
-            top_layers,
-        )
-        slots_by_rank: dict[int, list[str]] = {}
-        for layer_id, rank_id, pool_offset, expert_id, tokens in stats["slot_tokens"]:
-            slots_by_rank.setdefault(rank_id, []).append(
-                f"{layer_id}:{pool_offset}:{expert_id}:{tokens}"
-            )
-        for rank_id, slots in sorted(slots_by_rank.items()):
-            logger.info(
-                "[CRAFT-SLOT-TOKENS] rank=%d slots=%s",
-                rank_id,
-                ",".join(slots),
-            )
 
     @staticmethod
     def _rank_loads(deployment, hotness):
@@ -695,7 +603,7 @@ class EplbWorker:
         all ranks; the runtime broadcasts rank 0's full plan and each rank
         selects its local slice.
         """
-        if not self.full_rank_plan:
+        if self.policy_type != 4:
             send_all = []
             recv_all = []
             maps = []
@@ -717,30 +625,21 @@ class EplbWorker:
                 packed_update_info.append({"noop": True, "layer_id": layer_id})
                 continue
             num_ranks = int(new_expert_map.shape[0])
-            if self.policy_type == 4:
-                if getattr(self, "craft_rank_sharded_routing", False):
-                    log2phy_all = [
-                        generate_craft_rank_route_map(
-                            new_expert_map,
-                            rank_id,
-                            local_slots=getattr(self, "num_local_experts", None),
-                        ).numpy().tolist()
-                        for rank_id in range(num_ranks)
-                    ]
-                else:
-                    shared_log2phy_map = generate_craft_route_map(
+            if getattr(self, "craft_rank_sharded_routing", False):
+                log2phy_all = [
+                    generate_craft_rank_route_map(
                         new_expert_map,
+                        rank_id,
                         local_slots=getattr(self, "num_local_experts", None),
                     ).numpy().tolist()
-                    log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
-            elif self.full_rank_plan:
-                shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()
-                log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
-            else:
-                log2phy_all = [
-                    generate_log2phy_map(new_expert_map, rank_id).numpy().tolist()
                     for rank_id in range(num_ranks)
                 ]
+            else:
+                shared_log2phy_map = generate_craft_route_map(
+                    new_expert_map,
+                    local_slots=getattr(self, "num_local_experts", None),
+                ).numpy().tolist()
+                log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
 
             packed_update_info.append(
                 {

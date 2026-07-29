@@ -207,14 +207,6 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
 def _craft_hccl_supports_fused_prefill() -> bool:
     """Use fused prefill only with the HCCL size validated for large batches."""
     try:

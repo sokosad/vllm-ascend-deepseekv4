@@ -396,6 +396,7 @@ class EplbConfig:
         "craft_pool_size": 0,
         "craft_pool_layer_sizes": None,
         "craft_global_pool_size": 0,
+        "craft_global_planner_objective": "balancedness",
         "craft_pool_top_m": 0,
         "craft_pool_top_m_factor": 4,
         "craft_pool_min_hotness_delta": 0.05,
@@ -430,6 +431,10 @@ class EplbConfig:
         env_defaults = {
             "craft_pool_size": (("VLLM_ASCEND_CRAFT_POOL_SIZE",), int),
             "craft_global_pool_size": (("VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",), int),
+            "craft_global_planner_objective": (
+                ("CRAFT_GLOBAL_PLANNER_OBJECTIVE",),
+                str,
+            ),
             "craft_pool_top_m": (("CRAFT_POOL_TOP_M",), int),
             "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
@@ -469,6 +474,16 @@ class EplbConfig:
         self.config["craft_rank_sharded_routing"] = self._coerce_bool(
             self.config["craft_rank_sharded_routing"]
         )
+        objective = self.config["craft_global_planner_objective"]
+        if not isinstance(objective, str):
+            raise TypeError("craft_global_planner_objective must be a string")
+        objective = objective.strip().lower()
+        if objective not in ("balancedness", "critical_path"):
+            raise ValueError(
+                "craft_global_planner_objective must be balancedness or "
+                "critical_path"
+            )
+        self.config["craft_global_planner_objective"] = objective
         if self.expert_map_path is not None:
             logger.info(f"The expert_map is {self.config['dynamic_eplb']}")
             if self.expert_map_path[-5:] != ".json":
@@ -513,6 +528,10 @@ class EplbConfig:
         logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
         logger.info(f"The CRAFT pool layer sizes are {self.config['craft_pool_layer_sizes']}")
         logger.info(f"The CRAFT global pool size is {self.config['craft_global_pool_size']}")
+        logger.info(
+            "The CRAFT global planner objective is "
+            f"{self.config['craft_global_planner_objective']}"
+        )
         logger.info(f"The CRAFT pool top-M candidate limit is {self.config['craft_pool_top_m']}")
         logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
         logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")

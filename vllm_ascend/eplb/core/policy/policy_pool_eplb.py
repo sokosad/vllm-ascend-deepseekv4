@@ -1,6 +1,5 @@
 # Copyright Huawei Technologies Co., Ltd. 2023-2024. All rights reserved.
 import os
-import time
 
 import numpy as np
 import torch
@@ -8,6 +7,12 @@ from vllm.logger import logger
 
 from .craft_paper_allocator import plan_craft_replication
 from .policy_abstract import DynamicConfig, EplbPolicy
+
+
+_GLOBAL_COOLDOWN_BREAK_MIN_DELTA = 0.20
+_GLOBAL_COOLDOWN_BREAK_DELTA_FACTOR = 4.0
+_GLOBAL_COOLDOWN_BREAK_CONFIRMATIONS = 2
+_GLOBAL_COOLDOWN_BREAK_MIN_VOLUME_RATIO = 0.25
 
 
 def _get_int_config(config: DynamicConfig, attr: str, env_name: str, default: int) -> int:
@@ -22,6 +27,18 @@ def _get_float_config(config: DynamicConfig, attr: str, env_name: str, default: 
     if value is None:
         value = os.getenv(env_name, str(default))
     return float(value)
+
+
+def _get_str_config(
+    config: DynamicConfig,
+    attr: str,
+    env_name: str,
+    default: str,
+) -> str:
+    value = getattr(config, attr, None)
+    if value is None:
+        value = os.getenv(env_name, default)
+    return str(value)
 
 
 class PoolBalanceEplb(EplbPolicy):
@@ -56,6 +73,20 @@ class PoolBalanceEplb(EplbPolicy):
                 0,
             ),
         )
+        self.global_planner_objective = _get_str_config(
+            config,
+            "craft_global_planner_objective",
+            "CRAFT_GLOBAL_PLANNER_OBJECTIVE",
+            "balancedness",
+        ).strip().lower()
+        if self.global_planner_objective not in (
+            "balancedness",
+            "critical_path",
+        ):
+            raise ValueError(
+                "CRAFT global planner objective must be balancedness or "
+                "critical_path."
+            )
         self.global_rebalance_cooldown = max(
             0,
             _get_int_config(
@@ -78,6 +109,9 @@ class PoolBalanceEplb(EplbPolicy):
         self._layer_rebalance_cooldown_remaining: dict[int, int] = {}
         self._last_layer_hotness: dict[int, np.ndarray] = {}
         self._last_global_hotness: np.ndarray | None = None
+        self._last_global_plan_hotness: np.ndarray | None = None
+        self._last_global_plan_volume: float | None = None
+        self._global_cooldown_shift_streak = 0
 
     @staticmethod
     def _infer_pool_start(current_expert_table: torch.Tensor) -> int:
@@ -269,21 +303,22 @@ class PoolBalanceEplb(EplbPolicy):
             new_rank_slots[slot_id] = expert_id
         return new_rank_slots
 
-    def _global_hotness_changed(self, hotness: np.ndarray, total_slots: int) -> bool:
-        if self.min_hotness_delta <= 0:
-            return True
+    @staticmethod
+    def _normalize_global_hotness(hotness: np.ndarray) -> np.ndarray:
         flat_hotness = np.abs(hotness).reshape(-1)
         total_hotness = float(flat_hotness.sum())
-        normalized = (
+        return (
             flat_hotness / total_hotness
             if total_hotness > 0
             else np.zeros_like(flat_hotness, dtype=np.float64)
         )
-        previous = self._last_global_hotness
-        if previous is None or previous.shape != normalized.shape:
-            self._last_global_hotness = normalized.copy()
-            return True
 
+    def _global_hotness_delta(
+        self,
+        normalized: np.ndarray,
+        previous: np.ndarray,
+        total_slots: int,
+    ) -> float:
         top_m = self.candidate_top_m
         if top_m <= 0:
             top_m = max(total_slots * self.candidate_factor, total_slots)
@@ -298,19 +333,83 @@ class PoolBalanceEplb(EplbPolicy):
             return positive[np.argpartition(-values[positive], count - 1)[:count]]
 
         candidates = np.union1d(top_indices(normalized), top_indices(previous))
-        delta = float(np.sum(np.abs(normalized[candidates] - previous[candidates])))
+        return float(np.sum(np.abs(normalized[candidates] - previous[candidates])))
+
+    def _global_hotness_changed(self, hotness: np.ndarray, total_slots: int) -> bool:
+        if self.min_hotness_delta <= 0:
+            return True
+        normalized = self._normalize_global_hotness(hotness)
+        previous = self._last_global_hotness
+        if previous is None or previous.shape != normalized.shape:
+            self._last_global_hotness = normalized.copy()
+            return True
+
+        delta = self._global_hotness_delta(normalized, previous, total_slots)
         if delta < self.min_hotness_delta:
             return False
         self._last_global_hotness = normalized.copy()
         return True
 
-    def _global_rebalance_is_cooling_down(self) -> bool:
+    def _global_rebalance_is_cooling_down(
+        self,
+        hotness: np.ndarray,
+        total_slots: int,
+    ) -> bool:
         if self._global_rebalance_cooldown_remaining <= 0:
+            return False
+        normalized = self._normalize_global_hotness(hotness)
+        previous = self._last_global_plan_hotness
+        current_volume = float(np.sum(hotness))
+        reference_volume = self._last_global_plan_volume
+        volume_ratio = (
+            current_volume / reference_volume
+            if reference_volume is not None and reference_volume > 0
+            else 1.0
+        )
+        volume_is_representative = (
+            volume_ratio >= _GLOBAL_COOLDOWN_BREAK_MIN_VOLUME_RATIO
+        )
+        shift_delta = 0.0
+        break_threshold = min(
+            1.0,
+            max(
+                _GLOBAL_COOLDOWN_BREAK_MIN_DELTA,
+                self.min_hotness_delta * _GLOBAL_COOLDOWN_BREAK_DELTA_FACTOR,
+            ),
+        )
+        if previous is not None and previous.shape == normalized.shape:
+            shift_delta = self._global_hotness_delta(
+                normalized,
+                previous,
+                total_slots,
+            )
+        if volume_is_representative and shift_delta >= break_threshold:
+            self._global_cooldown_shift_streak += 1
+        else:
+            self._global_cooldown_shift_streak = 0
+        if self._global_cooldown_shift_streak >= _GLOBAL_COOLDOWN_BREAK_CONFIRMATIONS:
+            logger.info(
+                "[CRAFT-GLOBAL-COOLDOWN] break=true shift_delta=%.4f "
+                "threshold=%.4f volume_ratio=%.4f",
+                shift_delta,
+                break_threshold,
+                volume_ratio,
+            )
+            self._global_rebalance_cooldown_remaining = 0
+            self._global_cooldown_shift_streak = 0
             return False
         self._global_rebalance_cooldown_remaining -= 1
         logger.info(
-            "[CRAFT-GLOBAL-COOLDOWN] skipped=true remaining=%d",
+            "[CRAFT-GLOBAL-COOLDOWN] skipped=true remaining=%d "
+            "shift_delta=%.4f threshold=%.4f volume_ratio=%.4f "
+            "representative=%s shift_streak=%d/%d",
             self._global_rebalance_cooldown_remaining,
+            shift_delta,
+            break_threshold,
+            volume_ratio,
+            volume_is_representative,
+            self._global_cooldown_shift_streak,
+            _GLOBAL_COOLDOWN_BREAK_CONFIRMATIONS,
         )
         return True
 
@@ -444,6 +543,37 @@ class PoolBalanceEplb(EplbPolicy):
             / np.sum(layer_weights[active])
         )
 
+    @staticmethod
+    def _global_critical_path_load(table, hotness):
+        table = np.asarray(table)
+        hotness = np.asarray(hotness, dtype=np.float64)
+        valid = table >= 0
+        if not np.any(valid):
+            return 0.0
+        layer_ids = np.broadcast_to(
+            np.arange(table.shape[0], dtype=np.int64)[:, None, None],
+            table.shape,
+        )
+        rank_ids = np.broadcast_to(
+            np.arange(table.shape[1], dtype=np.int64)[None, :, None],
+            table.shape,
+        )
+        counts = np.zeros(hotness.shape, dtype=np.int64)
+        np.add.at(counts, (layer_ids[valid], table[valid]), 1)
+        per_copy = np.divide(
+            hotness,
+            counts,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=counts > 0,
+        )
+        rank_loads = np.zeros(table.shape[:2], dtype=np.float64)
+        np.add.at(
+            rank_loads,
+            (layer_ids[valid], rank_ids[valid]),
+            per_copy[layer_ids[valid], table[valid]],
+        )
+        return float(np.sum(np.max(rank_loads, axis=1)))
+
     def _rebalance_global_pool(self, current_expert_table, expert_workload, pool_start):
         old_table = current_expert_table.detach().cpu().numpy()
         pool_size = old_table.shape[2] - pool_start
@@ -454,7 +584,10 @@ class PoolBalanceEplb(EplbPolicy):
                 f"configured={self.global_pool_total_size}, table={pool_size * num_ranks}."
             )
         hotness = self._expert_hotness(current_expert_table, expert_workload)
-        if self._global_rebalance_is_cooling_down():
+        if self._global_rebalance_is_cooling_down(
+            hotness,
+            pool_size * num_ranks,
+        ):
             return False, None, current_expert_table.tolist()
         if not self._global_hotness_changed(hotness, pool_size * num_ranks):
             return False, None, current_expert_table.tolist()
@@ -482,15 +615,14 @@ class PoolBalanceEplb(EplbPolicy):
                     )
                 ),
             )
-        planner_started = time.perf_counter()
         layer_replicas, extra_capacities, placements = plan_craft_replication(
             hotness,
             pool_size * num_ranks,
             num_ranks,
             home_placements=home,
             candidate_top_m=planner_top_m,
+            benefit_objective=self.global_planner_objective,
         )
-        planner_ms = (time.perf_counter() - planner_started) * 1_000.0
         new_table = self._place_global_craft_plan(
             old_table,
             placements,
@@ -498,35 +630,37 @@ class PoolBalanceEplb(EplbPolicy):
             pool_start,
             pool_size,
         )
-        old_imbalance = self._global_imbalance(old_table, hotness)
-        new_imbalance = self._global_imbalance(new_table, hotness)
+        score_fn = (
+            self._global_critical_path_load
+            if self.global_planner_objective == "critical_path"
+            else self._global_imbalance
+        )
+        old_imbalance = score_fn(old_table, hotness)
+        new_imbalance = score_fn(new_table, hotness)
         relative_improvement = (
             (old_imbalance - new_imbalance) / old_imbalance
             if old_imbalance > 0
             else 0.0
         )
-        changed_slots = int(np.count_nonzero(old_table != new_table))
-        changed_layers = int(
-            np.count_nonzero(np.any(old_table != new_table, axis=(1, 2)))
-        )
         accepted = relative_improvement >= self.min_improvement
         logger.info(
-            "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
-            "current=%.4f proposed=%.4f improvement=%.4f accepted=%s "
-            "planner_top_m=%d planner_ms=%.3f layer_replicas=%s",
+            "[CRAFT-GLOBAL-BALANCE] slots=%d current=%.4f proposed=%.4f "
+            "improvement=%.4f accepted=%s objective=%s planner_top_m=%d "
+            "layer_replicas=%s",
             pool_size * num_ranks,
-            changed_slots,
-            changed_layers,
             old_imbalance,
             new_imbalance,
             relative_improvement,
             accepted,
+            self.global_planner_objective,
             planner_top_m,
-            planner_ms,
             ",".join(str(int(value)) for value in layer_replicas),
         )
         if not accepted:
             return False, None, current_expert_table.tolist()
+        self._last_global_plan_hotness = self._normalize_global_hotness(hotness)
+        self._last_global_plan_volume = float(np.sum(hotness))
+        self._global_cooldown_shift_streak = 0
         changed = not np.array_equal(old_table, new_table)
         if changed:
             self._global_rebalance_cooldown_remaining = (

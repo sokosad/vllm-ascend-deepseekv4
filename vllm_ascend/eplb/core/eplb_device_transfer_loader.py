@@ -14,7 +14,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import time
 from enum import Enum
 
 import torch
@@ -44,7 +43,6 @@ class D2DExpertWeightLoader:
         self._p2p_staging_tensors = []
         self._recv_staging_tasks = []
         self._craft_transfer_tasks = []
-        self._craft_transfer_ms = 0.0
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -67,7 +65,6 @@ class D2DExpertWeightLoader:
         if self.craft_pool_migration:
             rank_in_group = getattr(self.comm_group, "rank_in_group", None)
             local_rank = rank_in_group if isinstance(rank_in_group, int) else dist.get_rank()
-        send_bytes = 0
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
@@ -87,10 +84,7 @@ class D2DExpertWeightLoader:
                     )
                 else:
                     self.comm_op_list.append(op)
-                if self.craft_pool_migration:
-                    send_bytes += src_tensor.numel() * src_tensor.element_size()
 
-        recv_bytes = 0
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info
             for param_id, buffer_tensor in enumerate(self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]):
@@ -111,20 +105,11 @@ class D2DExpertWeightLoader:
                     )
                 else:
                     self.comm_op_list.append(op)
-                if self.craft_pool_migration:
-                    recv_bytes += buffer_tensor.numel() * buffer_tensor.element_size()
             local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
 
         if self.craft_pool_migration:
             self.comm_op_list = [op for _, op in sorted(craft_comm_ops, key=lambda item: item[0])]
-
-        if self.craft_pool_migration:
-            logger.info(
-                "[EPLB-MIG] layer=%d send_experts=%d recv_experts=%d MB=%.2f",
-                layer_id, len(expert_send_info), len(expert_recv_info),
-                (send_bytes + recv_bytes) / 1e6,
-            )
 
         self.state = ExpertWeightUpdateState.READY
 
@@ -138,11 +123,9 @@ class D2DExpertWeightLoader:
 
         # set asynchronous stream for d2d expert weight transfer
         if self.craft_pool_migration and self._craft_transfer_tasks:
-            transfer_started_at = time.perf_counter()
             self._synchronize_device()
             self._transfer_craft_weights_ordered()
             self._synchronize_device()
-            self._craft_transfer_ms = (time.perf_counter() - transfer_started_at) * 1e3
         elif self.comm_op_list:
             reqs.extend(dist.batch_isend_irecv(self.comm_op_list))
 
@@ -154,18 +137,10 @@ class D2DExpertWeightLoader:
             return
 
         # Waiting for send/recv tasks finish
-        t0 = time.perf_counter() if self.craft_pool_migration else None
         for req in reqs:
             req.wait()
         if self.craft_pool_migration:
             self._synchronize_device()
-            logger.info(
-                "[EPLB-MIG] layer=%d payload transfer %.1f ms",
-                self.layer_id,
-                self._craft_transfer_ms,
-            )
-            logger.info("[EPLB-MIG] layer=%d transfer wait %.1f ms",
-                        self.layer_id, (time.perf_counter() - t0) * 1e3)
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
@@ -194,7 +169,6 @@ class D2DExpertWeightLoader:
         self.updated_log2phy_map = None
         self._p2p_staging_tensors = []
         self._craft_transfer_tasks = []
-        self._craft_transfer_ms = 0.0
         self.layer_id = -1
         self.state = ExpertWeightUpdateState.WAITING
 

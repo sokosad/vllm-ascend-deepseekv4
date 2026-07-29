@@ -26,10 +26,6 @@ def begin_global_craft_expert_pool_model() -> int:
     return _ACTIVE_MODEL_ID
 
 
-def clear_global_craft_expert_pools() -> None:
-    _GLOBAL_POOLS.clear()
-
-
 def cache_global_craft_weight_lists(layer) -> None:
     pool = layer.craft_global_expert_pool.parameters
     layer.craft_global_w1 = (
