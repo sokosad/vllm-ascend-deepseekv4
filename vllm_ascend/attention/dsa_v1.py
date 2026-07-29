@@ -1185,6 +1185,13 @@ class AscendDSAImpl(DSAAttentionImpl):
             self.n_local_groups)
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups,
                                          group_hidden_dim)
+
+        def get_wo_a_weight(num_groups: int) -> torch.Tensor:
+            weight = self.wo_a.weight
+            if weight.dim() == 2:
+                weight = weight.view(num_groups, self.o_lora_rank, -1).transpose(1, 2)
+            return weight
+
         if oproj_tp_enable():
             oproj_group = get_otp_group()
             oproj_tp_size = oproj_group.world_size
@@ -1223,7 +1230,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                                      groups_per_oproj_rank, group_hidden_dim)
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
-                self.wo_a.weight,
+                get_wo_a_weight(groups_per_oproj_rank),
                 bias=None,
                 scale=None,
                 perm_x1=(1, 0, 2),
@@ -1240,7 +1247,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             # o = torch.einsum("tgd,grd->tgr", o, wo_a)
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
-                self.wo_a.weight,
+                get_wo_a_weight(self.n_local_groups),
                 bias=None,
                 scale=None,
                 perm_x1=(1, 0, 2),

@@ -22,19 +22,46 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, generate_pool_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
 
+CRAFT_POOL_POLICY_CONFIG_FIELDS = (
+    "craft_pool_top_m",
+    "craft_pool_top_m_factor",
+    "craft_pool_min_hotness_delta",
+    "craft_pool_min_improvement",
+)
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class EplbWorker:
-    def __init__(self, shared_dict, policy_type, enable_d2d: bool = True):
+    def __init__(self, shared_dict, policy_type, enable_d2d: bool = True, eplb_config=None):
         self.policy_type = policy_type
-        self.policy = PolicyFactory.generate_policy(policy_type, DynamicConfig())
+        self.policy = PolicyFactory.generate_policy(policy_type, self._build_policy_config(policy_type, eplb_config))
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
+        self.full_rank_plan = policy_type == 4
+
+    @staticmethod
+    def _build_policy_config(policy_type, eplb_config=None):
+        policy_config = DynamicConfig()
+        if policy_type != 4 or eplb_config is None:
+            return policy_config
+        for field in CRAFT_POOL_POLICY_CONFIG_FIELDS:
+            if hasattr(eplb_config, field):
+                setattr(policy_config, field, getattr(eplb_config, field))
+        return policy_config
 
     def do_update(self):
         # put data in to queue
@@ -49,7 +76,7 @@ class EplbWorker:
         if self.old_expert_maps is None:
             self.old_expert_maps = self.get_init_expert_maps()
             if self.old_expert_maps is not None:
-                self.num_local_experts = self.old_expert_maps.max() + 1
+                self.num_local_experts = self._max_local_experts(self.old_expert_maps)
             else:
                 raise ValueError("Failed to get expert_maps from shared_dict.")
 
@@ -90,11 +117,59 @@ class EplbWorker:
         return packed_update_info
 
     def check_expert_placement(self, old_placement, new_placement):
+        if self.policy_type != 4:
+            self._check_expert_placement_legacy(old_placement, new_placement)
+            return
+
         num_layers = old_placement.shape[0]
         num_ranks = old_placement.shape[1]
 
         for layer_id in range(num_layers):
             # check if any logical expert is not placed on any rank
+            old_valid_experts = torch.unique(old_placement[layer_id][old_placement[layer_id] >= 0])
+            new_valid_experts = torch.unique(new_placement[layer_id][new_placement[layer_id] >= 0])
+            if not torch.all(torch.isin(old_valid_experts, new_valid_experts)):
+                logger.error(f"There exists expert not placed on any rank in layer {layer_id}")
+                new_placement[layer_id] = old_placement[layer_id]
+                continue
+
+            for rank_id in range(num_ranks):
+                new_placement_check = new_placement[layer_id][rank_id]
+                old_placement_check = old_placement[layer_id][rank_id]
+                new_valid_slots = new_placement_check >= 0
+                new_valid_experts = new_placement_check[new_valid_slots]
+
+                # check if same logical experts are placed on the same NPU
+                if new_valid_experts.numel() != torch.unique(new_valid_experts).numel():
+                    logger.error(
+                        "Replicated experts are placed on the same NPU; expert placement on "
+                        f"layer {layer_id}, rank {rank_id} is invalid"
+                    )
+                    new_placement[layer_id] = old_placement[layer_id]
+                    break
+
+                # Experts that remain on a rank must keep their local slots so
+                # only pool replacement requires weight movement.
+                invalid_movement = False
+                for slot_id in torch.where(new_valid_slots)[0]:
+                    expert_id = new_placement_check[slot_id]
+                    old_slots = torch.where(old_placement_check == expert_id)[0]
+                    if old_slots.numel() > 0 and old_slots[0].item() != slot_id.item():
+                        invalid_movement = True
+                        break
+                if invalid_movement:
+                    logger.error(
+                        "There exists expert movement inside NPU; expert placement on "
+                        f"layer {layer_id}, rank {rank_id} is invalid"
+                    )
+                    new_placement[layer_id] = old_placement[layer_id]
+                    break
+
+    @staticmethod
+    def _check_expert_placement_legacy(old_placement, new_placement):
+        num_layers = old_placement.shape[0]
+        num_ranks = old_placement.shape[1]
+        for layer_id in range(num_layers):
             if torch.unique(new_placement[layer_id]).numel() < torch.unique(old_placement[layer_id]).numel():
                 logger.error(f"There exists expert not placed on any rank in layer {layer_id}")
                 new_placement[layer_id] = old_placement[layer_id]
@@ -103,8 +178,6 @@ class EplbWorker:
             for rank_id in range(num_ranks):
                 new_placement_check = new_placement[layer_id][rank_id]
                 old_placement_check = old_placement[layer_id][rank_id]
-
-                # check if same logical experts are placed on the same NPU
                 if new_placement_check.numel() != torch.unique(new_placement_check).numel():
                     logger.error(
                         "Replicated experts are placed on the same NPU; expert placement on "
@@ -113,7 +186,6 @@ class EplbWorker:
                     new_placement[layer_id] = old_placement[layer_id]
                     break
 
-                # check if there is any experts movement inside one NPU
                 expert_not_move = torch.isin(new_placement_check, old_placement_check)
                 if not torch.equal(new_placement_check[expert_not_move], old_placement_check[expert_not_move]):
                     logger.error(
@@ -141,6 +213,7 @@ class EplbWorker:
                     updated_expert_maps_this_layer,
                     layer_id,
                 )
+                continue
 
             # Parse expert_ids each rank needs to receive from other ranks
             dst_rank_indices, experts_to_recv = torch.where(
@@ -206,16 +279,24 @@ class EplbWorker:
     def update_expert_map(self, expert_maps):
         self.shared_dict["expert_maps"] = expert_maps
 
-    def global2local(self, placement: torch.Tensor, E_local: int) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _max_local_experts(expert_maps: torch.Tensor) -> int:
+        valid_slots = expert_maps[expert_maps >= 0]
+        if valid_slots.numel() == 0:
+            return 0
+        return int(torch.max(valid_slots).item()) + 1
+
+    def global2local(self, placement: torch.Tensor, E_local: int) -> torch.Tensor:
         L, G, _ = placement.shape
         device = placement.device
+        E_local = int(E_local)
 
         pt_local = torch.full((L, G, E_local), fill_value=-1, dtype=torch.long, device=device)
 
         valid = placement >= 0
         l_idx, g_idx, k_idx = valid.nonzero(as_tuple=True)
 
-        slot_idx = placement[l_idx, g_idx, k_idx]
+        slot_idx = placement[l_idx, g_idx, k_idx].long()
 
         pt_local[l_idx, g_idx, slot_idx] = k_idx
 
@@ -243,42 +324,80 @@ class EplbWorker:
 
     def pack_update_info(self, update_info_generator):
         """
-        Pack a list of update info tuples for efficient IPC.
+        Pack a list of update info records for efficient IPC.
+
+        Dynamic EPLB workers run independently on every rank. To keep D2D
+        P2P send/recv pairs consistent, each worker packs the full plan for
+        all ranks; the runtime broadcasts rank 0's full plan and each rank
+        selects its local slice.
         """
-        send_all = []
-        recv_all = []
-        maps = []
-        log2phy_all = []
-        layer_ids = []
+        if not self.full_rank_plan:
+            send_all = []
+            recv_all = []
+            maps = []
+            log2phy_all = []
+            layer_ids = []
+            for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+                send_all.append(send_info.get(self.rank_id, []))
+                recv_all.append(recv_info.get(self.rank_id, []))
+                maps.append(new_expert_map[self.rank_id].numpy().tolist())
+                log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
+                log2phy_all.append(log2phy_map.numpy().tolist())
+                layer_ids.append(layer_id)
+            return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+
+        packed_update_info = []
 
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
-            send_info_this_rank = send_info.get(self.rank_id, [])
-            recv_info_this_rank = recv_info.get(self.rank_id, [])
-            send_all.append(send_info_this_rank)
-            recv_all.append(recv_info_this_rank)
+            num_ranks = int(new_expert_map.shape[0])
+            if self.full_rank_plan:
+                shared_log2phy_map = generate_pool_log2phy_map(new_expert_map).numpy().tolist()
+                log2phy_all = [shared_log2phy_map for _ in range(num_ranks)]
+            else:
+                log2phy_all = [
+                    generate_log2phy_map(new_expert_map, rank_id).numpy().tolist()
+                    for rank_id in range(num_ranks)
+                ]
 
-            maps.append(new_expert_map[self.rank_id].numpy().tolist())
+            packed_update_info.append(
+                {
+                    "send_all": [send_info.get(rank_id, []) for rank_id in range(num_ranks)],
+                    "recv_all": [recv_info.get(rank_id, []) for rank_id in range(num_ranks)],
+                    "maps_all": [new_expert_map[rank_id].numpy().tolist() for rank_id in range(num_ranks)],
+                    "log2phy_all": log2phy_all,
+                    "layer_id": layer_id,
+                }
+            )
 
-            log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
-            log2phy_all.append(log2phy_map.numpy().tolist())
-
-            layer_ids.append(layer_id)
-
-        return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+        return packed_update_info
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):
         imbalance_list = []
-        deployment_all_layer = np.array(deployment_all_layer)
+        deployment_all_layer = (
+            deployment_all_layer.detach().cpu().numpy()
+            if torch.is_tensor(deployment_all_layer)
+            else np.asarray(deployment_all_layer)
+        )
         for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):
-            counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])
+            valid = deployment >= 0
+            if not valid.any() or hotness.shape[0] == 0:
+                continue
+            counts = np.bincount(deployment[valid].reshape(-1), minlength=hotness.shape[0])
 
             unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
 
-            stage_load = unit_hotness[deployment].sum(-1)
-            stage_par = stage_load.max() / stage_load.mean()
+            stage_load = []
+            for rank_deployment in deployment:
+                valid_rank_experts = rank_deployment[rank_deployment >= 0]
+                stage_load.append(unit_hotness[valid_rank_experts].sum() if valid_rank_experts.size else 0.0)
+            stage_load = np.asarray(stage_load)
+            mean_load = stage_load.mean()
+            stage_par = stage_load.max() / mean_load if mean_load > 0 else 0.0
             imbalance_list.append(stage_par)
 
+        if not imbalance_list:
+            return 0.0, 0.0
         max_val = max(imbalance_list)
         mean_val = sum(imbalance_list) / len(imbalance_list)
         return mean_val, max_val
@@ -286,11 +405,23 @@ class EplbWorker:
     @staticmethod
     def _calculate_hotness(deployment_all_layer, moe_load_all_layer):
         hotnesses = []
-        num_of_expert = deployment_all_layer.shape[1] * deployment_all_layer.shape[2]
-        for deployment, rank_load in zip(deployment_all_layer, moe_load_all_layer.numpy()):
+        deployment_all_layer = (
+            deployment_all_layer.detach().cpu().numpy()
+            if torch.is_tensor(deployment_all_layer)
+            else np.asarray(deployment_all_layer)
+        )
+        moe_load_all_layer = (
+            moe_load_all_layer.detach().cpu().numpy()
+            if torch.is_tensor(moe_load_all_layer)
+            else np.asarray(moe_load_all_layer)
+        )
+        valid = deployment_all_layer >= 0
+        num_of_expert = int(deployment_all_layer[valid].max()) + 1 if valid.any() else 0
+        for deployment, rank_load in zip(deployment_all_layer, moe_load_all_layer):
             hotness = np.zeros(num_of_expert, dtype=rank_load.dtype)
-            deployment_flat = deployment.ravel()
-            rank_load_flat = rank_load.ravel()
+            valid_deployment = deployment >= 0
+            deployment_flat = deployment[valid_deployment].ravel()
+            rank_load_flat = rank_load[valid_deployment].ravel()
             np.add.at(hotness, deployment_flat, rank_load_flat)
             hotnesses.append(hotness)
 
@@ -298,7 +429,7 @@ class EplbWorker:
 
 
 class EplbProcess:
-    def __init__(self, shared_dict, policy_type: int = 0, enable_d2d: bool = True):
+    def __init__(self, shared_dict, policy_type: int = 0, enable_d2d: bool = True, eplb_config=None):
         """
         Args:
             shared_dict: Cross-process shared dict returned by Manager().dict()
@@ -312,7 +443,7 @@ class EplbProcess:
         self.block_update_q: Queue[Any] = Queue(maxsize=1)
 
         # Create EplbWorker instance
-        self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)
+        self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d, eplb_config)
 
     def worker_process(self, planner_q, block_update_q):
         """
