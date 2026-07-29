@@ -151,6 +151,24 @@ class VllmEplbAdaptor:
         self.moe_load = self.model.get_all_moe_loads()
         return self.moe_load
 
+    def get_expert_cost_metadata(self) -> list[dict[str, int]]:
+        """Return conservative per-layer compute and migration payload sizes."""
+        metadata = []
+        for layer_id in range(self.num_dense_layers, self.model.config.num_hidden_layers):
+            transfer_sizes = []
+            compute_sizes = []
+            for tensors in self.expert_param_per_layer[layer_id]:
+                tensor_bytes = [tensor.numel() * tensor.element_size() for tensor in tensors]
+                transfer_sizes.append(sum(tensor_bytes))
+                compute_sizes.append(sum(tensor_bytes[:2]))
+            metadata.append(
+                {
+                    "transfer_bytes": max(transfer_sizes, default=0),
+                    "compute_bytes": max(compute_sizes, default=0),
+                }
+            )
+        return metadata
+
     def _export_tensor_to_file(self, expert_maps, expert_map_record_path: str):
         if self.rank_id == 0:
             expert_maps_list = expert_maps.tolist()

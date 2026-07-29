@@ -39,6 +39,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (
     expert_file_pool_metadata,
+    generate_craft_route_map,
     generate_local_physical_expert_mask,
     generate_pool_log2phy_map,
     get_configured_craft_pool_size,
@@ -92,6 +93,14 @@ def _coerce_bool(value) -> bool:
 def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
     if not bool(getattr(layer, "craft_pool_enabled", False)):
         return False
+    # Fused MC2 executes the real MoE op during capture, so its graph already
+    # owns stable outputs. Per-layer shadow buffers only duplicate those
+    # outputs for every capture shape and retain substantial HBM.
+    if (
+        envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+        and getattr(_EXTRA_CTX, "moe_comm_type", None) == MoECommType.FUSED_MC2
+    ):
+        return False
     try:
         if bool(_EXTRA_CTX.graph_capture_forward or _EXTRA_CTX.graph_buffer_warmup):
             return True
@@ -106,11 +115,6 @@ def _is_craft_pool_graph_mode(layer: torch.nn.Module) -> bool:
 
 def _is_craft_pool_graph_capturing(layer: torch.nn.Module) -> bool:
     if not _is_craft_pool_graph_mode(layer):
-        return False
-    if (
-        envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
-        and getattr(_EXTRA_CTX, "moe_comm_type", None) == MoECommType.FUSED_MC2
-    ):
         return False
     try:
         return bool(
@@ -477,7 +481,7 @@ class AscendFusedMoE(FusedMoE):
                     f"pool={self.local_num_experts_pool}.")
             self.global_num_experts = num_experts
             self.global_redundant_expert_num = 0
-            self.log2phy = generate_pool_log2phy_map(self.global_expert_map).npu()
+            self.log2phy = generate_craft_route_map(self.global_expert_map).npu()
             self.local_num_experts = self.local_num_experts_main + self.local_num_experts_pool
             self.dispatch_expert_map = generate_local_physical_expert_mask(
                 self.local_num_experts,

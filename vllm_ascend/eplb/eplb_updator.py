@@ -72,6 +72,8 @@ class EplbUpdator:
         self.world_size = dist.get_world_size()
         self.device = local_load.device
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
+        if self.craft_pool_plan:
+            self.shared_dict["craft_expert_cost_metadata"] = self.adaptor.get_expert_cost_metadata()
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
@@ -93,6 +95,8 @@ class EplbUpdator:
         self.update_info_all = []
         self.update_info_index = 0
         self.skip_current_step = False
+        self.noop_current_step = False
+        self.noop_cycle_pending = False
 
         self.cur_iterations: torch.int64 = 0
 
@@ -112,6 +116,8 @@ class EplbUpdator:
 
             self.adaptor.model.clear_all_moe_loads()
             self.cur_iterations = 0
+            return True
+        return False
 
     def get_update_info_flag(self):
         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
@@ -145,6 +151,9 @@ class EplbUpdator:
     def _select_rank_update_info(self, update_info_all):
         selected_update_info = []
         for record in update_info_all:
+            if isinstance(record, dict) and record.get("noop", False):
+                selected_update_info.append(None)
+                continue
             if not isinstance(record, dict) or "send_all" not in record:
                 selected_update_info.append(record)
                 continue
@@ -196,6 +205,11 @@ class EplbUpdator:
                     self.update_info_all = []
                 else:
                     self.update_info_all = self._select_rank_update_info(self.update_info_all)
+                    self.noop_cycle_pending = (
+                        self.craft_pool_plan
+                        and len(self.update_info_all) == self.num_moe_layers
+                        and all(update_info is None for update_info in self.update_info_all)
+                    )
             else:
                 self.update_info_all = self.eplb_process.block_update_q.get()
             self.update_info_index = 0
@@ -211,6 +225,9 @@ class EplbUpdator:
                     )
                     return
                 update_info = self.update_info_all[self.update_info_index]
+                if update_info is None:
+                    self.noop_current_step = True
+                    return
             else:
                 update_info = self.update_info_all.pop(0)
             (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = update_info
@@ -233,8 +250,27 @@ class EplbUpdator:
             self.compute_and_set_moe_load()
             self.wakeup_eplb_worker()
 
+        if self.noop_cycle_pending:
+            if self.expert_map_record_path is not None:
+                self.adaptor._export_tensor_to_file(
+                    self.shared_dict["expert_maps"], self.expert_map_record_path
+                )
+            self.adaptor.model.clear_all_moe_loads()
+            self.cur_iterations = 0
+            self.update_info_all = []
+            self.noop_cycle_pending = False
+            logger.info("[EPLB] skipped unchanged CRAFT update cycle.")
+            return
+
         if self.update_expert_weight_flag() and self.skip_current_step:
             self.skip_current_step = False
+            return
+
+        if self.update_expert_weight_flag() and self.noop_current_step:
+            cycle_completed = self.update_iteration()
+            self.noop_current_step = False
+            if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+                logger.info("[EPLB] completed CRAFT update cycle.")
             return
 
         if (
@@ -244,8 +280,11 @@ class EplbUpdator:
         ):
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
-        self.update_iteration()
+        cycle_completed = self.update_iteration()
+        if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+            logger.info("[EPLB] completed CRAFT update cycle.")
         self.skip_current_step = False
+        self.noop_current_step = False
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

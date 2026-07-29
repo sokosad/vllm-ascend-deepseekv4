@@ -66,14 +66,6 @@ def _coerce_pool_size(pool_size) -> int:
     return max(0, int(pool_size or 0))
 
 
-def _coerce_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
 def get_configured_craft_pool_size(eplb_config, layer_id: int | None = None) -> int:
     layer_sizes = getattr(eplb_config, "craft_pool_layer_sizes", None)
     if layer_sizes is None:
@@ -193,7 +185,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
             local_expert_map = expert_map
     if eplb_enable:
         if pool_mode:
-            log2phy = generate_pool_log2phy_map(global_expert_map).npu()
+            log2phy = generate_craft_route_map(global_expert_map).npu()
         else:
             log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
     else:
@@ -252,6 +244,14 @@ def generate_pool_log2phy_map(global_expert_map):
     if torch.any(copy_index == 0):
         raise ValueError("Pool log2phy contains a logical expert without a physical replica.")
     return log2phy
+
+
+def generate_craft_route_map(global_expert_map):
+    """Pack CRAFT candidates and replica counts into one graph-stable tensor."""
+    candidates = generate_pool_log2phy_map(global_expert_map)
+    replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int32)
+    encoded_counts = -(replica_counts + 1).unsqueeze(-1)
+    return torch.cat((candidates, encoded_counts), dim=-1)
 
 
 def generate_local_physical_expert_mask(local_num_experts, ep_size, ep_rank):
