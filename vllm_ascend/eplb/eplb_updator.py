@@ -55,6 +55,10 @@ class EplbUpdator:
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
         self.craft_pool_plan = self.eplb_config.eplb_policy_type == 4
+        self.craft_global_pool_plan = (
+            int(getattr(self.eplb_config, "craft_global_pool_size", 0) or 0) > 0
+        )
+        self.global_pool_routes_suspended = False
         self.full_rank_plan = self.craft_pool_plan
         self.plan_timeout_s = _positive_float(
             getattr(self.eplb_config, "craft_plan_timeout_s", 60.0),
@@ -74,6 +78,14 @@ class EplbUpdator:
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
         if self.craft_pool_plan:
             self.shared_dict["craft_expert_cost_metadata"] = self.adaptor.get_expert_cost_metadata()
+
+    def _planner_process_alive(self) -> bool:
+        if self.process is None or not hasattr(self.process, "is_alive"):
+            return True
+        try:
+            return self.process.is_alive() is not False
+        except (AssertionError, ValueError):
+            return False
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
@@ -193,13 +205,18 @@ class EplbUpdator:
             if self.full_rank_plan:
                 update_info_all = None
                 if self.rank_id == self.plan_src_rank:
-                    try:
-                        update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
-                    except Empty:
+                    if not self._planner_process_alive():
                         logger.error(
-                            "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
-                            self.plan_timeout_s,
+                            "CRAFT EPLB planner is not running; skipping this update cycle"
                         )
+                    else:
+                        try:
+                            update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
+                        except Empty:
+                            logger.error(
+                                "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
+                                self.plan_timeout_s,
+                            )
                 self.update_info_all = self._broadcast_update_info(update_info_all)
                 if self.update_info_all is None:
                     self.update_info_all = []
@@ -230,6 +247,14 @@ class EplbUpdator:
                     return
             else:
                 update_info = self.update_info_all.pop(0)
+            if self.craft_global_pool_plan and not self.global_pool_routes_suspended:
+                changed_layer_ids = [
+                    layer_update[4]
+                    for layer_update in self.update_info_all
+                    if isinstance(layer_update, tuple)
+                ]
+                self.adaptor.suspend_global_pool_routes(changed_layer_ids)
+                self.global_pool_routes_suspended = True
             (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = update_info
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
@@ -259,6 +284,7 @@ class EplbUpdator:
             self.cur_iterations = 0
             self.update_info_all = []
             self.noop_cycle_pending = False
+            self.global_pool_routes_suspended = False
             logger.info("[EPLB] skipped unchanged CRAFT update cycle.")
             return
 
@@ -271,6 +297,8 @@ class EplbUpdator:
             self.noop_current_step = False
             if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
                 logger.info("[EPLB] completed CRAFT update cycle.")
+            if cycle_completed:
+                self.global_pool_routes_suspended = False
             return
 
         if (
@@ -283,6 +311,8 @@ class EplbUpdator:
         cycle_completed = self.update_iteration()
         if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
             logger.info("[EPLB] completed CRAFT update cycle.")
+        if cycle_completed:
+            self.global_pool_routes_suspended = False
         self.skip_current_step = False
         self.noop_current_step = False
 

@@ -395,12 +395,16 @@ class EplbConfig:
         "eplb_policy_type": 1,
         "craft_pool_size": 0,
         "craft_pool_layer_sizes": None,
+        "craft_global_pool_size": 0,
         "craft_pool_top_m": 0,
         "craft_pool_top_m_factor": 4,
         "craft_pool_min_hotness_delta": 0.05,
         "craft_pool_min_improvement": 0.01,
+        "craft_global_rebalance_cooldown": 0,
+        "craft_layer_rebalance_cooldown": 0,
         "craft_pool_max_payback_steps": 0,
         "craft_pool_migration_cost_ratio": 1.0,
+        "craft_rank_sharded_routing": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -425,12 +429,19 @@ class EplbConfig:
     def _apply_env_defaults(self, user_config: dict):
         env_defaults = {
             "craft_pool_size": (("VLLM_ASCEND_CRAFT_POOL_SIZE",), int),
+            "craft_global_pool_size": (("VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",), int),
             "craft_pool_top_m": (("CRAFT_POOL_TOP_M",), int),
             "craft_pool_top_m_factor": (("CRAFT_POOL_TOP_M_FACTOR", "CRAFT_POOL_TOPM_FACTOR"), int),
             "craft_pool_min_hotness_delta": (("CRAFT_POOL_MIN_HOTNESS_DELTA",), float),
             "craft_pool_min_improvement": (("CRAFT_POOL_MIN_IMPROVEMENT",), float),
+            "craft_global_rebalance_cooldown": (("CRAFT_GLOBAL_REBALANCE_COOLDOWN",), int),
+            "craft_layer_rebalance_cooldown": (("CRAFT_LAYER_REBALANCE_COOLDOWN",), int),
             "craft_pool_max_payback_steps": (("CRAFT_POOL_MAX_PAYBACK_STEPS",), int),
             "craft_pool_migration_cost_ratio": (("CRAFT_POOL_MIGRATION_COST_RATIO",), float),
+            "craft_rank_sharded_routing": (
+                ("VLLM_ASCEND_CRAFT_RANK_SHARDED_ROUTING", "CRAFT_RANK_SHARDED_ROUTING"),
+                self._coerce_bool,
+            ),
         }
         for key, (env_names, coerce) in env_defaults.items():
             if key in user_config:
@@ -441,7 +452,23 @@ class EplbConfig:
                     self.config[key] = coerce(value)
                     break
 
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+            raise ValueError(f"Invalid boolean value: {value}")
+        return bool(value)
+
     def _validate_config(self):
+        self.config["craft_rank_sharded_routing"] = self._coerce_bool(
+            self.config["craft_rank_sharded_routing"]
+        )
         if self.expert_map_path is not None:
             logger.info(f"The expert_map is {self.config['dynamic_eplb']}")
             if self.expert_map_path[-5:] != ".json":
@@ -459,6 +486,9 @@ class EplbConfig:
             "algorithm_execution_interval",
             "num_redundant_experts",
             "craft_pool_size",
+            "craft_global_pool_size",
+            "craft_global_rebalance_cooldown",
+            "craft_layer_rebalance_cooldown",
             "craft_pool_max_payback_steps",
         ]:
             if not isinstance(self.config[key], int):
@@ -467,7 +497,10 @@ class EplbConfig:
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
         if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
             raise ValueError("eplb_policy_type must in [0, 1, 2, 3, 4]")
+        if not isinstance(self.config["craft_rank_sharded_routing"], bool):
+            raise TypeError("craft_rank_sharded_routing must be a boolean")
         self._validate_craft_pool_layer_sizes()
+        self._validate_craft_global_pool_size()
         self._validate_craft_pool_policy_knobs()
         if self.config["dynamic_eplb"]:
             assert (
@@ -479,12 +512,22 @@ class EplbConfig:
         logger.info(f"The number of redundant experts is {self.config['num_redundant_experts']}")
         logger.info(f"The CRAFT pool size per rank is {self.config['craft_pool_size']}")
         logger.info(f"The CRAFT pool layer sizes are {self.config['craft_pool_layer_sizes']}")
+        logger.info(f"The CRAFT global pool size is {self.config['craft_global_pool_size']}")
         logger.info(f"The CRAFT pool top-M candidate limit is {self.config['craft_pool_top_m']}")
         logger.info(f"The CRAFT pool top-M factor is {self.config['craft_pool_top_m_factor']}")
         logger.info(f"The CRAFT pool min hotness delta is {self.config['craft_pool_min_hotness_delta']}")
         logger.info(f"The CRAFT pool min improvement is {self.config['craft_pool_min_improvement']}")
+        logger.info(
+            "The CRAFT global rebalance cooldown is "
+            f"{self.config['craft_global_rebalance_cooldown']}"
+        )
+        logger.info(
+            "The CRAFT layer rebalance cooldown is "
+            f"{self.config['craft_layer_rebalance_cooldown']}"
+        )
         logger.info(f"The CRAFT pool max payback steps is {self.config['craft_pool_max_payback_steps']}")
         logger.info(f"The CRAFT pool migration cost ratio is {self.config['craft_pool_migration_cost_ratio']}")
+        logger.info(f"CRAFT rank-sharded routing is {self.config['craft_rank_sharded_routing']}")
 
     def _validate_craft_pool_layer_sizes(self):
         layer_sizes = self.config["craft_pool_layer_sizes"]
@@ -502,6 +545,23 @@ class EplbConfig:
                 raise TypeError("craft_pool_layer_sizes values must be integers")
             if pool_size < 0:
                 raise ValueError("craft_pool_layer_sizes values must be non-negative")
+
+    def _validate_craft_global_pool_size(self):
+        global_pool_size = self.config["craft_global_pool_size"]
+        if global_pool_size <= 0:
+            return
+        if self.config["craft_pool_size"] > 0:
+            raise ValueError("craft_global_pool_size conflicts with craft_pool_size.")
+        if self.config["craft_pool_layer_sizes"] is not None:
+            raise ValueError("craft_global_pool_size conflicts with craft_pool_layer_sizes.")
+        if self.config["num_redundant_experts"] > 0:
+            raise ValueError("craft_global_pool_size conflicts with num_redundant_experts.")
+        if self.config["expert_map_path"] is not None:
+            raise ValueError("craft_global_pool_size does not support expert_map_path.")
+        if self.config["expert_map_record_path"] is not None:
+            raise ValueError("craft_global_pool_size does not support expert_map_record_path.")
+        if not self.config["dynamic_eplb"] or self.config["eplb_policy_type"] != 4:
+            raise ValueError("craft_global_pool_size requires dynamic_eplb=true and eplb_policy_type=4.")
 
     def _validate_craft_pool_policy_knobs(self):
         for key in ["craft_pool_top_m", "craft_pool_top_m_factor"]:

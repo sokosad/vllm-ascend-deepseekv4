@@ -211,10 +211,14 @@ class NPUPlatform(Platform):
     def _is_craft_pool_configured(cls, eplb_config) -> bool:
         from vllm_ascend.eplb.core.eplb_utils import (
             expert_file_has_pool_mode,
+            get_configured_craft_global_pool_size,
             get_configured_craft_pool_size,
         )
 
-        if get_configured_craft_pool_size(eplb_config) > 0:
+        if (
+            get_configured_craft_pool_size(eplb_config) > 0
+            or get_configured_craft_global_pool_size(eplb_config) > 0
+        ):
             return True
         return expert_file_has_pool_mode(getattr(eplb_config, "expert_map_path", None))
 
@@ -302,7 +306,18 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         craft_pool_size = ascend_config.eplb_config.craft_pool_size
+        craft_global_pool_size = ascend_config.eplb_config.craft_global_pool_size
         craft_pool_configured = cls._is_craft_pool_configured(ascend_config.eplb_config)
+        if craft_global_pool_size > 0:
+            ep_size = cls._get_configured_ep_size(parallel_config)
+            if craft_global_pool_size % ep_size != 0:
+                raise ValueError(
+                    "craft_global_pool_size must be divisible by ep_size: "
+                    f"craft_global_pool_size={craft_global_pool_size}, ep_size={ep_size}."
+                )
+            parallel_eplb_config = getattr(parallel_config, "eplb_config", None)
+            if parallel_eplb_config is not None:
+                setattr(parallel_eplb_config, "craft_global_pool_size", craft_global_pool_size)
         if craft_pool_size > 0:
             if vllm_config.additional_config is None:
                 vllm_config.additional_config = {}

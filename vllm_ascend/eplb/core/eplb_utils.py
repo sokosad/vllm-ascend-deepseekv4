@@ -66,6 +66,14 @@ def _coerce_pool_size(pool_size) -> int:
     return max(0, int(pool_size or 0))
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def get_configured_craft_pool_size(eplb_config, layer_id: int | None = None) -> int:
     layer_sizes = getattr(eplb_config, "craft_pool_layer_sizes", None)
     if layer_sizes is None:
@@ -79,6 +87,23 @@ def get_configured_craft_pool_size(eplb_config, layer_id: int | None = None) -> 
     if layer_id >= len(layer_sizes):
         return 0
     return _coerce_pool_size(layer_sizes[layer_id])
+
+
+def get_configured_craft_global_pool_size(eplb_config) -> int:
+    """Return the total number of model-level CRAFT slots across all EP ranks."""
+    return _coerce_pool_size(getattr(eplb_config, "craft_global_pool_size", 0))
+
+
+def get_craft_global_pool_size_per_rank(eplb_config, ep_size: int) -> int:
+    total_size = get_configured_craft_global_pool_size(eplb_config)
+    if total_size == 0:
+        return 0
+    if ep_size <= 0 or total_size % ep_size != 0:
+        raise ValueError(
+            "craft_global_pool_size must be divisible by ep_size: "
+            f"craft_global_pool_size={total_size}, ep_size={ep_size}."
+        )
+    return total_size // ep_size
 
 
 @lru_cache(maxsize=16)
@@ -137,7 +162,17 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     ep_size = moe_config.ep_size
     global_placement = None
     craft_pool_size = get_configured_craft_pool_size(eplb_config, layer_id)
-    pool_mode = get_configured_craft_pool_size(eplb_config) > 0 or expert_file_has_pool_mode(expert_map_path)
+    global_pool_size = get_craft_global_pool_size_per_rank(eplb_config, ep_size)
+    if global_pool_size > 0 and n_experts % ep_size != 0:
+        raise ValueError("CRAFT global pool requires num_experts to be divisible by ep_size.")
+    pool_mode = (
+        get_configured_craft_pool_size(eplb_config) > 0
+        or global_pool_size > 0
+        or expert_file_has_pool_mode(expert_map_path)
+    )
+    craft_rank_sharded_routing = _coerce_bool(
+        getattr(eplb_config, "craft_rank_sharded_routing", False)
+    )
     eplb_enable = (
         eplb_config.dynamic_eplb
         or pool_mode
@@ -184,8 +219,24 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
     if eplb_enable:
-        if pool_mode:
-            log2phy = generate_craft_route_map(global_expert_map).npu()
+        layer_uses_pool_route = (
+            craft_pool_size > 0
+            or global_pool_size > 0
+            or expert_file_has_pool_mode(expert_map_path)
+        )
+        if layer_uses_pool_route:
+            local_slots = n_experts // ep_size + global_pool_size if global_pool_size > 0 else None
+            if craft_rank_sharded_routing:
+                log2phy = generate_craft_rank_route_map(
+                    global_expert_map,
+                    moe_config.ep_rank,
+                    local_slots=local_slots,
+                ).npu()
+            else:
+                log2phy = generate_craft_route_map(
+                    global_expert_map,
+                    local_slots=local_slots,
+                ).npu()
         else:
             log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
     else:
@@ -217,7 +268,7 @@ def generate_log2phy_map(global_expert_map, ep_rank):
     return log2phy_map
 
 
-def generate_pool_log2phy_map(global_expert_map):
+def generate_pool_log2phy_map(global_expert_map, local_slots: int | None = None):
     """Return logical expert id -> candidate global physical slots.
 
     Pool mode has multiple physical copies for some logical experts. The
@@ -228,7 +279,13 @@ def generate_pool_log2phy_map(global_expert_map):
         global_expert_map = torch.stack(global_expert_map)
 
     ep_size, num_experts = global_expert_map.shape
-    local_slots = int(torch.max(global_expert_map).item()) + 1
+    inferred_local_slots = int(torch.max(global_expert_map).item()) + 1
+    if local_slots is None:
+        local_slots = inferred_local_slots
+    elif local_slots < inferred_local_slots:
+        raise ValueError(
+            f"local_slots={local_slots} is smaller than required slots={inferred_local_slots}."
+        )
     max_copies = ep_size
     log2phy = torch.full((num_experts, max_copies), -1, dtype=torch.int32)
     copy_index = torch.zeros(num_experts, dtype=torch.int64)
@@ -246,12 +303,53 @@ def generate_pool_log2phy_map(global_expert_map):
     return log2phy
 
 
-def generate_craft_route_map(global_expert_map):
+def generate_craft_route_map(global_expert_map, local_slots: int | None = None):
     """Pack CRAFT candidates and replica counts into one graph-stable tensor."""
-    candidates = generate_pool_log2phy_map(global_expert_map)
+    candidates = generate_pool_log2phy_map(global_expert_map, local_slots=local_slots)
     replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int32)
     encoded_counts = -(replica_counts + 1).unsqueeze(-1)
     return torch.cat((candidates, encoded_counts), dim=-1)
+
+
+def generate_craft_rank_route_map(
+    global_expert_map,
+    source_rank: int,
+    local_slots: int | None = None,
+):
+    """Select a local CRAFT replica when possible, then shard the remainder."""
+    if not torch.is_tensor(global_expert_map):
+        global_expert_map = torch.stack(global_expert_map)
+    if local_slots is None:
+        local_slots = int(torch.max(global_expert_map).item()) + 1
+    candidates = generate_pool_log2phy_map(
+        global_expert_map,
+        local_slots=local_slots,
+    )
+    replica_counts = torch.sum(candidates >= 0, dim=-1, dtype=torch.int64)
+    logical_ids = torch.arange(candidates.shape[0], dtype=torch.int64)
+    candidate_ranks = torch.div(
+        torch.clamp(candidates, min=0),
+        int(local_slots),
+        rounding_mode="floor",
+    )
+    valid_candidates = candidates >= 0
+    local_candidates = valid_candidates & (candidate_ranks == int(source_rank))
+    local_selector = torch.argmax(local_candidates.to(torch.int64), dim=-1)
+    # Exclude source ranks already pinned to local replicas before distributing
+    # the remaining ranks, otherwise local preference can skew replica load.
+    local_ranks_before = torch.sum(
+        valid_candidates & (candidate_ranks < int(source_rank)),
+        dim=-1,
+        dtype=torch.int64,
+    )
+    remaining_rank = int(source_rank) - local_ranks_before
+    fair_selector = (remaining_rank + logical_ids) % replica_counts
+    replica_selector = torch.where(
+        torch.any(local_candidates, dim=-1),
+        local_selector,
+        fair_selector,
+    )
+    return candidates[logical_ids, replica_selector]
 
 
 def generate_local_physical_expert_mask(local_num_experts, ep_size, ep_rank):

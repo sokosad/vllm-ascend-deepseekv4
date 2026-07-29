@@ -1,9 +1,12 @@
 # Copyright Huawei Technologies Co., Ltd. 2023-2024. All rights reserved.
 import os
+import time
 
 import numpy as np
 import torch
+from vllm.logger import logger
 
+from .craft_paper_allocator import plan_craft_replication
 from .policy_abstract import DynamicConfig, EplbPolicy
 
 
@@ -22,11 +25,11 @@ def _get_float_config(config: DynamicConfig, attr: str, env_name: str, default: 
 
 
 class PoolBalanceEplb(EplbPolicy):
-    """Dynamic EPLB policy for fixed-capacity CRAFT pool slots.
+    """Dynamic EPLB policy for fixed-capacity CRAFT pool storage.
 
-    The first `pool_start` local slots are fixed home experts. Only slots
-    `[pool_start, E_local)` are replaced, so tensor shapes and main ownership
-    stay stable while hot experts can rotate through the pool.
+    Layer-local pools keep the first `pool_start` slots fixed. A global pool
+    shares extra storage across layers and assigns replicas with a CRAFT-style
+    per-layer budget while keeping base ownership and tensor shapes stable.
     """
 
     def __init__(self, config: DynamicConfig):
@@ -44,7 +47,37 @@ class PoolBalanceEplb(EplbPolicy):
             0.0,
             _get_float_config(config, "craft_pool_min_improvement", "CRAFT_POOL_MIN_IMPROVEMENT", 0.01),
         )
+        self.global_pool_total_size = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_global_pool_size",
+                "VLLM_ASCEND_CRAFT_GLOBAL_POOL_SIZE",
+                0,
+            ),
+        )
+        self.global_rebalance_cooldown = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_global_rebalance_cooldown",
+                "CRAFT_GLOBAL_REBALANCE_COOLDOWN",
+                0,
+            ),
+        )
+        self.layer_rebalance_cooldown = max(
+            0,
+            _get_int_config(
+                config,
+                "craft_layer_rebalance_cooldown",
+                "CRAFT_LAYER_REBALANCE_COOLDOWN",
+                0,
+            ),
+        )
+        self._global_rebalance_cooldown_remaining = 0
+        self._layer_rebalance_cooldown_remaining: dict[int, int] = {}
         self._last_layer_hotness: dict[int, np.ndarray] = {}
+        self._last_global_hotness: np.ndarray | None = None
 
     @staticmethod
     def _infer_pool_start(current_expert_table: torch.Tensor) -> int:
@@ -67,12 +100,12 @@ class PoolBalanceEplb(EplbPolicy):
         valid_experts = table[table >= 0]
         num_experts = int(valid_experts.max()) + 1 if valid_experts.size else 0
         hotness = np.zeros((num_layers, num_experts), dtype=np.float64)
-        for layer_id in range(num_layers):
-            for rank_id in range(table.shape[1]):
-                for slot_id in range(table.shape[2]):
-                    expert_id = int(table[layer_id, rank_id, slot_id])
-                    if expert_id >= 0:
-                        hotness[layer_id, expert_id] += float(load[layer_id, rank_id, slot_id])
+        valid = table >= 0
+        layer_ids = np.broadcast_to(
+            np.arange(num_layers, dtype=np.int64)[:, None, None],
+            table.shape,
+        )
+        np.add.at(hotness, (layer_ids[valid], table[valid]), load[valid])
         return hotness
 
     def _candidate_experts(self, hotness, pool_size, num_ranks):
@@ -120,6 +153,13 @@ class PoolBalanceEplb(EplbPolicy):
             return True
         self._last_layer_hotness[layer_id] = normalized_hotness.copy()
         return False
+
+    def _layer_cooldown_active(self, layer_id: int) -> bool:
+        remaining = self._layer_rebalance_cooldown_remaining.get(layer_id, 0)
+        if remaining <= 0:
+            return False
+        self._layer_rebalance_cooldown_remaining[layer_id] = remaining - 1
+        return True
 
     def _desired_pool_sets(self, home, hotness, pool_size):
         num_ranks = len(home)
@@ -229,12 +269,279 @@ class PoolBalanceEplb(EplbPolicy):
             new_rank_slots[slot_id] = expert_id
         return new_rank_slots
 
+    def _global_hotness_changed(self, hotness: np.ndarray, total_slots: int) -> bool:
+        if self.min_hotness_delta <= 0:
+            return True
+        flat_hotness = np.abs(hotness).reshape(-1)
+        total_hotness = float(flat_hotness.sum())
+        normalized = (
+            flat_hotness / total_hotness
+            if total_hotness > 0
+            else np.zeros_like(flat_hotness, dtype=np.float64)
+        )
+        previous = self._last_global_hotness
+        if previous is None or previous.shape != normalized.shape:
+            self._last_global_hotness = normalized.copy()
+            return True
+
+        top_m = self.candidate_top_m
+        if top_m <= 0:
+            top_m = max(total_slots * self.candidate_factor, total_slots)
+
+        def top_indices(values):
+            positive = np.flatnonzero(values > 0)
+            count = min(top_m, positive.size)
+            if count == 0:
+                return np.empty(0, dtype=np.int64)
+            if count == positive.size:
+                return positive
+            return positive[np.argpartition(-values[positive], count - 1)[:count]]
+
+        candidates = np.union1d(top_indices(normalized), top_indices(previous))
+        delta = float(np.sum(np.abs(normalized[candidates] - previous[candidates])))
+        if delta < self.min_hotness_delta:
+            return False
+        self._last_global_hotness = normalized.copy()
+        return True
+
+    def _global_rebalance_is_cooling_down(self) -> bool:
+        if self._global_rebalance_cooldown_remaining <= 0:
+            return False
+        self._global_rebalance_cooldown_remaining -= 1
+        logger.info(
+            "[CRAFT-GLOBAL-COOLDOWN] skipped=true remaining=%d",
+            self._global_rebalance_cooldown_remaining,
+        )
+        return True
+
+    @staticmethod
+    def _place_global_craft_plan(
+        old_table,
+        placements,
+        extra_capacities,
+        pool_start,
+        pool_size,
+    ):
+        num_layers, num_ranks, _ = old_table.shape
+        new_table = np.full_like(old_table, -1)
+        pool_slots = list(range(pool_start, pool_start + pool_size))
+        assigned_pool_slots = [[[] for _ in range(num_ranks)] for _ in range(num_layers)]
+
+        for rank_id in range(num_ranks):
+            old_owners = {}
+            for slot_id in pool_slots:
+                owners = [
+                    layer_id
+                    for layer_id in range(num_layers)
+                    if old_table[layer_id, rank_id, slot_id] >= 0
+                ]
+                if len(owners) > 1:
+                    raise ValueError(
+                        "CRAFT global pool slot has multiple layer owners: "
+                        f"rank={rank_id}, slot={slot_id}, owners={owners}."
+                    )
+                if owners:
+                    old_owners[slot_id] = owners[0]
+
+            free_slots = set(pool_slots)
+            for layer_id in range(num_layers):
+                quota = int(extra_capacities[layer_id, rank_id])
+                old_layer_slots = [
+                    slot_id
+                    for slot_id, owner in old_owners.items()
+                    if owner == layer_id
+                ]
+                target = set(placements[layer_id][rank_id])
+                old_layer_slots.sort(
+                    key=lambda slot_id: (
+                        old_table[layer_id, rank_id, slot_id] not in target,
+                        slot_id,
+                    )
+                )
+                kept = old_layer_slots[:quota]
+                assigned_pool_slots[layer_id][rank_id].extend(kept)
+                free_slots.difference_update(kept)
+
+            for layer_id in range(num_layers):
+                quota = int(extra_capacities[layer_id, rank_id])
+                missing = quota - len(assigned_pool_slots[layer_id][rank_id])
+                selected = sorted(free_slots)[:missing]
+                assigned_pool_slots[layer_id][rank_id].extend(selected)
+                free_slots.difference_update(selected)
+
+            if free_slots:
+                raise ValueError(
+                    "CRAFT interleaved capacities did not consume every global pool slot."
+                )
+
+        for layer_id in range(num_layers):
+            for rank_id in range(num_ranks):
+                allowed_slots = list(range(pool_start)) + assigned_pool_slots[layer_id][rank_id]
+                target_experts = list(placements[layer_id][rank_id])
+                target_set = set(target_experts)
+                assigned = set()
+                for slot_id in allowed_slots:
+                    expert_id = int(old_table[layer_id, rank_id, slot_id])
+                    if expert_id >= 0 and expert_id in target_set and expert_id not in assigned:
+                        new_table[layer_id, rank_id, slot_id] = expert_id
+                        assigned.add(expert_id)
+
+                missing_experts = [
+                    expert_id for expert_id in target_experts if expert_id not in assigned
+                ]
+                free_allowed_slots = [
+                    slot_id
+                    for slot_id in allowed_slots
+                    if new_table[layer_id, rank_id, slot_id] < 0
+                ]
+                if len(missing_experts) != len(free_allowed_slots):
+                    raise ValueError(
+                        "CRAFT placement does not match the assigned layer/rank capacity."
+                    )
+                for slot_id, expert_id in zip(free_allowed_slots, missing_experts):
+                    new_table[layer_id, rank_id, slot_id] = expert_id
+        return new_table
+
+    @staticmethod
+    def _global_imbalance(table, hotness):
+        table = np.asarray(table)
+        hotness = np.asarray(hotness, dtype=np.float64)
+        valid = table >= 0
+        layer_ids = np.broadcast_to(
+            np.arange(table.shape[0], dtype=np.int64)[:, None, None],
+            table.shape,
+        )
+        rank_ids = np.broadcast_to(
+            np.arange(table.shape[1], dtype=np.int64)[None, :, None],
+            table.shape,
+        )
+        counts = np.zeros(hotness.shape, dtype=np.int64)
+        np.add.at(
+            counts,
+            (layer_ids[valid], table[valid]),
+            1,
+        )
+        per_copy = np.divide(
+            hotness,
+            counts,
+            out=np.zeros_like(hotness, dtype=np.float64),
+            where=counts > 0,
+        )
+        rank_loads = np.zeros(table.shape[:2], dtype=np.float64)
+        np.add.at(
+            rank_loads,
+            (layer_ids[valid], rank_ids[valid]),
+            per_copy[layer_ids[valid], table[valid]],
+        )
+        mean_loads = np.mean(rank_loads, axis=1)
+        layer_weights = np.sum(hotness, axis=1)
+        active = (mean_loads > 0) & (layer_weights > 0)
+        if not np.any(active):
+            return 0.0
+        ratios = np.max(rank_loads[active], axis=1) / mean_loads[active]
+        return float(
+            np.sum(ratios * layer_weights[active])
+            / np.sum(layer_weights[active])
+        )
+
+    def _rebalance_global_pool(self, current_expert_table, expert_workload, pool_start):
+        old_table = current_expert_table.detach().cpu().numpy()
+        pool_size = old_table.shape[2] - pool_start
+        num_ranks = old_table.shape[1]
+        if pool_size <= 0 or pool_size * num_ranks != self.global_pool_total_size:
+            raise ValueError(
+                "CRAFT global pool table capacity mismatch: "
+                f"configured={self.global_pool_total_size}, table={pool_size * num_ranks}."
+            )
+        hotness = self._expert_hotness(current_expert_table, expert_workload)
+        if self._global_rebalance_is_cooling_down():
+            return False, None, current_expert_table.tolist()
+        if not self._global_hotness_changed(hotness, pool_size * num_ranks):
+            return False, None, current_expert_table.tolist()
+        home = [
+            [
+                [
+                    int(expert_id)
+                    for expert_id in old_table[layer_id, rank_id, :pool_start]
+                    if expert_id >= 0
+                ]
+                for rank_id in range(num_ranks)
+            ]
+            for layer_id in range(old_table.shape[0])
+        ]
+        planner_top_m = self.candidate_top_m
+        if planner_top_m <= 0:
+            planner_top_m = max(
+                num_ranks,
+                int(
+                    np.ceil(
+                        pool_size
+                        * num_ranks
+                        * self.candidate_factor
+                        / old_table.shape[0]
+                    )
+                ),
+            )
+        planner_started = time.perf_counter()
+        layer_replicas, extra_capacities, placements = plan_craft_replication(
+            hotness,
+            pool_size * num_ranks,
+            num_ranks,
+            home_placements=home,
+            candidate_top_m=planner_top_m,
+        )
+        planner_ms = (time.perf_counter() - planner_started) * 1_000.0
+        new_table = self._place_global_craft_plan(
+            old_table,
+            placements,
+            extra_capacities,
+            pool_start,
+            pool_size,
+        )
+        old_imbalance = self._global_imbalance(old_table, hotness)
+        new_imbalance = self._global_imbalance(new_table, hotness)
+        relative_improvement = (
+            (old_imbalance - new_imbalance) / old_imbalance
+            if old_imbalance > 0
+            else 0.0
+        )
+        changed_slots = int(np.count_nonzero(old_table != new_table))
+        changed_layers = int(
+            np.count_nonzero(np.any(old_table != new_table, axis=(1, 2)))
+        )
+        accepted = relative_improvement >= self.min_improvement
+        logger.info(
+            "[CRAFT-GLOBAL-BALANCE] slots=%d changed_slots=%d changed_layers=%d "
+            "current=%.4f proposed=%.4f improvement=%.4f accepted=%s "
+            "planner_top_m=%d planner_ms=%.3f layer_replicas=%s",
+            pool_size * num_ranks,
+            changed_slots,
+            changed_layers,
+            old_imbalance,
+            new_imbalance,
+            relative_improvement,
+            accepted,
+            planner_top_m,
+            planner_ms,
+            ",".join(str(int(value)) for value in layer_replicas),
+        )
+        if not accepted:
+            return False, None, current_expert_table.tolist()
+        changed = not np.array_equal(old_table, new_table)
+        if changed:
+            self._global_rebalance_cooldown_remaining = (
+                self.global_rebalance_cooldown
+            )
+        return changed, None, new_table.tolist()
+
     def rebalance_experts(self, current_expert_table, expert_workload):
         if not torch.is_tensor(current_expert_table):
             current_expert_table = torch.tensor(current_expert_table)
         pool_start = self._infer_pool_start(current_expert_table)
         if pool_start <= 0:
             return False, None, current_expert_table.tolist()
+        if self.global_pool_total_size > 0:
+            return self._rebalance_global_pool(current_expert_table, expert_workload, pool_start)
 
         hotness = self._expert_hotness(current_expert_table, expert_workload)
         old_table = current_expert_table.detach().cpu().numpy()
@@ -246,6 +553,8 @@ class PoolBalanceEplb(EplbPolicy):
             if pool_size <= 0:
                 continue
             layer_hotness = hotness[layer_id]
+            if self._layer_cooldown_active(layer_id):
+                continue
             if self._should_skip_layer(layer_id, layer_hotness):
                 continue
             home = [
@@ -270,6 +579,13 @@ class PoolBalanceEplb(EplbPolicy):
                     desired_pool[rank_id],
                     pool_start,
                     local_slots,
+                )
+            if not np.array_equal(
+                old_table[layer_id],
+                new_table[layer_id],
+            ):
+                self._layer_rebalance_cooldown_remaining[layer_id] = (
+                    self.layer_rebalance_cooldown
                 )
 
         changed = not np.array_equal(old_table, new_table)
