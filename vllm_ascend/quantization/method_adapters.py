@@ -210,8 +210,12 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        num_experts_main: int | None = None,
+        num_experts_pool: int = 0,
         **extra_weight_attrs,
     ) -> None:
+        layer.local_num_experts_main = num_experts if num_experts_main is None else num_experts_main
+        layer.local_num_experts_pool = num_experts_pool
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )

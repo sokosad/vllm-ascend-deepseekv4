@@ -101,6 +101,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # Static CRAFT pooling: extra local redundant expert slots per rank.
+    # 0 keeps the existing single-tensor MoE path.
+    "VLLM_ASCEND_CRAFT_POOL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_CRAFT_POOL_SIZE", "0")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # use fused op transpose_kv_cache_by_block, default is True

@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this updator.
+from queue import Empty
+
 import numpy
 import torch
 import torch.distributed as dist
@@ -27,6 +29,22 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _positive_float(value, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result > 0 else default
+
+
 class EplbUpdator:
     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
         self.eplb_config = eplb_config
@@ -36,6 +54,20 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
+        self.craft_pool_plan = self.eplb_config.eplb_policy_type == 4
+        self.craft_global_pool_plan = (
+            int(getattr(self.eplb_config, "craft_global_pool_size", 0) or 0) > 0
+        )
+        self.global_pool_routes_suspended = False
+        self.full_rank_plan = self.craft_pool_plan
+        self.plan_timeout_s = _positive_float(
+            getattr(self.eplb_config, "craft_plan_timeout_s", 60.0),
+            60.0,
+        )
+        rank_in_group = getattr(self.comm_group, "rank_in_group", self.rank_id)
+        self.rank_in_group = rank_in_group if isinstance(rank_in_group, int) else self.rank_id
+        group_ranks = getattr(self.comm_group, "ranks", None)
+        self.plan_src_rank = group_ranks[0] if isinstance(group_ranks, (list, tuple)) and group_ranks else 0
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -44,6 +76,16 @@ class EplbUpdator:
         self.world_size = dist.get_world_size()
         self.device = local_load.device
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
+        if self.craft_pool_plan:
+            self.shared_dict["craft_expert_cost_metadata"] = self.adaptor.get_expert_cost_metadata()
+
+    def _planner_process_alive(self) -> bool:
+        if self.process is None or not hasattr(self.process, "is_alive"):
+            return True
+        try:
+            return self.process.is_alive() is not False
+        except (AssertionError, ValueError):
+            return False
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
@@ -63,6 +105,10 @@ class EplbUpdator:
 
         self.reqs = []
         self.update_info_all = []
+        self.update_info_index = 0
+        self.skip_current_step = False
+        self.noop_current_step = False
+        self.noop_cycle_pending = False
 
         self.cur_iterations: torch.int64 = 0
 
@@ -82,6 +128,8 @@ class EplbUpdator:
 
             self.adaptor.model.clear_all_moe_loads()
             self.cur_iterations = 0
+            return True
+        return False
 
     def get_update_info_flag(self):
         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
@@ -95,17 +143,119 @@ class EplbUpdator:
         )
         return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
 
-    def wakeup_eplb_worker(self):
-        self.eplb_process.planner_q.put(1)
+    def current_weight_update_index(self):
+        return self.cur_iterations - (
+            self.expert_heat_collection_interval + self.algorithm_execution_interval
+        )
 
-    def forward_before(self):
+    def wakeup_eplb_worker(self):
+        if not self.full_rank_plan or self.rank_id == self.plan_src_rank:
+            self.eplb_process.planner_q.put(1)
+
+    def _broadcast_update_info(self, update_info_all):
+        object_list = [update_info_all if self.rank_id == self.plan_src_rank else None]
+        group = getattr(self.comm_group, "cpu_group", None)
+        if group is None:
+            group = getattr(self.comm_group, "device_group", None)
+        dist.broadcast_object_list(object_list, src=self.plan_src_rank, group=group)
+        return object_list[0]
+
+    def _select_rank_update_info(self, update_info_all):
+        selected_update_info = []
+        for record in update_info_all:
+            if isinstance(record, dict) and record.get("noop", False):
+                selected_update_info.append(None)
+                continue
+            if not isinstance(record, dict) or "send_all" not in record:
+                selected_update_info.append(record)
+                continue
+
+            rank_idx = self.rank_in_group
+            selected_update_info.append(
+                (
+                    record["send_all"][rank_idx],
+                    record["recv_all"][rank_idx],
+                    record["maps_all"][rank_idx],
+                    record["log2phy_all"][rank_idx],
+                    record["layer_id"],
+                )
+            )
+        return selected_update_info
+
+    def _synchronize_skip_update(self, skip_update: bool) -> bool:
+        if not self.craft_pool_plan or not self.update_expert_weight_flag():
+            return False
+
+        cpu_group = getattr(self.comm_group, "cpu_group", None)
+        sync_device = "cpu" if cpu_group is not None else self.device
+        group = cpu_group if cpu_group is not None else self.comm_group.device_group
+        update_allowed = torch.tensor(
+            [not skip_update], dtype=torch.int32, device=sync_device
+        )
+        dist.all_reduce(update_allowed, op=dist.ReduceOp.MIN, group=group)
+        return not bool(update_allowed.item())
+
+    def forward_before(self, skip_update: bool = False):
+        # A pool migration may pair any two EP ranks. DP synchronization only
+        # covers ranks at the same TP position, so all EPLB ranks must agree to
+        # enter a migration step before any P2P operation is launched.
+        self.skip_current_step = self._synchronize_skip_update(skip_update)
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
-            self.update_info_all = self.eplb_process.block_update_q.get()
+            if self.full_rank_plan:
+                update_info_all = None
+                if self.rank_id == self.plan_src_rank:
+                    if not self._planner_process_alive():
+                        logger.error(
+                            "CRAFT EPLB planner is not running; skipping this update cycle"
+                        )
+                    else:
+                        try:
+                            update_info_all = self.eplb_process.block_update_q.get(timeout=self.plan_timeout_s)
+                        except Empty:
+                            logger.error(
+                                "CRAFT EPLB planner timed out after %.1f seconds; skipping this update cycle",
+                                self.plan_timeout_s,
+                            )
+                self.update_info_all = self._broadcast_update_info(update_info_all)
+                if self.update_info_all is None:
+                    self.update_info_all = []
+                else:
+                    self.update_info_all = self._select_rank_update_info(self.update_info_all)
+                    self.noop_cycle_pending = (
+                        self.craft_pool_plan
+                        and len(self.update_info_all) == self.num_moe_layers
+                        and all(update_info is None for update_info in self.update_info_all)
+                    )
+            else:
+                self.update_info_all = self.eplb_process.block_update_q.get()
+            self.update_info_index = 0
+        if self.skip_current_step:
+            return
         if self.update_expert_weight_flag():
-            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all.pop(
-                0
-            )
+            if self.full_rank_plan:
+                self.update_info_index = self.current_weight_update_index()
+                if self.update_info_index < 0 or self.update_info_index >= len(self.update_info_all):
+                    logger.warning_once(
+                        "EPLB update info is not ready for index %s; skipping this step",
+                        self.update_info_index,
+                    )
+                    return
+                update_info = self.update_info_all[self.update_info_index]
+                if update_info is None:
+                    self.noop_current_step = True
+                    return
+            else:
+                update_info = self.update_info_all.pop(0)
+            if self.craft_global_pool_plan and not self.global_pool_routes_suspended:
+                changed_layer_ids = [
+                    layer_update[4]
+                    for layer_update in self.update_info_all
+                    if isinstance(layer_update, tuple)
+                ]
+                self.adaptor.suspend_global_pool_routes(changed_layer_ids)
+                self.global_pool_routes_suspended = True
+            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = update_info
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
             updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))
@@ -125,10 +275,46 @@ class EplbUpdator:
             self.compute_and_set_moe_load()
             self.wakeup_eplb_worker()
 
-        if self.update_expert_weight_flag() and self.expert_map_record_path is None:
+        if self.noop_cycle_pending:
+            if self.expert_map_record_path is not None:
+                self.adaptor._export_tensor_to_file(
+                    self.shared_dict["expert_maps"], self.expert_map_record_path
+                )
+            self.adaptor.model.clear_all_moe_loads()
+            self.cur_iterations = 0
+            self.update_info_all = []
+            self.noop_cycle_pending = False
+            self.global_pool_routes_suspended = False
+            logger.info("[EPLB] skipped unchanged CRAFT update cycle.")
+            return
+
+        if self.update_expert_weight_flag() and self.skip_current_step:
+            self.skip_current_step = False
+            return
+
+        if self.update_expert_weight_flag() and self.noop_current_step:
+            cycle_completed = self.update_iteration()
+            self.noop_current_step = False
+            if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+                logger.info("[EPLB] completed CRAFT update cycle.")
+            if cycle_completed:
+                self.global_pool_routes_suspended = False
+            return
+
+        if (
+            self.update_expert_weight_flag()
+            and not self.skip_current_step
+            and self.expert_map_record_path is None
+        ):
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
-        self.update_iteration()
+        cycle_completed = self.update_iteration()
+        if cycle_completed and self.craft_pool_plan and self.rank_id == 0:
+            logger.info("[EPLB] completed CRAFT update cycle.")
+        if cycle_completed:
+            self.global_pool_routes_suspended = False
+        self.skip_current_step = False
+        self.noop_current_step = False
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

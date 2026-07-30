@@ -20,6 +20,24 @@ import types
 import torch
 
 
+def _stack_moe_loads(moe_loads: list[torch.Tensor]) -> torch.Tensor:
+    if not moe_loads:
+        return torch.empty(0)
+
+    max_slots = max(load.shape[-1] for load in moe_loads)
+    padded_loads = []
+    for load in moe_loads:
+        if load.shape[-1] == max_slots:
+            padded_loads.append(load)
+            continue
+        pad_shape = list(load.shape)
+        pad_shape[-1] = max_slots - load.shape[-1]
+        padding = torch.zeros(pad_shape, dtype=load.dtype, device=load.device)
+        padded_loads.append(torch.cat((load, padding), dim=-1))
+
+    return torch.stack(padded_loads, dim=0)
+
+
 def get_expert_map(self, layer_id):
     return self.model.layers[layer_id].mlp.experts.expert_map
 
@@ -31,11 +49,10 @@ def get_log2phy_map(self, layer_id):
 def get_all_moe_loads(self):
     num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
     num_layers = self.model.config.num_hidden_layers
-    all_moe_loads = torch.stack(
-        [self.model.layers[layer_id].mlp.experts.moe_load for layer_id in range(num_dense_layers, num_layers)],
-        dim=0,
-    )
-    return all_moe_loads
+    moe_loads = [
+        self.model.layers[layer_id].mlp.experts.moe_load for layer_id in range(num_dense_layers, num_layers)
+    ]
+    return _stack_moe_loads(moe_loads)
 
 
 def clear_all_moe_loads(self):

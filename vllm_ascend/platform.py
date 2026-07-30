@@ -33,6 +33,14 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import init_ascend_config
 
+CRAFT_POOL_MOE_SPLITTING_OPS = ("vllm::moe_forward", "vllm::moe_forward_shared")
+CRAFT_POOL_ASCEND_SPLITTING_OPS = (
+    "_C_ascend::npu_hc_pre",
+    "_C_ascend::npu_hc_post",
+    "npu::npu_swiglu",
+    "npu::npu_rms_norm",
+)
+
 # isort: off
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -192,6 +200,46 @@ class NPUPlatform(Platform):
         return min(max_num_seqs * decode_query_len, 512)
 
     @classmethod
+    def _get_configured_ep_size(cls, parallel_config) -> int:
+        if not getattr(parallel_config, "enable_expert_parallel", False):
+            return 1
+        tensor_parallel_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        data_parallel_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+        return max(1, tensor_parallel_size * data_parallel_size)
+
+    @classmethod
+    def _is_craft_pool_configured(cls, eplb_config) -> bool:
+        from vllm_ascend.eplb.core.eplb_utils import (
+            expert_file_has_pool_mode,
+            get_configured_craft_global_pool_size,
+            get_configured_craft_pool_size,
+        )
+
+        if (
+            get_configured_craft_pool_size(eplb_config) > 0
+            or get_configured_craft_global_pool_size(eplb_config) > 0
+        ):
+            return True
+        return expert_file_has_pool_mode(getattr(eplb_config, "expert_map_path", None))
+
+    @classmethod
+    def _append_craft_pool_splitting_ops(cls, compilation_config) -> None:
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
+        for op_name in CRAFT_POOL_MOE_SPLITTING_OPS + CRAFT_POOL_ASCEND_SPLITTING_OPS:
+            if op_name not in compilation_config.splitting_ops:
+                compilation_config.splitting_ops.append(op_name)
+
+    @classmethod
+    def _craft_pool_supports_full_graph(cls, parallel_config, eplb_config) -> bool:
+        return (
+            getattr(eplb_config, "eplb_policy_type", None) == 4
+            and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and cls._get_configured_ep_size(parallel_config) <= 32
+        )
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return None
 
@@ -257,6 +305,40 @@ class NPUPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
+        craft_pool_size = ascend_config.eplb_config.craft_pool_size
+        craft_global_pool_size = ascend_config.eplb_config.craft_global_pool_size
+        craft_pool_configured = cls._is_craft_pool_configured(ascend_config.eplb_config)
+        if craft_global_pool_size > 0:
+            ep_size = cls._get_configured_ep_size(parallel_config)
+            if craft_global_pool_size % ep_size != 0:
+                raise ValueError(
+                    "craft_global_pool_size must be divisible by ep_size: "
+                    f"craft_global_pool_size={craft_global_pool_size}, ep_size={ep_size}."
+                )
+            parallel_eplb_config = getattr(parallel_config, "eplb_config", None)
+            if parallel_eplb_config is not None:
+                setattr(parallel_eplb_config, "craft_global_pool_size", craft_global_pool_size)
+        if craft_pool_size > 0:
+            if vllm_config.additional_config is None:
+                vllm_config.additional_config = {}
+            ep_size = cls._get_configured_ep_size(parallel_config)
+            pool_redundant_experts = craft_pool_size * ep_size
+            configured_redundant_experts = ascend_config.eplb_config.num_redundant_experts
+            if configured_redundant_experts not in (0, pool_redundant_experts):
+                raise ValueError(
+                    "craft_pool_size conflicts with num_redundant_experts: "
+                    f"craft_pool_size={craft_pool_size}, ep_size={ep_size}, "
+                    f"num_redundant_experts={configured_redundant_experts}."
+                )
+            ascend_config.eplb_config.config["num_redundant_experts"] = pool_redundant_experts
+            parallel_eplb_config = getattr(parallel_config, "eplb_config", None)
+            if parallel_eplb_config is not None:
+                setattr(parallel_eplb_config, "num_redundant_experts", pool_redundant_experts)
+                setattr(parallel_eplb_config, "craft_pool_size", craft_pool_size)
+            vllm_config.additional_config.setdefault("eplb_config", {})[
+                "num_redundant_experts"
+            ] = pool_redundant_experts
+
         ascend_compilation_config = ascend_config.ascend_compilation_config
         if ascend_compilation_config:
             vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
@@ -345,6 +427,18 @@ class NPUPlatform(Platform):
                 logger.warning("encoder-decoder model doesn't support FULL_DECODE_ONLY, fallback to PIECEWISE ")
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+        if (
+            craft_pool_configured
+            and compilation_config.cudagraph_mode in (CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL)
+            and not cls._craft_pool_supports_full_graph(parallel_config, ascend_config.eplb_config)
+        ):
+            logger.warning(
+                "CRAFT pool full ACL graph capture requires fused MC2 on A3 with EP<=32. "
+                "Falling back to PIECEWISE so the rest of the model can still use graph capture."
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            compilation_config.mode = CompilationMode.VLLM_COMPILE
+
         # get custom compile backend for graph fusion
         compilation_config.oot_compiler = cls.get_compile_backend()
 
@@ -369,6 +463,8 @@ class NPUPlatform(Platform):
             # If splitting ops does not contain the vllm::mla forward value, this configuration issue will
             # not be detected in advance assert.
             compilation_config.splitting_ops.extend(["vllm::mla_forward"])
+            if craft_pool_configured:
+                cls._append_craft_pool_splitting_ops(compilation_config)
             update_aclgraph_sizes(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         elif (
@@ -680,6 +776,8 @@ class NPUPlatform(Platform):
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing.
         capturing = False
+        graph_capture_forward = False
+        graph_buffer_warmup = False
 
         # set for sequence parallelism, 1000 is the batch size concurrency
         # threshold for enabling the flashcomm_v1 or sequence_parallelism feature.
@@ -727,6 +825,8 @@ class NPUPlatform(Platform):
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
             "capturing": capturing,
+            "graph_capture_forward": graph_capture_forward,
+            "graph_buffer_warmup": graph_buffer_warmup,
             "mmrs_fusion": mmrs_fusion,
             "num_tokens": num_tokens,
             "flash_comm_v1_enabled": flash_comm_v1_enabled,

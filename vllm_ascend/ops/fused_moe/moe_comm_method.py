@@ -59,6 +59,40 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
 
 
+def _apply_log2phy(
+    log2phy: torch.Tensor | None,
+    topk_ids: torch.Tensor,
+    compact_craft_pool: bool = False,
+) -> torch.Tensor:
+    if log2phy is None:
+        return topk_ids
+    if log2phy.dim() == 1:
+        return log2phy[topk_ids]
+
+    if compact_craft_pool:
+        logical_ids = topk_ids
+        # generate_craft_route_map rejects logical experts without a replica,
+        # so compact counts are already positive and need no runtime clamp.
+        replica_counts = -log2phy[logical_ids, -1] - 1
+    else:
+        candidates = log2phy[topk_ids]
+        replica_counts = torch.sum(candidates >= 0, dim=-1)
+        replica_counts = torch.clamp(replica_counts, min=1)
+        logical_ids = topk_ids.to(torch.int64)
+
+    token_selector = torch.arange(
+        topk_ids.shape[0],
+        device=topk_ids.device,
+        dtype=logical_ids.dtype,
+    )
+    while token_selector.dim() < topk_ids.dim():
+        token_selector = token_selector.unsqueeze(-1)
+    replica_selector = (token_selector + logical_ids) % replica_counts
+    if compact_craft_pool:
+        return log2phy[logical_ids, replica_selector]
+    return candidates.gather(-1, replica_selector.unsqueeze(-1)).squeeze(-1)
+
+
 def set_gmmswigluquant_method():
     from vllm_ascend.ascend_config import get_ascend_config
 
@@ -127,9 +161,11 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
-        routed_topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+        routed_topk_ids = _apply_log2phy(
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.topk_ids,
+            fused_experts_input.compact_craft_pool,
+        )
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -137,10 +173,16 @@ class MoECommMethod(ABC):
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
+        use_fusion_ops = self.use_fusion_ops
+        disable_triton_activation = False
+        if fused_experts_input.compact_craft_pool:
+            use_fusion_ops = False
+            disable_triton_activation = True
         mlp_compute_input = build_mlp_compute_input(
             fused_experts_input=fused_experts_input,
             token_dispatch_output=token_dispatch_output,
-            use_fusion_ops=self.use_fusion_ops,
+            use_fusion_ops=use_fusion_ops,
+            disable_triton_activation=disable_triton_activation,
         )
 
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
@@ -278,7 +320,10 @@ class FusedMC2CommImpl(MoECommMethod):
             "w1_scale and w2_scale cannot be None for FusedMC2CommImpl."
         )
 
-        assert not (fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None), (
+        assert not (
+            fused_experts_input.weights.w1_scale_bias is None
+            or fused_experts_input.weights.w2_scale_bias is None
+        ), (
             "w1_scale_bias and w2_scale_bias cannot be None for FusedMC2CommImpl."
         )
 
@@ -287,12 +332,20 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         # Apply log2phy if needed
-        topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+        topk_ids = _apply_log2phy(
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.topk_ids,
+            fused_experts_input.compact_craft_pool,
+        )
 
         expert_tokens = None
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+            expert_token_nums = (
+                fused_experts_input.expert_token_nums
+                if fused_experts_input.expert_token_nums is not None
+                else self.expert_token_nums
+            )
+            assert expert_token_nums is not None
             out = torch.empty_like(fused_experts_input.hidden_states)
             torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                 x=fused_experts_input.hidden_states,
@@ -308,9 +361,9 @@ class FusedMC2CommImpl(MoECommMethod):
                 max_output_size=65536,
                 swiglu_limit=fused_experts_input.swiglu_limit,
                 out=out,
-                expert_token_nums=self.expert_token_nums,
+                expert_token_nums=expert_token_nums,
             )
-            expert_tokens = self.expert_token_nums
+            expert_tokens = expert_token_nums
         elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
             assert fused_experts_input.routing.expert_map is not None, "expert_map cannot be None."
             out, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(  # type: ignore
@@ -330,4 +383,8 @@ class FusedMC2CommImpl(MoECommMethod):
             )
         else:
             raise ValueError(f"Wrong value of {envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2=}")
-        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens, swiglu_limit=fused_experts_input.swiglu_limit)
+        return FusedExpertsResult(
+            routed_out=out,
+            expert_tokens=expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+        )
